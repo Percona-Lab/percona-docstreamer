@@ -844,6 +844,106 @@ Consider a scenario where Document A is inserted (Insert 1 at TS_1), deleted (at
 
 Regardless of the state the Full Load left behind, the CDC process replays history from $\mathbf{T_0}$ in strict order. The final event (Insert 2) is always the last operation applied, ensuring the destination matches the source perfectly.
 
+## Detailed docMongoStream Internal Workflow
+
+Here is a more detailed but simple explanation of the inner workings of docMongoStream for each of the 2 stages (Full Load and CDC).
+
+### Full Sync (Load)
+
+Think of the Full Sync as a massive "Divide and Conquer" operation. Instead of trying to read the entire database at once (which would be slow and memory-heavy), docMongoStream splits the work into tiny, manageable chunks and processes them in a pipeline.
+
+1. "Divide and Conquer" (Segmentation)\
+  Before copying any data, docMongoStream looks at the collection to figure out how to split it up:
+    - Find the Boundaries
+      - docMongoStream asks the source for the very first _id (Minimum) and the very last _id (Maximum) currently in the collection.
+    - Create Segments 
+      - docMongoStream doesn't list all documents. Instead, it calculates logical ranges of _ids. For example, if you have 1 million documents and `cloner.segment_size_docs` is 10,000, it logically creates 100 "tickets" (segments).
+
+2. The "Find" Logic (Read Workers)\  
+  Several Read Workers run in parallel, grabbing those "tickets" and querying the source. Instead of running one giant query, a worker runs a specific range query for its segment.
+    - Standard Segment 
+      - "Give me all documents where _id is greater than A and less than or equal to B."
+    - The "Open-Ended" Final Segment 
+      - For the very last segment, the tool drops the "less than" condition. 
+        - Why? 
+          - While the migration is running, your application might insert new data at the end of the collection. 
+          - By making the last query open-ended, the worker keeps reading until it grabs even those brand-new documents, ensuring nothing at the "end" is left behind.
+
+3. The Pipeline (Buffering)\  
+  The Read Workers don't write to MongoDB directly. They are just "fetchers." 
+    - Read
+      - A worker fetches a batch of documents (e.g., 1,000 at a time) from DocumentDB.
+    - Pack
+      - It then wraps these documents into a "write model" (instructions for MongoDB).
+    - Queue
+      - It then pushes this batch into a channel (a safe waiting line in memory).
+
+4. Writing to Target (Insert Workers)\  
+  On the other side of the queue, Insert Workers are waiting to do the following:
+    - Grab 
+      - They pick up a batch from the queue.
+    - Write 
+      - They send the batch to MongoDB using BulkWrite.
+    - Idempotency (Safety) 
+      - They use ReplaceOne with Upsert: True.
+        - Why not Insert? 
+          - If you stop and restart the migration, or if the CDC phase tries to update a document you just copied, a standard "Insert" would fail with a "Duplicate Key Error."
+        - Upsert strategy 
+          - This tells MongoDB: "If this document exists, replace it with this version. If it doesn't exist, create it." This makes the process crash-proof and safe to retry.
+
+### CDC
+
+Think of CDC as "Live Tailing." Instead of reading static files, the docMongoStream subscribes to a live news feed of every single action happening on the DocumentDB cluster and replays it on the destination.
+
+1. The Starting Line "Time Zero" ($T_0$)\
+  The most critical part of CDC is knowing where to start.
+    - No Gaps
+        - It doesn't start "now." It starts exactly at the timestamp captured before the Full Sync began.
+    - The Overlap
+        - This means it replays events that happened while the Full Sync was running. This intentional overlap ensures absolutely no data is missing.
+        
+2. The Watcher (The Listener)\
+  This component connects to the Source (DocumentDB) and opens a Change Stream.
+    - The Feed 
+        - It tells DocumentDB: "Send me a notification for every Insert, Update, Delete, or Drop that happens after time $T_0$."
+    - The Pipeline
+      - As these notifications (events) arrive, the Watcher pushes them instantly into a high-speed internal queue.
+        
+3. The Processor (The sorter)\
+  A processor sits at the end of that queue and sorts the events.
+    - Data Events (Inserts/Updates/Deletes): 
+      - These are thrown into a Bulk Buffer. 
+          - The tool doesn't write them one by one (which is slow); 
+          - It groups them into batches (e.g., 1,000 at a time).
+    - DDL Events (Schema Changes)
+      - If someone drops a collection or renames a DB, this is a "Stop the Presses" moment. 
+        - The processor
+          - Pauses reading.
+          - Flushes all pending data writes to ensure order.
+          - Executes the schema change immediately.
+          - Saves a checkpoint.
+          
+4. The Writers (Parallel Execution)\
+  Just like with the Full Sync, we don't use just one thread to write. We use Write Workers (configured by `cdc.max_write_workers`).
+    - Concurrent Batches 
+      - When the buffer is full (or every 500ms), a batch is handed to a worker.
+    - Translation (The Magic Trick)
+      - This is key. The worker doesn't just copy the operation blind. 
+        - Source says: "Insert Document A.
+        - "Worker translates to: "Replace Document A (Upsert: True).
+        - "Why? 
+          - Because of the overlap in step 1. If the Full Sync already copied "Document A," a standard Insert would fail. 
+          - The "Replace/Upsert" logic makes it safe to replay the same event twice.
+          
+5. The Safety Net (Checkpoints)\
+  While all this is happening, the docMongoStream is constantly saving its place.
+    - Tracking
+      - Every time a batch is successfully applied, the tool updates its internal tracker.
+    - Saving 
+      - It periodically writes the timestamp of the last successful event to the `docMongoStream.checkpoints` collection in MongoDB.
+    - Crash Recovery 
+      - If the server crashes or docMongoStream is stopped, the tool restarts, reads that timestamp, and resumes the change stream from the exact millisecond it left off.
+
 ## Limitations & Important Notes
 
 ### DocumentDB Cursor Rate Limiting
@@ -861,6 +961,7 @@ docMongoStream has support for replicating most DDL operations.
 Supported: drop (collection), dropDatabase, rename (collection), create (collection). 
 
 NOT Supported: createIndexes, dropIndexes. These operations will be detected and logged, but skipped. You must manually recreate or drop indexes on the target cluster.
+
 
 
 
