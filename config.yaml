@@ -1,0 +1,100 @@
+# -----------------------------------------------
+# docMongoStream Configuration File
+# -----------------------------------------------
+# This file is watched by the application at runtime.
+# Changes will be logged, and new settings will be
+# picked up by new processes.
+#
+# Environment variables will OVERRIDE these settings.
+# e.g., export DOCDB_ENDPOINT=other.host
+# -----------------------------------------------
+
+# Logging Configuration
+logging:
+  # Log level (e.g., "debug", "info", "warn", "error")
+  level: "info"
+  # Path to the log file.
+  # The directory will be created if it doesn't exist.
+  file_path: "logs/docMongoStream.log"
+  # Path to CDC ops log
+  ops_log_path: "logs/cdc.log"
+  # Path to full load ops log
+  full_load_log_path: "logs/full_load.log"
+
+# Source DocumentDB
+docdb:
+  endpoint: "localhost"
+  port: "7777"
+  ca_file: "/home/daniel.almeida/global-bundle.pem"
+  # If true, tlsAllowInvalidHostnames=true will be added to the connection string.
+  tls_allow_invalid_hostnames: true
+  extra_params: ""
+
+# Target MongoDB
+mongo:
+  endpoint: "dan-ps-lab-mongos00.tp.int.percona.com"
+  port: "27017"
+  ca_file: ""
+  tls_allow_invalid_hostnames: true 
+  extra_params: ""
+
+# General Migration Settings
+migration:
+  # Prefix for environment variables (e.g., MIGRATION_DOCDB_USER)
+  env_prefix: "MIGRATION"
+  pid_file_path: "docMongoStream.pid"
+  # Port for the HTTP /status endpoint
+  status_http_port: "8080"
+  network_compressors: "zlib,snappy"
+  # Databases to skip during discovery
+  exclude_dbs:
+    - "admin"
+    - "local"
+    - "config"
+  # Collections to skip during discovery (format: "dbname.collname")
+  # If you want to skip all collections for a given database, use exclude_dbs setting instead
+  exclude_collections: []  
+  # Max number of collections to copy at the same time
+  max_concurrent_workers: 2
+  # Database and collections to keep track of the migration
+  metadata_db: "docMongoStream"
+  checkpoint_collection: "checkpoints"
+  checkpoint_doc_id: "cdc_resume_timestamp"
+  status_collection: "status"
+  status_doc_id: "migration_status"
+  # Set the following to True if you want to start the migration all over from scratch
+  # This will drop all databases and collections in the destination environment
+  # except for admin, local and config
+  destroy: False
+  # Set the following to True if you do not want to make any changes and just want to validate you are able to connect 
+  # to source and destination
+  dry_run: False
+
+# Full Load Settings
+cloner:
+  # This will read segments in parallel
+  num_read_workers: 4
+  # Number of insert workers *per collection*
+  num_insert_workers: 8
+  # Number of documents per read batch
+  read_batch_size: 1000
+  # Number of documents per insert batch
+  insert_batch_size: 1000
+  # Max size (in bytes) of a single insert batch
+  insert_batch_bytes: 16777216 # 16MB
+  # Size (in docs) of a segment for parallel reads
+  # A collection of 1M docs will be split into 100 segments of 10k docs
+  segment_size_docs: 10000
+
+# Change Data Capture (CDC) Settings
+cdc:
+  # How many operations to batch together
+  batch_size: 1000
+  # Max time to wait (in ms) before flushing a batch
+  # This ensures low-volume changes are still applied quickly
+  batch_interval_ms: 500
+  # Max time (in ms) for the change stream to wait for new events
+  max_await_time_ms: 1000
+  # Maximum concurrent BulkWrite operations.
+  # Increase this value to utilize more target MongoDB resources and improve real-time throughput. (Default: 4)
+  max_write_workers: 4              

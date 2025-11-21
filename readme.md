@@ -1,6 +1,5 @@
 # docMongoStream: Migration & Sync Tool
 
-```
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ________            ______  ___                                ____________                               
 ___  __ \______________   |/  /___________________ ______      __  ___/_  /__________________ _______ ___ 
@@ -9,7 +8,6 @@ _  /_/ // /_/ / /__ _  /  / / / /_/ /  / / /  /_/ // /_/ /     ____/ // /_ _  / 
 /_____/ \____/\___/ /_/  /_/  \____//_/ /_/_\__, / \____/      /____/ \__/ /_/    \___/\__,_/ /_/ /_/ /_/ 
                                            /____/      
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ 
-```
 
 docMongoStream automates the complete, end-to-end migration from an Amazon DocumentDB cluster to any self-managed MongoDB instance. It is a high-performance tool written in Go for performing a full data load and continuous data capture (CDC) migrations. It provides a resilient, two-phase migration process:
 
@@ -159,43 +157,33 @@ Credentials for the source and target databases are required. They can be provid
 
 2. Environment Variables:
     * `MIGRATION_DOCDB_USER`: Username for the source DocumentDB.
-    * `MIGRATION_MONGO_USER`: Username for the target MongoDB.
-    * `DOCDB_PASS`: Password for the source DocumentDB user.
-    * `MONGO_PASS`: Password for the target MongoDB user.
+    * `MIGRATION_DOCDB_PASS`: Password for the source DocumentDB user.
+    * `MIGRATION_MONGO_USER`: Username for the target MongoDB.    
+    * `MIGRATION_MONGO_PASS`: Password for the target MongoDB user.
+
+    ***Note about env vars*** You can change the prefix (`MIGRATION`) by setting `migration.env_prefix` in the `config.yaml`.
 
 3. Interactive Prompt (Lowest Priority):
-    * If passwords (DOCDB_PASS, MONGO_PASS) are not set as environment variables, the start command will securely prompt you to enter them. This is the recommended approach.
+    * If passwords (`MIGRATION_DOCDB_PASS`, `MIGRATION_MONGO_PASS`) are not set as environment variables, the start command will securely prompt you to enter them. This is the recommended approach. You can not provide passwords as command line arguments for security purposes.
 
 ```bash
-./docMongoStream --help
+./docMongoStream help
 docMongoStream is a tool for performing a full load and continuous data
 capture (CDC) migration from AWS DocumentDB to MongoDB.
-Credentials:
-  The tool requires source and target database credentials. These can be provided
-  via flags or environment variables. Passwords will be prompted for if not set.
-  Flags:
-    --docdb-user <user>   (Overrides MIGRATION_DOCDB_USER)
-    --mongo-user <user>   (Overrides MIGRATION_MONGO_USER)
-  Environment Variables:
-    MIGRATION_DOCDB_USER: Username for the source DocumentDB.
-    MIGRATION_MONGO_USER: Username for the target MongoDB.
-    DOCDB_PASS: Password for the source DocumentDB user.
-    MONGO_PASS: Password for the target MongoDB user.
-  Note: The 'MIGRATION_' prefix is configurable in config.yaml (migration.env_prefix).
 
 Usage:
   docMongoStream [command]
 
 Available Commands:
   help        Help about any command
-  start       Starts the full load and CDC migration in the background
+  start       Starts the full load and CDC migration
   status      Checks and prints the current status of the migration
   stop        Finds the running application and stops it
 
 Flags:
-      --docdb-user string   Source DocumentDB Username (overrides MIGRATION_DOCDB_USER)
+      --docdb-user string   Source DocumentDB Username
   -h, --help                help for docMongoStream
-      --mongo-user string   Target MongoDB Username (overrides MIGRATION_MONGO_USER)
+      --mongo-user string   Target MongoDB Username
 
 Use "docMongoStream [command] --help" for more information about a command.
 ```
