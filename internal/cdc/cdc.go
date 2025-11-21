@@ -11,10 +11,9 @@ import (
 	"github.com/Percona-Lab/docMongoStream/internal/config"
 	"github.com/Percona-Lab/docMongoStream/internal/logging"
 	"github.com/Percona-Lab/docMongoStream/internal/status"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // CDCManager manages the change stream watcher and batch processor
@@ -24,8 +23,8 @@ type CDCManager struct {
 	eventQueue         chan *ChangeEvent
 	flushQueue         chan map[string][]mongo.WriteModel // Channel for batches to be processed
 	bulkWriter         *BulkWriter
-	startAt            primitive.Timestamp // This holds the loaded T0
-	lastSuccessfulTS   primitive.Timestamp
+	startAt            bson.Timestamp
+	lastSuccessfulTS   bson.Timestamp
 	checkpoint         *checkpoint.Manager
 	statusManager      *status.Manager
 	shutdownWG         sync.WaitGroup
@@ -35,7 +34,7 @@ type CDCManager struct {
 }
 
 // NewManager creates a new CDC manager
-func NewManager(source, target *mongo.Client, checkpointDocID string, startAt primitive.Timestamp, checkpoint *checkpoint.Manager, statusMgr *status.Manager) *CDCManager {
+func NewManager(source, target *mongo.Client, checkpointDocID string, startAt bson.Timestamp, checkpoint *checkpoint.Manager, statusMgr *status.Manager) *CDCManager {
 	// 1. Load the actual resume timestamp (T0) from the checkpoint manager
 	resumeTS, found := checkpoint.GetResumeTimestamp(context.Background(), checkpointDocID)
 
@@ -164,13 +163,13 @@ func (m *CDCManager) Start(ctx context.Context) error {
 	// processChanges has closed the channel. Now wait for workers to drain it.
 	m.workerWG.Wait()
 
-	// Save the checkpoint HERE, only after all workers have successfully finished.
-	if (m.lastSuccessfulTS != primitive.Timestamp{}) {
+	// Save the checkpoint here, but only after all workers have successfully finished.
+	if (m.lastSuccessfulTS != bson.Timestamp{}) {
 		initialT0, _ := m.checkpoint.GetResumeTimestamp(context.Background(), m.checkpointDocID)
 		if initialT0.T == 0 || m.lastSuccessfulTS.T > initialT0.T || (m.lastSuccessfulTS.T == initialT0.T && m.lastSuccessfulTS.I > initialT0.I) {
 			logging.PrintInfo("[CDC] Saving final resume timestamp...", 0)
 			saveCtx := context.Background()
-			nextTS := primitive.Timestamp{T: m.lastSuccessfulTS.T, I: m.lastSuccessfulTS.I + 1}
+			nextTS := bson.Timestamp{T: m.lastSuccessfulTS.T, I: m.lastSuccessfulTS.I + 1}
 			m.checkpoint.SaveResumeTimestamp(saveCtx, m.checkpointDocID, nextTS)
 		}
 		m.statusManager.UpdateCDCStats(m.totalEventsApplied.Load(), m.lastSuccessfulTS)
@@ -266,7 +265,7 @@ func (m *CDCManager) handleDDL(ctx context.Context, event *ChangeEvent) {
 
 	// TODO: In a perfect world, we'd wait for workers to drain here too,
 	// but DDL consistency is complex. For now, we save checkpoint immediately.
-	nextTS := primitive.Timestamp{T: event.ClusterTime.T, I: event.ClusterTime.I + 1}
+	nextTS := bson.Timestamp{T: event.ClusterTime.T, I: event.ClusterTime.I + 1}
 	m.checkpoint.SaveResumeTimestamp(saveCtx, m.checkpointDocID, nextTS)
 	m.statusManager.UpdateCDCStats(m.totalEventsApplied.Load(), event.ClusterTime)
 	m.statusManager.Persist(saveCtx)

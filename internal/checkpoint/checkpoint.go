@@ -7,17 +7,16 @@ import (
 
 	"github.com/Percona-Lab/docMongoStream/internal/config"
 	"github.com/Percona-Lab/docMongoStream/internal/logging"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // checkpointDoc is the structure we save in MongoDB
 type checkpointDoc struct {
-	ID          string              `bson:"_id"`
-	Timestamp   primitive.Timestamp `bson:"timestamp"`
-	LastUpdated time.Time           `bson:"lastUpdated"`
+	ID          string         `bson:"_id"`
+	Timestamp   bson.Timestamp `bson:"timestamp"`
+	LastUpdated time.Time      `bson:"lastUpdated"`
 }
 
 // Manager saves and loads migration checkpoints
@@ -39,15 +38,15 @@ func NewManager(targetClient *mongo.Client) *Manager {
 }
 
 // GetResumeTimestamp loads the last saved CDC timestamp from the database.
-func (m *Manager) GetResumeTimestamp(ctx context.Context, docID string) (primitive.Timestamp, bool) {
+func (m *Manager) GetResumeTimestamp(ctx context.Context, docID string) (bson.Timestamp, bool) {
 	var doc checkpointDoc
 	err := m.coll.FindOne(ctx, bson.D{{Key: "_id", Value: docID}}).Decode(&doc)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			logging.PrintInfo(fmt.Sprintf("[CDC %s] No resume timestamp found in checkpoint database.", docID), 0)
-			return primitive.Timestamp{}, false
+			return bson.Timestamp{}, false
 		}
-		return primitive.Timestamp{}, false
+		return bson.Timestamp{}, false
 	}
 
 	logging.PrintInfo(fmt.Sprintf("[CDC %s] Found resume timestamp: %v", docID, doc.Timestamp), 0)
@@ -55,7 +54,7 @@ func (m *Manager) GetResumeTimestamp(ctx context.Context, docID string) (primiti
 }
 
 // SaveResumeTimestamp saves the latest processed timestamp to the database.
-func (m *Manager) SaveResumeTimestamp(ctx context.Context, docID string, ts primitive.Timestamp) {
+func (m *Manager) SaveResumeTimestamp(ctx context.Context, docID string, ts bson.Timestamp) {
 	doc := checkpointDoc{
 		ID:          docID,
 		Timestamp:   ts,
@@ -70,8 +69,8 @@ func (m *Manager) SaveResumeTimestamp(ctx context.Context, docID string, ts prim
 }
 
 // SaveCollectionCheckpoint saves the final Full Load completion timestamp for a single collection.
-// This uses the collection namespace (e.g., "databaseName.collectionName") as the unique document ID.
-func (m *Manager) SaveCollectionCheckpoint(ctx context.Context, ns string, ts primitive.Timestamp) {
+// This uses the collection namespace (e.g., "dbname.collname") as the unique document ID.
+func (m *Manager) SaveCollectionCheckpoint(ctx context.Context, ns string, ts bson.Timestamp) {
 	doc := checkpointDoc{
 		// Use the namespace as the document ID for per-collection tracking
 		ID:          ns,
@@ -89,8 +88,8 @@ func (m *Manager) SaveCollectionCheckpoint(ctx context.Context, ns string, ts pr
 }
 
 // GetLatestCollectionCheckpoint finds the latest completion timestamp across all collection checkpoints.
-func (m *Manager) GetLatestCollectionCheckpoint(ctx context.Context) (primitive.Timestamp, bool) {
-	var latestTS primitive.Timestamp
+func (m *Manager) GetLatestCollectionCheckpoint(ctx context.Context) (bson.Timestamp, bool) {
+	var latestTS bson.Timestamp
 
 	// Exclude the global CDC resume timestamp itself from this calculation
 	filter := bson.D{{Key: "_id", Value: bson.D{{Key: "$ne", Value: config.Cfg.Migration.CheckpointDocID}}}}
@@ -100,7 +99,7 @@ func (m *Manager) GetLatestCollectionCheckpoint(ctx context.Context) (primitive.
 	cursor, err := m.coll.Find(ctx, filter, opts)
 	if err != nil {
 		logging.PrintWarning(fmt.Sprintf("[FULL LOAD] Failed to list collection checkpoints: %v", err), 0)
-		return primitive.Timestamp{}, false
+		return bson.Timestamp{}, false
 	}
 	defer cursor.Close(ctx)
 
@@ -112,5 +111,5 @@ func (m *Manager) GetLatestCollectionCheckpoint(ctx context.Context) (primitive.
 		}
 	}
 
-	return primitive.Timestamp{}, false
+	return bson.Timestamp{}, false
 }

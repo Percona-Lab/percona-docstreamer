@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/Percona-Lab/docMongoStream/internal/logging"
-	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
 // changeStreamInfo is used to unmarshal the result from $listChangeStreams

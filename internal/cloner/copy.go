@@ -16,10 +16,9 @@ import (
 	"github.com/Percona-Lab/docMongoStream/internal/status"
 	"github.com/Percona-Lab/docMongoStream/internal/topo"
 	"github.com/dustin/go-humanize"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // Batch of documents read from the source
@@ -66,7 +65,8 @@ func NewSegmenter(ctx context.Context, mcoll *mongo.Collection, collInfo discove
 
 // getIDKeyRange finds the min and max _id in a collection
 func getIDKeyRange(ctx context.Context, mcoll *mongo.Collection) (min, max bson.RawValue, err error) {
-	minRes := mcoll.FindOne(ctx, bson.D{}, options.FindOne().SetSort(bson.D{{Key: "_id", Value: 1}}).SetProjection(bson.D{{Key: "_id", Value: 1}}))
+	minOpts := options.FindOne().SetSort(bson.D{{Key: "_id", Value: 1}}).SetProjection(bson.D{{Key: "_id", Value: 1}})
+	minRes := mcoll.FindOne(ctx, bson.D{}, minOpts)
 	if minRes.Err() != nil {
 		return bson.RawValue{}, bson.RawValue{}, minRes.Err()
 	}
@@ -75,7 +75,8 @@ func getIDKeyRange(ctx context.Context, mcoll *mongo.Collection) (min, max bson.
 		return bson.RawValue{}, bson.RawValue{}, fmt.Errorf("could not decode min _id: %w", err)
 	}
 
-	maxRes := mcoll.FindOne(ctx, bson.D{}, options.FindOne().SetSort(bson.D{{Key: "_id", Value: -1}}).SetProjection(bson.D{{Key: "_id", Value: 1}}))
+	maxOpts := options.FindOne().SetSort(bson.D{{Key: "_id", Value: -1}}).SetProjection(bson.D{{Key: "_id", Value: 1}})
+	maxRes := mcoll.FindOne(ctx, bson.D{}, maxOpts)
 	if maxRes.Err() != nil {
 		return bson.RawValue{}, bson.RawValue{}, maxRes.Err()
 	}
@@ -161,8 +162,6 @@ type CopyManager struct {
 	checkpointMgr   *checkpoint.Manager
 	checkpointDocID string // Here to ensure consistent ID usage
 	initialMaxKey   bson.RawValue
-	readOpts        *options.FindOptions
-	bulkWriteOpts   *options.BulkWriteOptions
 }
 
 // NewCopyManager creates a new manager for a single collection copy.
@@ -174,18 +173,16 @@ func NewCopyManager(source, target *mongo.Client, collInfo discover.CollectionIn
 		statusMgr:       statusMgr,
 		checkpointMgr:   checkpointMgr,
 		checkpointDocID: checkpointDocID,
-		readOpts:        options.Find().SetBatchSize(int32(config.Cfg.Cloner.ReadBatchSize)),
-		bulkWriteOpts:   options.BulkWrite().SetOrdered(false).SetBypassDocumentValidation(true),
 	}
 }
 
 // This function runs the full 3-phase copy operation for one collection
-func (cm *CopyManager) Do(ctx context.Context) (int64, primitive.Timestamp, error) {
+func (cm *CopyManager) Do(ctx context.Context) (int64, bson.Timestamp, error) {
 	ns := cm.collInfo.Namespace
 	db := cm.collInfo.DB
 	coll := cm.collInfo.Coll
 	sourceCount := cm.collInfo.Count
-	emptyTS := primitive.Timestamp{}
+	emptyTS := bson.Timestamp{}
 
 	logging.PrintInfo(fmt.Sprintf("[%s] Source collection has %d documents.", ns, sourceCount), 3)
 
@@ -248,7 +245,7 @@ func (cm *CopyManager) Do(ctx context.Context) (int64, primitive.Timestamp, erro
 	}
 
 	// --- PHASE 3: Finalize Indexes ---
-	if err := indexer.FinalizeIndexes(ctx, targetColl, indexModels, ns); err != nil {
+	if err := indexer.FinalizeIndexes(ctx, targetColl, cm.collInfo.Indexes, ns); err != nil {
 		logging.PrintError(fmt.Sprintf("[%s] Index finalization failed: %v", ns, err), 3)
 	}
 
@@ -357,7 +354,12 @@ func (cm *CopyManager) readWorker(
 
 		filter := bson.D{{Key: "_id", Value: idFilter}}
 
-		cursor, err := coll.Find(ctx, filter, cm.readOpts.SetSort(bson.D{{Key: "_id", Value: 1}}))
+		// Create options locally to prevent race conditions and type errors
+		readOpts := options.Find().
+			SetBatchSize(int32(config.Cfg.Cloner.ReadBatchSize)).
+			SetSort(bson.D{{Key: "_id", Value: 1}})
+
+		cursor, err := coll.Find(ctx, filter, readOpts)
 		if err != nil {
 			logging.PrintError(fmt.Sprintf("[%s] Read Worker %d Find failed: %v", ns, workerID, err), 4)
 			return
@@ -428,6 +430,11 @@ func (cm *CopyManager) insertWorker(
 ) {
 	defer wg.Done()
 
+	// Define options locally.
+	bulkWriteOpts := options.BulkWrite().
+		SetOrdered(false).
+		SetBypassDocumentValidation(true)
+
 	for batch := range queue {
 		if len(batch.models) == 0 {
 			continue
@@ -437,7 +444,7 @@ func (cm *CopyManager) insertWorker(
 		}
 
 		start := time.Now()
-		res, err := coll.BulkWrite(ctx, batch.models, cm.bulkWriteOpts)
+		res, err := coll.BulkWrite(ctx, batch.models, bulkWriteOpts)
 
 		var docCount int64
 		if res != nil {

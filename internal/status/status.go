@@ -11,25 +11,24 @@ import (
 
 	"github.com/Percona-Lab/docMongoStream/internal/config"
 	"github.com/Percona-Lab/docMongoStream/internal/logging"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // Status represents the current state of the migration
 type Status struct {
-	State                string              `json:"state"`
-	LastStateChange      time.Time           `json:"lastStateChange"`
-	Error                string              `json:"error,omitempty"`
-	CloneCompleted       bool                `json:"cloneCompleted"`
-	InitialSyncCompleted bool                `json:"initialSyncCompleted"`
-	Lag                  int64               `json:"lag,omitempty"`
-	EstimatedBytes       int64               `json:"estimatedBytes"`
-	ClonedBytes          int64               `json:"clonedBytes"`
-	EventsApplied        int64               `json:"eventsApplied"`
-	LastEventTimestamp   primitive.Timestamp `json:"lastEventTimestamp,omitempty"`
-	LastBatchAppliedAt   time.Time           `json:"lastBatchAppliedAt,omitempty"`
+	State                string         `json:"state"`
+	LastStateChange      time.Time      `json:"lastStateChange"`
+	Error                string         `json:"error,omitempty"`
+	CloneCompleted       bool           `json:"cloneCompleted"`
+	InitialSyncCompleted bool           `json:"initialSyncCompleted"`
+	Lag                  int64          `json:"lag,omitempty"`
+	EstimatedBytes       int64          `json:"estimatedBytes"`
+	ClonedBytes          int64          `json:"clonedBytes"`
+	EventsApplied        int64          `json:"eventsApplied"`
+	LastEventTimestamp   bson.Timestamp `json:"lastEventTimestamp,omitempty"`
+	LastBatchAppliedAt   time.Time      `json:"lastBatchAppliedAt,omitempty"`
 }
 
 type OpTimeInfo struct {
@@ -69,7 +68,7 @@ type Manager struct {
 	estimatedBytes       int64
 	clonedBytes          int64
 	eventsApplied        int64
-	lastEventTimestamp   primitive.Timestamp
+	lastEventTimestamp   bson.Timestamp
 	lastBatchAppliedAt   time.Time
 
 	targetClient *mongo.Client
@@ -140,7 +139,7 @@ func (m *Manager) GetEventsApplied() int64 {
 }
 
 // UpdateCDCStats updates the CDC counters and records wall time if progress is made
-func (m *Manager) UpdateCDCStats(eventsApplied int64, lastEventTS primitive.Timestamp) {
+func (m *Manager) UpdateCDCStats(eventsApplied int64, lastEventTS bson.Timestamp) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
@@ -295,9 +294,16 @@ func (m *Manager) ToJSON() ([]byte, error) {
 		// Difference between when event happened (Source) and when it was applied (Dest)
 		// Stays constant/low when source is quiet
 		if !m.lastBatchAppliedAt.IsZero() {
-			cdcLag = m.lastBatchAppliedAt.Sub(eventTime).Seconds()
-			if cdcLag < 0 {
+			// If we haven't applied any batches in > 10 seconds,
+			// assume the pipeline is idle/caught up and reset Lag to 0.
+			// This handles the case where the source stops writing, preventing "frozen" lag stats.
+			if time.Since(m.lastBatchAppliedAt) > 10*time.Second {
 				cdcLag = 0.0
+			} else {
+				cdcLag = m.lastBatchAppliedAt.Sub(eventTime).Seconds()
+				if cdcLag < 0 {
+					cdcLag = 0.0
+				}
 			}
 		}
 	}

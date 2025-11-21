@@ -19,10 +19,11 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/mongo/readpref"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 	"golang.org/x/term"
 
 	"github.com/Percona-Lab/docMongoStream/internal/cdc"
@@ -123,7 +124,7 @@ then it will detach and return you to the command prompt.`,
 		logging.PrintStep("Connecting to source DocumentDB...", 0)
 		tlsConfig := &tls.Config{InsecureSkipVerify: config.Cfg.DocDB.TlsAllowInvalidHostnames}
 		clientOpts := options.Client().ApplyURI(docdbURI).SetTLSConfig(tlsConfig)
-		sourceClient, err := mongo.Connect(context.TODO(), clientOpts)
+		sourceClient, err := mongo.Connect(clientOpts)
 		if err != nil {
 			logging.PrintError(fmt.Sprintf("Failed to create source client: %v", err), 0)
 			os.Exit(1)
@@ -139,7 +140,7 @@ then it will detach and return you to the command prompt.`,
 		logging.PrintStep("Connecting to target MongoDB...", 0)
 		mongoTlsConfig := &tls.Config{InsecureSkipVerify: config.Cfg.Mongo.TlsAllowInvalidHostnames}
 		mongoClientOpts := options.Client().ApplyURI(mongoURI).SetTLSConfig(mongoTlsConfig)
-		targetClient, err := mongo.Connect(context.TODO(), mongoClientOpts)
+		targetClient, err := mongo.Connect(mongoClientOpts)
 		if err != nil {
 			logging.PrintError(fmt.Sprintf("Failed to create target client: %v", err), 0)
 			os.Exit(1)
@@ -278,7 +279,7 @@ func monitorStartup(logPath string, offset int64, pidVal int, port string) {
 				var s status.StatusOutput
 				if json.NewDecoder(resp.Body).Decode(&s) == nil {
 					// Check for healthy states
-					if s.OK && (s.State == "running" || s.State == "discovering" || s.State == "destroying") {
+					if s.OK && s.State == "running" {
 						logging.PrintSuccess(fmt.Sprintf("Application is healthy (State: %s).", s.State), 0)
 						return
 					}
@@ -373,7 +374,8 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	mongoURI := config.Cfg.BuildMongoURI(mongoUser, mongoPass)
 	tlsConfig := &tls.Config{InsecureSkipVerify: config.Cfg.DocDB.TlsAllowInvalidHostnames}
 	clientOpts := options.Client().ApplyURI(docdbURI).SetTLSConfig(tlsConfig)
-	sourceClient, err := mongo.Connect(ctx, clientOpts)
+
+	sourceClient, err := mongo.Connect(clientOpts)
 	if err != nil {
 		logging.PrintError(err.Error(), 0)
 		return
@@ -381,7 +383,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	defer sourceClient.Disconnect(context.TODO())
 	mongoTlsConfig := &tls.Config{InsecureSkipVerify: config.Cfg.Mongo.TlsAllowInvalidHostnames}
 	mongoClientOpts := options.Client().ApplyURI(mongoURI).SetTLSConfig(mongoTlsConfig)
-	targetClient, err := mongo.Connect(ctx, mongoClientOpts)
+	targetClient, err := mongo.Connect(mongoClientOpts)
 	if err != nil {
 		logging.PrintError(err.Error(), 0)
 		return
@@ -405,7 +407,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	}
 	checkpointManager := checkpoint.NewManager(targetClient)
 
-	var startAt primitive.Timestamp
+	var startAt bson.Timestamp
 	var collectionsToMigrate []discover.CollectionInfo
 
 	resumeAt, found := checkpointManager.GetResumeTimestamp(ctx, config.Cfg.Migration.CheckpointDocID)
@@ -473,7 +475,8 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 			finalT0 = t0
 		}
 
-		now := primitive.Timestamp{T: uint32(time.Now().Unix()), I: 0}
+		// bson.Timestamp is struct{T, I}
+		now := bson.Timestamp{T: uint32(time.Now().Unix()), I: 0}
 		lag := int64(now.T) - int64(finalT0.T)
 		if lag < 0 {
 			lag = 0
@@ -571,7 +574,7 @@ func extractDBNames(collections []discover.CollectionInfo) []string {
 	return dbNames
 }
 
-func launchFullLoadWorkers(ctx context.Context, source, target *mongo.Client, collections []discover.CollectionInfo, statusMgr *status.Manager, checkpointMgr *checkpoint.Manager) (primitive.Timestamp, error) {
+func launchFullLoadWorkers(ctx context.Context, source, target *mongo.Client, collections []discover.CollectionInfo, statusMgr *status.Manager, checkpointMgr *checkpoint.Manager) (bson.Timestamp, error) {
 	jobs := make(chan discover.CollectionInfo, len(collections))
 	for _, c := range collections {
 		jobs <- c
@@ -608,10 +611,10 @@ func launchFullLoadWorkers(ctx context.Context, source, target *mongo.Client, co
 	close(resultsChan)
 	for err := range resultsChan {
 		if err != nil {
-			return primitive.Timestamp{}, err
+			return bson.Timestamp{}, err
 		}
 	}
-	return primitive.Timestamp{}, nil
+	return bson.Timestamp{}, nil
 }
 
 func init() {

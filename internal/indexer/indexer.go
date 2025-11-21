@@ -8,8 +8,9 @@ import (
 
 	"github.com/Percona-Lab/docMongoStream/internal/discover"
 	"github.com/Percona-Lab/docMongoStream/internal/logging"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // CreateCollectionAndPreloadIndexes handles the initial setup of the target collection.
@@ -44,7 +45,8 @@ func CreateCollectionAndPreloadIndexes(ctx context.Context, targetDB *mongo.Data
 }
 
 // FinalizeIndexes builds any indexes that failed during pre-load.
-func FinalizeIndexes(ctx context.Context, targetColl *mongo.Collection, indexes []mongo.IndexModel, ns string) error {
+// Accepts []discover.IndexInfo to access metadata (Name) which is hidden in v2 IndexModel builders.
+func FinalizeIndexes(ctx context.Context, targetColl *mongo.Collection, indexes []discover.IndexInfo, ns string) error {
 	if len(indexes) == 0 {
 		return nil
 	}
@@ -72,15 +74,18 @@ func FinalizeIndexes(ctx context.Context, targetColl *mongo.Collection, indexes 
 	// Filter out any indexes that successfully built
 	indexesToBuild := []mongo.IndexModel{}
 	for _, idx := range indexes {
-		if idx.Options != nil && idx.Options.Name != nil {
-			if !existingIndexes[*idx.Options.Name] {
-				indexesToBuild = append(indexesToBuild, idx)
+		if !existingIndexes[idx.Name] {
+			// Reconstruct the model for the V2 driver
+			model := mongo.IndexModel{
+				Keys:    idx.Key,
+				Options: options.Index().SetName(idx.Name).SetUnique(idx.Unique),
 			}
+			indexesToBuild = append(indexesToBuild, model)
 		}
 	}
 
 	if len(indexesToBuild) == 0 {
-		logging.PrintSuccess(fmt.Sprintf("[%d] All indexes confirmed.", 0), 0)
+		logging.PrintSuccess(fmt.Sprintf("[%s] All indexes confirmed.", ns), 0)
 		return nil
 	}
 

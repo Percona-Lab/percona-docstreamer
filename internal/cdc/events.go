@@ -3,9 +3,8 @@ package cdc
 import (
 	"fmt"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
 // OperationType is the type of MongoDB operation
@@ -28,14 +27,14 @@ const (
 
 // ChangeEvent represents a single event from the change stream
 type ChangeEvent struct {
-	ID            bson.Raw            `bson:"_id"`
-	OperationType OperationType       `bson:"operationType"`
-	ClusterTime   primitive.Timestamp `bson:"clusterTime"`
-	FullDocument  bson.Raw            `bson:"fullDocument"`
-	Namespace     Namespace           `bson:"ns"`
-	DocumentKey   bson.M              `bson:"documentKey"`
-	To            Namespace           `bson:"to,omitempty"`
-	UpdateFields  bson.M              `bson:"updateDescription,omitempty"`
+	ID            bson.Raw       `bson:"_id"`
+	OperationType OperationType  `bson:"operationType"`
+	ClusterTime   bson.Timestamp `bson:"clusterTime"`
+	FullDocument  bson.Raw       `bson:"fullDocument"`
+	Namespace     Namespace      `bson:"ns"`
+	DocumentKey   bson.M         `bson:"documentKey"`
+	To            Namespace      `bson:"to,omitempty"`
+	UpdateFields  bson.M         `bson:"updateDescription,omitempty"`
 }
 
 // Namespace holds the db and collection

@@ -6,8 +6,8 @@ import (
 
 	"github.com/Percona-Lab/docMongoStream/internal/config"
 	"github.com/Percona-Lab/docMongoStream/internal/logging"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
 // DropAllDatabases lists all databases on the target and drops them,
