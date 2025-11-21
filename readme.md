@@ -701,7 +701,7 @@ This is the initial snapshot stage.
 
 **Global Time Capture ($\mathbf{T_0}$):** Before a single document is copied, the tool captures the source cluster's current Cluster Time. This timestamp ($\mathbf{T_0}$) becomes the guaranteed starting point for the CDC phase, ensuring strictly zero data loss.
 
-**Parallel Execution:** A worker pool is created (based on migration.max_concurrent_workers) to copy collections in parallel.
+**Parallel Execution:** A collection-level worker pool (configured via `migration.max_concurrent_workers`) orchestrates the migration. Inside each collection, data is processed concurrently by dedicated read and insert workers (`cloner.num_read_workers` and `cloner.num_insert_workers`) to maximize throughput.
 
 **Open-Ended Snapshots:** Each worker copies documents using an unbounded query strategy for the final segment. This ensures that documents inserted into a collection while it is being copied are captured, preventing the "frozen max key" issue common in other migration tools.
 
