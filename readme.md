@@ -48,7 +48,8 @@ You can obtain the DocumentDB AWS CA cert for your cluster by going to the AWS c
 
 #### How to enable change streams in DocumentDB
 
-docMongoStream was designed to run these checks for you automatically. DocumentDB requires change streams to be explicitly enabled. Once you have modified the parameter groups accordingly you can then proceed to enabling the Cluster Stream. Run the MongoDB shell command below to enable the cluster-wide stream in your DocumentDB cluster:
+docMongoStream was designed to run these checks for you automatically, but it does not make these changes for you. 
+DocumentDB requires change streams to be explicitly enabled. Once you have modified the parameter groups accordingly you can then proceed to enabling the Cluster Stream. Connect to your DocumentDB cluster via a mongo shell and run the command below to enable the cluster-wide stream in your DocumentDB cluster:
 
 ```bash
 use admin;
@@ -264,9 +265,9 @@ CDC performance is governed by concurrency and batching efficiency.
 
 docMongoStream operates as a background process managed by simple commands, so its usage is rather straight forward. Once you have edited the configuration file accordingly, all you need to do is run the commands as shown below.
 
-### Start
+### Start / Resume
 
-The start command can be used to start a brand new migration and to resume a migration that has been stopped. 
+The start command can be used to start a brand new migration and to resume a migration that has been stopped. docMongoStream will check if a full migration has already completed and it will resume from the last checkpoint.  
 
 ```bash
 ./docMongoStream start --docdb-user=your_docdb_user --mongo-user=your_mongo_user
@@ -275,10 +276,9 @@ The start command can be used to start a brand new migration and to resume a mig
 Sample output:
 
 ```bash
-./docMongoStream start --docdb-user=percona --mongo-user=root
-2025/11/17 16:02:57 [INFO] CDC Operations logger initialized (file: logs/cdc.log)
-2025/11/17 16:02:57 [INFO] Full Load logger initialized (file: logs/full_load.log)
-2025/11/17 16:02:57
+2025/11/20 19:14:44 [INFO] CDC Operations logger initialized (file: logs/cdc.log)
+2025/11/20 19:14:44 [INFO] Full Load logger initialized (file: logs/full_load.log)
+2025/11/20 19:14:44
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ________            ______  ___                                ____________
 ___  __ \______________   |/  /___________________ ______      __  ___/_  /__________________ _______ ___
@@ -288,39 +288,56 @@ _  /_/ // /_/ / /__ _  /  / / / /_/ /  / / /  /_/ // /_/ /     ____/ // /_ _  / 
                                            /____/
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-2025/11/17 16:02:57 --- docMongoStream Application Start ---
-2025/11/17 16:02:57
+2025/11/20 19:14:44 --- docMongoStream Application Start ---
+2025/11/20 19:14:44
 --- Phase 1: VALIDATION ---
-Enter DocumentDB password for user 'percona':
-Enter MongoDB password for user 'root':
-2025/11/17 16:03:05 [TASK] Connecting to source DocumentDB...
-2025/11/17 16:03:06 [TASK] Connecting to target MongoDB...
-2025/11/17 16:03:06 [OK]   Connections successful.
-2025/11/17 16:03:06 [TASK] Validating DocumentDB Change Stream configuration...
-2025/11/17 16:03:06 [INFO] [VALIDATE] Running $listChangeStreams on admin DB...
-2025/11/17 16:03:06 [INFO] [VALIDATE] Found 15 enabled change streams:
-2025/11/17 16:03:06 [INFO] [VALIDATE]   - my_awesome_app.*
-2025/11/17 16:03:06 [INFO] [VALIDATE]   - my_awesome_app.users
-2025/11/17 16:03:06 [INFO] [VALIDATE]   - percona_db_1.test_1
-2025/11/17 16:03:06 [INFO] [VALIDATE]   - percona_db_1.test_5
-2025/11/17 16:03:06 [INFO] [VALIDATE]   - percona_db_1.test_2
-2025/11/17 16:03:06 [INFO] [VALIDATE]   - percona_db_1.test_3
-2025/11/17 16:03:06 [INFO] [VALIDATE]   - percona_db_1.test_4
-2025/11/17 16:03:06 [INFO] [VALIDATE]   - percona_db_2.test_1
-2025/11/17 16:03:06 [INFO] [VALIDATE]   - percona_db_2.test_2
-2025/11/17 16:03:06 [INFO] [VALIDATE]   - percona_db_2.test_3
-2025/11/17 16:03:06 [INFO] [VALIDATE]   - percona_db_2.test_4
-2025/11/17 16:03:06 [INFO] [VALIDATE]   - percona_db_2.test_5
-2025/11/17 16:03:06 [INFO] [VALIDATE]   - tobeignored.skipme_1
-2025/11/17 16:03:06 [INFO] [VALIDATE]   - alpha.test_1
-2025/11/17 16:03:06 [INFO] [VALIDATE]   - CLUSTER_WIDE (*.*)
-2025/11/17 16:03:06 [OK]   DocumentDB Change Stream configuration is valid.
-2025/11/17 16:03:06
+2025/11/20 19:14:44 [TASK] Connecting to source DocumentDB...
+2025/11/20 19:14:44 [TASK] Connecting to target MongoDB...
+2025/11/20 19:14:45 [OK]   Connections successful.
+2025/11/20 19:14:45 [TASK] Validating DocumentDB Change Stream configuration...
+2025/11/20 19:14:45 [INFO] [VALIDATE] Running $listChangeStreams on admin DB...
+2025/11/20 19:14:45 [INFO] [VALIDATE] Found 15 enabled change streams:
+2025/11/20 19:14:45 [INFO] [VALIDATE]   - my_awesome_app.*
+2025/11/20 19:14:45 [INFO] [VALIDATE]   - my_awesome_app.users
+2025/11/20 19:14:45 [INFO] [VALIDATE]   - percona_db_1.test_1
+2025/11/20 19:14:45 [INFO] [VALIDATE]   - percona_db_1.test_5
+2025/11/20 19:14:45 [INFO] [VALIDATE]   - percona_db_1.test_2
+2025/11/20 19:14:45 [INFO] [VALIDATE]   - percona_db_1.test_3
+2025/11/20 19:14:45 [INFO] [VALIDATE]   - percona_db_1.test_4
+2025/11/20 19:14:45 [INFO] [VALIDATE]   - percona_db_2.test_1
+2025/11/20 19:14:45 [INFO] [VALIDATE]   - percona_db_2.test_2
+2025/11/20 19:14:45 [INFO] [VALIDATE]   - percona_db_2.test_3
+2025/11/20 19:14:45 [INFO] [VALIDATE]   - percona_db_2.test_4
+2025/11/20 19:14:45 [INFO] [VALIDATE]   - percona_db_2.test_5
+2025/11/20 19:14:45 [INFO] [VALIDATE]   - tobeignored.skipme_1
+2025/11/20 19:14:45 [INFO] [VALIDATE]   - alpha.test_1
+2025/11/20 19:14:45 [INFO] [VALIDATE]   - CLUSTER_WIDE (*.*)
+2025/11/20 19:14:45 [OK]   DocumentDB Change Stream configuration is valid.
+2025/11/20 19:14:45
 --- Phase 2: LAUNCHING BACKGROUND PROCESS ---
-2025/11/17 16:03:06 [OK]   Application started in background with PID: 3017878
-2025/11/17 16:03:06 [INFO] Logs are being written to: logs/docMongoStream.log
-2025/11/17 16:03:06 [INFO] To stop the application, run: /home/daniel.almeida/docMongoStream stop
-2025/11/17 16:03:06 [INFO] To check status, run: /home/daniel.almeida/docMongoStream status (or GET http://localhost:8080/status)
+2025/11/20 19:14:45 [OK]   Application started in background with PID: 1841063
+2025/11/20 19:14:45 [INFO] CDC Operations logger initialized (file: logs/cdc.log)
+2025/11/20 19:14:45 [INFO] Full Load logger initialized (file: logs/full_load.log)
+2025/11/20 19:14:45 [INFO] Writing PID 1841063 to ./docMongoStream.pid
+2025/11/20 19:14:45 [INFO] Status manager initialized (collection: docMongoStream.status)
+2025/11/20 19:14:45 [INFO] [STATUS] State changed to: connecting (Connections established. Pinging...)
+2025/11/20 19:14:45 [INFO] Starting status HTTP server on :8080/status
+2025/11/20 19:14:46 [INFO] Checkpoint manager initialized (collection: docMongoStream.checkpoints)
+2025/11/20 19:14:46 [INFO] [CDC cdc_resume_timestamp] Found resume timestamp: {1763682329 1002}
+2025/11/20 19:14:46
+--- Phase 1: DISCOVERY (SKIPPED) ---
+2025/11/20 19:14:46
+--- Phase 2: FULL DATA LOAD (SKIPPED) ---
+2025/11/20 19:14:46 [INFO] Resuming CDC from global checkpoint: {1763682329 1002}
+2025/11/20 19:14:46
+--- Phase 3: CONTINUOUS SYNC (CDC) ---
+2025/11/20 19:14:46 [INFO] [STATUS] State changed to: running (Change Data Capture)
+2025/11/20 19:14:46 [INFO] [CDC cdc_resume_timestamp] Found resume timestamp: {1763682329 1002}
+2025/11/20 17:59:58 [TASK] [lws_1.test_4] Processed batch: 1000 inserted, 0 replaced. (310 kB) in 563.608945ms
+2025/11/20 19:14:46 [INFO] [CDC] Resuming event count from 440000
+2025/11/20 19:14:46 [INFO] Starting cluster-wide CDC... Resuming from checkpoint: {1763682329 1002}
+2025/11/20 19:14:46 [INFO] [CDC] Starting 4 concurrent write workers...
+2025/11/20 19:14:46 [TASK] [CDC] Starting cluster-wide change stream watcher...
 ```
 
 ### Stop
@@ -331,11 +348,8 @@ Enter MongoDB password for user 'root':
 
 Sample Output:
 
-```
-./docMongoStream stop
-2025/11/17 16:05:14 [INFO] CDC Operations logger initialized (file: logs/cdc.log)
-2025/11/17 16:05:14 [INFO] Full Load logger initialized (file: logs/full_load.log)
-2025/11/17 16:05:14
+```bash
+2025/11/20 21:55:16
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ________            ______  ___                                ____________
 ___  __ \______________   |/  /___________________ ______      __  ___/_  /__________________ _______ ___
@@ -345,10 +359,23 @@ _  /_/ // /_/ / /__ _  /  / / / /_/ /  / / /  /_/ // /_/ /     ____/ // /_ _  / 
                                            /____/
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-2025/11/17 16:05:14 --- docMongoStream Application Start ---
-2025/11/17 16:05:14
+2025/11/20 21:55:16
 --- Phase X: STOPPING APPLICATION ---
-2025/11/17 16:05:14 [OK]   Stop signal sent. It may take a few seconds for the process to shut down.
+2025/11/20 21:55:16 [OK]   Stop signal sent.
+2025/11/20 21:55:16 [OK]   Stop signal sent.
+2025/11/20 21:55:16 [WARN] Received signal: terminated. Initiating graceful shutdown...
+2025/11/20 21:55:16 [INFO] !!! PLEASE WAIT: Flushing final CDC batches to destination...
+2025/11/20 21:55:16 [INFO] !!! DO NOT FORCE QUIT (Ctrl+C), or data may be lost.
+2025/11/20 21:55:16 [INFO] [STATUS] State changed to: stopping (Flushing pending events... Please wait.)
+2025/11/20 21:55:16 [INFO] [CDC] Processor shutting down. Flushing final batch...
+2025/11/20 21:55:16 [INFO] [Worker 1] Shutting down.
+2025/11/20 21:55:16 [INFO] [Worker 2] Shutting down.
+2025/11/20 21:55:16 [INFO] [Worker 3] Shutting down.
+2025/11/20 21:55:16 [INFO] [Worker 0] Shutting down.
+2025/11/20 21:55:16 [INFO] [CDC] Watcher stopped. Waiting for processor to finalize...
+2025/11/20 21:55:16 [INFO] [CDC cdc_resume_timestamp] Found resume timestamp: {1763682329 1002}
+2025/11/20 21:55:16 [INFO] [CDC] Processor finalized. Shutdown complete.
+2025/11/20 21:55:16 [INFO] CDC process stopped. Exiting.
 ```
 
 ### Status
@@ -360,29 +387,28 @@ _  /_/ // /_/ / /__ _  /  / / / /_/ /  / / /  /_/ // /_/ /     ____/ // /_ _  / 
 Sample output
 
 ```bash
- ./docMongoStream status 
 --- docMongoStream Status (Live) ---
-PID: 554240 (Querying http://localhost:8080/status)
+PID: 1973713 (Querying http://localhost:8080/status)
 {
     "ok": true,
     "state": "running",
     "info": "Change Data Capture",
-    "timeSinceLastEventSeconds": 230.694939041,
-    "cdcLagSeconds": 2.028853483,
-    "totalEventsApplied": 315000,
+    "timeSinceLastEventSeconds": 11474.269888194,
+    "cdcLagSeconds": 2.407,
+    "totalEventsApplied": 440000,
     "lastSourceEventTime": {
-        "ts": "1763569833.1002",
-        "isoDate": "2025-11-19T16:30:33Z"
+        "ts": "1763682329.1002",
+        "isoDate": "2025-11-20T23:45:29Z"
     },
-    "lastBatchAppliedAt": "2025-11-19T16:30:35Z",
+    "lastBatchAppliedAt": "2025-11-20T23:45:31Z",
     "initialSync": {
         "completed": true,
-        "completionLagSeconds": 78,
+        "completionLagSeconds": 112,
         "cloneCompleted": true,
-        "estimatedCloneSizeBytes": 473256586,
-        "clonedSizeBytes": 473256586,
-        "estimatedCloneSizeHuman": "451.3 MB",
-        "clonedSizeHuman": "451.3 MB"
+        "estimatedCloneSizeBytes": 794409586,
+        "clonedSizeBytes": 794409586,
+        "estimatedCloneSizeHuman": "757.6 MB",
+        "clonedSizeHuman": "757.6 MB"
     }
 }
 ```
@@ -443,11 +469,11 @@ The status command provides real-time metrics on the health and progress of your
 
 ### Logs
 
-docMongoStream generates three separate logs:
+docMongoStream generates three separate logs, each of the logs location and name can be configured via [config.yaml](./config.yaml):
 
-1. Application Log: Tracks the overall application status and any errors encountered.
-2. Full Load Log: Dedicated to the initial full synchronization process. This log, together with the status endpoint, helps you monitor the progress of the initial sync.
-3. CDC Log: Dedicated to Change Data Capture (CDC) operations. These operations begin only after the full sync is complete, so this log will remain empty until that point. Use it, along with the status endpoint, to track CDC progress.
+1. Application Log (`logs/docMongoStream.log`): Tracks the overall application status and any errors encountered.
+2. Full Load Log (`logs/full_load.log`): Dedicated to the initial full synchronization process. This log, together with the status endpoint, helps you monitor the progress of the initial sync.
+3. CDC Log (`logs/cdc.log`): Dedicated to Change Data Capture (CDC) operations. These operations begin only after the full sync is complete, so this log will remain empty until that point. Use it, along with the status endpoint, to track CDC progress.
 
 Application log sample:
 
