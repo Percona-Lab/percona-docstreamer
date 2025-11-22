@@ -274,7 +274,10 @@ Change Data Capture (CDC) performance is largely governed by concurrency and bat
 
 This setting determines the write pipeline's capacity during live synchronization. A higher value enables greater parallelism when replaying real-time events. You can increase this value to utilize more target resources and improve real-time throughput. This is particularly effective if the source (DocumentDB) has a high volume of changes and the target (MongoDB) has ample CPU and I/O capacity.
 
-Note: Setting this value too high may saturate connections or CPU resources on the target MongoDB cluster, potentially degrading the performance of other operations.
+**Note:** Setting this value too high may saturate connections or CPU resources on the target MongoDB cluster, potentially degrading the performance of other operations.
+
+**Note on Partitioning:** docMongoStream uses Key-Based Partitioning to guarantee strict data ordering. This means all updates for a specific document are handled by the same worker. In rare cases of "Hot Keys" (a single document receiving massive update volume), one worker may be utilized more than others. This is an intentional trade-off to ensure data integrity.
+
 
 | Setting | Purpose |
 |--------:|---------|
@@ -282,7 +285,6 @@ Note: Setting this value too high may saturate connections or CPU resources on t
 | `cdc.batch_size` | Number of operations (inserts/updates/deletes) grouped into a single network request. Larger batches reduce network overhead per operation. |
 | `cdc.batch_interval_ms` | Maximum wait time before flushing an incomplete batch. Lower values reduce latency; higher values increase overall throughput. This ensures low-volume changes are still applied quickly |
 | `cdc.max_await_time_ms` | Max time (in ms) for the change stream to wait for new events |
-
 
 ## How to Use docMongoStream
 
@@ -909,31 +911,22 @@ Think of CDC as "Live Tailing." Instead of reading static files, the docMongoStr
     - The Pipeline
       - As these notifications (events) arrive, the Watcher pushes them instantly into a high-speed internal queue.
         
-3. The Processor (The sorter)\
-  A processor sits at the end of that queue and sorts the events.
-    - Data Events (Inserts/Updates/Deletes): 
-      - These are thrown into a Bulk Buffer. 
-          - The tool doesn't write them one by one (which is slow); 
-          - It groups them into batches (e.g., 1,000 at a time).
-    - DDL Events (Schema Changes)
-      - If someone drops a collection or renames a DB, this is a "Stop the Presses" moment. 
-        - The processor
-          - Pauses reading.
-          - Flushes all pending data writes to ensure order.
-          - Executes the schema change immediately.
-          - Saves a checkpoint.
-          
-4. The Writers (Parallel Execution)\
-  Just like with the Full Sync, we don't use just one thread to write. We use Write Workers (configured by `cdc.max_write_workers`).
-    - Concurrent Batches 
-      - When the buffer is full (or every 500ms), a batch is handed to a worker.
-    - Translation (The Magic Trick)
-      - This is key. The worker doesn't just copy the operation blind. 
-        - Source says: "Insert Document A.
-        - "Worker translates to: "Replace Document A (Upsert: True).
-        - "Why? 
-          - Because of the overlap in step 1. If the Full Sync already copied "Document A," a standard Insert would fail. 
-          - The "Replace/Upsert" logic makes it safe to replay the same event twice.
+3. The Processor (The Router)\
+  A processor sits at the end of that queue and routes the events.
+    - Consistent Hashing: Instead of a random pool, the processor calculates a hash of the document's _id.
+    - Routing: Based on this hash, the event is assigned to a specific Worker Partition.
+      - Example: All updates for "Doc A" are always routed to "Worker 1". All updates for "Doc B" go to "Worker 2".
+      - Benefit: This guarantees that the timeline of changes for any single document remains strictly serial, preventing race conditions where a newer update overwrites an older one.
+    - DDL Events (Schema Changes):
+      - If a schema change occurs (e.g., Drop Collection), the processor pauses.
+      - It flushes all partition buffers to ensure global consistency.
+      - It executes the DDL and saves a checkpoint.
+
+4. The Writers (Partitioned Execution)\
+  We use Write Workers (configured by `cdc.max_write_workers`), but they operate independently.
+    - Dedicated Buffers: Each worker has its own dedicated buffer. When a worker's buffer is full (or time elapses), it flushes only its assigned documents.
+    - Ordered Writes: Writes are sent to MongoDB with ordered: true. This ensures that within a batch, Update 1 is applied before Update 2, maintaining strict chronological history.
+    - Translation (Idempotency): The worker translates operations (Insert -> Replace/Upsert) to handle the overlap with the Full Load phase safely.
           
 5. The Safety Net (Checkpoints)\
   While all this is happening, the docMongoStream is constantly saving its place.

@@ -3,6 +3,7 @@ package cdc
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,11 +19,12 @@ import (
 
 // CDCManager manages the change stream watcher and batch processor
 type CDCManager struct {
-	sourceClient       *mongo.Client
-	targetClient       *mongo.Client
-	eventQueue         chan *ChangeEvent
-	flushQueue         chan map[string][]mongo.WriteModel // Channel for batches to be processed
-	bulkWriter         *BulkWriter
+	sourceClient *mongo.Client
+	targetClient *mongo.Client
+	eventQueue   chan *ChangeEvent
+	// Key-Based Partitioning: We now have a slice of queues and writers (one pair per worker)
+	flushQueues        []chan map[string][]mongo.WriteModel
+	bulkWriters        []*BulkWriter
 	startAt            bson.Timestamp
 	lastSuccessfulTS   bson.Timestamp
 	checkpoint         *checkpoint.Manager
@@ -50,18 +52,34 @@ func NewManager(source, target *mongo.Client, checkpointDocID string, startAt bs
 	if initialEvents > 0 {
 		logging.PrintInfo(fmt.Sprintf("[CDC] Resuming event count from %d", initialEvents), 0)
 	}
+
+	// Initialize Key-Based Partitioning structures
+	workerCount := config.Cfg.CDC.MaxWriteWorkers
+	if workerCount < 1 {
+		workerCount = 1
+	}
+
+	queues := make([]chan map[string][]mongo.WriteModel, workerCount)
+	writers := make([]*BulkWriter, workerCount)
+
+	for i := 0; i < workerCount; i++ {
+		// Each worker gets its own buffered channel to prevent blocking the processor
+		queues[i] = make(chan map[string][]mongo.WriteModel, config.Cfg.Migration.MaxConcurrentWorkers)
+		writers[i] = NewBulkWriter(target, config.Cfg.CDC.BatchSize)
+	}
+
 	mgr := &CDCManager{
 		sourceClient:     source,
 		targetClient:     target,
 		eventQueue:       make(chan *ChangeEvent, config.Cfg.CDC.BatchSize*2),
-		flushQueue:       make(chan map[string][]mongo.WriteModel, config.Cfg.Migration.MaxConcurrentWorkers), // Buffered channel
-		bulkWriter:       NewBulkWriter(target, config.Cfg.CDC.BatchSize),
-		startAt:          resumeTS, // Use the loaded checkpoint (T0)
+		flushQueues:      queues,
+		bulkWriters:      writers,
+		startAt:          resumeTS,
 		lastSuccessfulTS: resumeTS,
 		checkpoint:       checkpoint,
 		statusManager:    statusMgr,
 		shutdownWG:       sync.WaitGroup{},
-		workerWG:         sync.WaitGroup{}, // Initialize worker WG
+		workerWG:         sync.WaitGroup{},
 		checkpointDocID:  checkpointDocID,
 	}
 	mgr.totalEventsApplied.Store(initialEvents)
@@ -90,7 +108,12 @@ func (m *CDCManager) handleBulkWrite(ctx context.Context, batch map[string][]mon
 		}
 
 		targetColl := m.targetClient.Database(db).Collection(coll)
-		opts := options.BulkWrite().SetOrdered(false)
+
+		// CRITICAL CHANGE for Partitioning: SetOrdered(true)
+		// Since we are now partitioning by Key, a single worker might receive multiple
+		// updates for the SAME document in one batch. We must apply them in order.
+		opts := options.BulkWrite().SetOrdered(true)
+
 		result, err := targetColl.BulkWrite(ctx, models, opts)
 
 		if err != nil {
@@ -111,23 +134,19 @@ func (m *CDCManager) handleBulkWrite(ctx context.Context, batch map[string][]mon
 	return totalOps, namespaces, firstErr
 }
 
-// startFlushWorkers launches the concurrent workers
+// startFlushWorkers launches the concurrent workers, each attached to a specific queue
 func (m *CDCManager) startFlushWorkers() {
-	workerCount := config.Cfg.CDC.MaxWriteWorkers
-	logging.PrintInfo(fmt.Sprintf("[CDC] Starting %d concurrent write workers...", workerCount), 0)
+	workerCount := len(m.flushQueues)
+	logging.PrintInfo(fmt.Sprintf("[CDC] Starting %d partition-aware write workers...", workerCount), 0)
 
 	for i := 0; i < workerCount; i++ {
 		m.workerWG.Add(1)
-		go func(workerID int) {
+		// Launch worker specifically for queue [i]
+		go func(workerID int, queue <-chan map[string][]mongo.WriteModel) {
 			defer m.workerWG.Done()
 
-			// Drain the channel until it is closed. Do NOT stop on ctx.Done().
-			// This ensures all pending batches (especially the final one) are processed.
-			for batch := range m.flushQueue {
+			for batch := range queue {
 				start := time.Now()
-
-				// Use a Background context for the write.
-				// The main 'ctx' might be cancelled already (shutdown), but we must finish writing.
 				writeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				flushedCount, namespaces, err := m.handleBulkWrite(writeCtx, batch)
 				cancel()
@@ -135,14 +154,13 @@ func (m *CDCManager) startFlushWorkers() {
 				logging.LogCDCOp(start, flushedCount, namespaces, err)
 
 				if err != nil {
-					logging.PrintError(fmt.Sprintf("[CDC] CRITICAL: Worker batch flush failed: %v", err), 0)
+					logging.PrintError(fmt.Sprintf("[CDC Worker %d] CRITICAL: Batch flush failed: %v", workerID, err), 0)
 				} else {
-					// ATOMIC UPDATE
 					m.totalEventsApplied.Add(flushedCount)
 				}
 			}
 			logging.PrintInfo(fmt.Sprintf("[Worker %d] Shutting down.", workerID), 0)
-		}(i)
+		}(i, m.flushQueues[i])
 	}
 }
 
@@ -150,7 +168,7 @@ func (m *CDCManager) startFlushWorkers() {
 func (m *CDCManager) Start(ctx context.Context) error {
 	logging.PrintInfo(fmt.Sprintf("Starting cluster-wide CDC... Resuming from checkpoint: %v", m.startAt), 0)
 
-	m.startFlushWorkers() // Start the parallel workers (no ctx passed, they rely on channel close)
+	m.startFlushWorkers()
 
 	m.shutdownWG.Add(1)
 	go m.processChanges(ctx)
@@ -158,9 +176,8 @@ func (m *CDCManager) Start(ctx context.Context) error {
 	err := m.watchChanges(ctx)
 
 	logging.PrintInfo("[CDC] Watcher stopped. Waiting for processor to finalize...", 0)
-	m.shutdownWG.Wait() // Wait for processChanges to finish flushing to channel
+	m.shutdownWG.Wait()
 
-	// processChanges has closed the channel. Now wait for workers to drain it.
 	m.workerWG.Wait()
 
 	// Save the checkpoint here, but only after all workers have successfully finished.
@@ -180,40 +197,84 @@ func (m *CDCManager) Start(ctx context.Context) error {
 	return err
 }
 
-// processChanges reads from the eventQueue and applies changes to the target
+// getWorkerIndex calculates the consistent hash for a document ID
+func (m *CDCManager) getWorkerIndex(docID interface{}) int {
+	numWorkers := len(m.bulkWriters)
+	if numWorkers == 1 {
+		return 0
+	}
+
+	// Marshal the ID to bytes to ensure consistent representation (handles ObjectId, string, int, etc.)
+	// We wrap it in a D struct to ensure valid BSON serialization
+	data, err := bson.Marshal(bson.D{{"v", docID}})
+	if err != nil {
+		// Fallback for extreme edge cases
+		logging.PrintWarning(fmt.Sprintf("[CDC] Failed to marshal _id for hashing: %v. Using string fallback.", err), 0)
+		data = []byte(fmt.Sprintf("%v", docID))
+	}
+
+	h := fnv.New32a()
+	h.Write(data)
+	return int(h.Sum32()) % numWorkers
+}
+
+// processChanges reads from the eventQueue, routes to buffers, and flushes to workers
 func (m *CDCManager) processChanges(ctx context.Context) {
 	defer m.shutdownWG.Done()
 
-	// Ensure flushQueue is closed when this function exits, causing workers to stop.
-	defer close(m.flushQueue)
+	// Ensure ALL flushQueues are closed when this function exits
+	defer func() {
+		for _, ch := range m.flushQueues {
+			close(ch)
+		}
+	}()
 
 	ticker := time.NewTicker(time.Duration(config.Cfg.CDC.BatchIntervalMS) * time.Millisecond)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
-			logging.PrintInfo("[CDC] Processor shutting down. Flushing final batch...", 0)
-			// Flush any remaining events in the buffer
-			if finalBatch := m.bulkWriter.ExtractBatches(); len(finalBatch) > 0 {
-				m.flushQueue <- finalBatch
+			logging.PrintInfo("[CDC] Processor shutting down. Flushing all partitions...", 0)
+			// Flush all writers to their respective queues
+			for i, writer := range m.bulkWriters {
+				if finalBatch := writer.ExtractBatches(); len(finalBatch) > 0 {
+					m.flushQueues[i] <- finalBatch
+				}
 			}
-			// DO NOT save checkpoint here. We must wait for workers (in Start)
 			return
+
 		case event := <-m.eventQueue:
 			m.lastSuccessfulTS = event.ClusterTime
+
 			if m.isDDL(event) {
 				m.handleDDL(ctx, event)
 				m.totalEventsApplied.Add(1)
 			} else {
-				if m.bulkWriter.AddEvent(event) {
-					m.flushQueue <- m.bulkWriter.ExtractBatches()
+				// ROUTING LOGIC: Determine which worker owns this document
+				// If DocumentKey is nil (shouldn't happen for CRUD), default to 0
+				var docID interface{}
+				if event.DocumentKey != nil {
+					docID = event.DocumentKey["_id"]
+				}
+
+				workerIdx := m.getWorkerIndex(docID)
+
+				// Add to the assigned buffer
+				if m.bulkWriters[workerIdx].AddEvent(event) {
+					// If buffer is full, flush ONLY this worker's buffer to its queue
+					m.flushQueues[workerIdx] <- m.bulkWriters[workerIdx].ExtractBatches()
 				}
 			}
+
 		case <-ticker.C:
-			if batch := m.bulkWriter.ExtractBatches(); len(batch) > 0 {
-				m.flushQueue <- batch
+			// Periodic flush for ALL partitions to keep latency low
+			for i, writer := range m.bulkWriters {
+				if batch := writer.ExtractBatches(); len(batch) > 0 {
+					m.flushQueues[i] <- batch
+				}
 			}
-			// Update status periodically so metrics are live
+			// Update status periodically
 			m.statusManager.UpdateCDCStats(m.totalEventsApplied.Load(), m.lastSuccessfulTS)
 		}
 	}
@@ -255,16 +316,16 @@ func (m *CDCManager) isDDL(event *ChangeEvent) bool {
 // handleDDL flushes any pending writes and applies the DDL operation
 func (m *CDCManager) handleDDL(ctx context.Context, event *ChangeEvent) {
 	ns := event.Ns()
-	logging.PrintWarning(fmt.Sprintf("[%s] DDL Operation detected: %s. Flushing batch before applying.", ns, event.OperationType), 0)
+	logging.PrintWarning(fmt.Sprintf("[%s] DDL Operation detected: %s. Flushing all partitions before applying.", ns, event.OperationType), 0)
 	saveCtx := context.Background()
 
-	// Flush pending data first
-	if batch := m.bulkWriter.ExtractBatches(); len(batch) > 0 {
-		m.flushQueue <- batch
+	// Flush ALL pending data across ALL partitions
+	for i, writer := range m.bulkWriters {
+		if batch := writer.ExtractBatches(); len(batch) > 0 {
+			m.flushQueues[i] <- batch
+		}
 	}
 
-	// TODO: In a perfect world, we'd wait for workers to drain here too,
-	// but DDL consistency is complex. For now, we save checkpoint immediately.
 	nextTS := bson.Timestamp{T: event.ClusterTime.T, I: event.ClusterTime.I + 1}
 	m.checkpoint.SaveResumeTimestamp(saveCtx, m.checkpointDocID, nextTS)
 	m.statusManager.UpdateCDCStats(m.totalEventsApplied.Load(), event.ClusterTime)
