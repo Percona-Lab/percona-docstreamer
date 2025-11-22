@@ -206,7 +206,7 @@ func (m *CDCManager) getWorkerIndex(docID interface{}) int {
 
 	// Marshal the ID to bytes to ensure consistent representation (handles ObjectId, string, int, etc.)
 	// We wrap it in a D struct to ensure valid BSON serialization
-	data, err := bson.Marshal(bson.D{{"v", docID}})
+	data, err := bson.Marshal(bson.D{{Key: "v", Value: docID}})
 	if err != nil {
 		// Fallback for extreme edge cases
 		logging.PrintWarning(fmt.Sprintf("[CDC] Failed to marshal _id for hashing: %v. Using string fallback.", err), 0)

@@ -861,7 +861,7 @@ Think of the Full Sync as a massive "Divide and Conquer" operation. Instead of t
     - Create Segments 
       - docMongoStream doesn't list all documents. Instead, it calculates logical ranges of _ids. For example, if you have 1 million documents and `cloner.segment_size_docs` is 10,000, it logically creates 100 "tickets" (segments).
 
-2. The "Find" Logic (Read Workers)\  
+2. The "Find" Logic (Read Workers)\
   Several Read Workers run in parallel, grabbing those "tickets" and querying the source. Instead of running one giant query, a worker runs a specific range query for its segment.
     - Standard Segment 
       - "Give me all documents where _id is greater than A and less than or equal to B."
@@ -871,7 +871,7 @@ Think of the Full Sync as a massive "Divide and Conquer" operation. Instead of t
           - While the migration is running, your application might insert new data at the end of the collection. 
           - By making the last query open-ended, the worker keeps reading until it grabs even those brand-new documents, ensuring nothing at the "end" is left behind.
 
-3. The Pipeline (Buffering)\  
+3. The Pipeline (Buffering)\
   The Read Workers don't write to MongoDB directly. They are just "fetchers." 
     - Read
       - A worker fetches a batch of documents (e.g., 1,000 at a time) from DocumentDB.
@@ -880,7 +880,7 @@ Think of the Full Sync as a massive "Divide and Conquer" operation. Instead of t
     - Queue
       - It then pushes this batch into a channel (a safe waiting line in memory).
 
-4. Writing to Target (Insert Workers)\  
+4. Writing to Target (Insert Workers)\
   On the other side of the queue, Insert Workers are waiting to do the following:
     - Grab 
       - They pick up a batch from the queue.
