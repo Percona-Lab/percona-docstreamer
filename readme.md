@@ -249,12 +249,12 @@ Lets take our default values set in [config.yaml](./config.yaml)
 
 This will give us 2 collections doing the full migration at once and each of these collections will have 12 workers (4 read + 8 write). Even though we have 12 workers and 2 collections for a total of 24 threads, there is a split depending on how many are read and write. The total of active threads in this case will be the following for each given environment:
 
-***Source***
-Total Source Connections = 2 Collections * 4 Read Workers (8 concurrent threads)
+***Source***\
+Total Source Connections = 2 Collections * 4 Read Workers (8 concurrent threads)\
 Note: There is also 1 "segmenter" thread per collection calculating ID ranges, so it's technically ~10 threads, but the segmenter load is very light compared to the readers.
 
-***Destination***
-Only the Insert Workers connect to the destination.
+***Destination***\
+Only the Insert Workers connect to the destination.\
 Total Destination Connections = 2 Collections * 8 Insert Workers (16 concurrent threads)
 
 | Setting | Purpose |
