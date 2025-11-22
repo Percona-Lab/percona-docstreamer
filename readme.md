@@ -848,7 +848,7 @@ Consider a scenario where Document A is inserted (Insert 1 at TS_1), deleted (at
 
 Regardless of the state the Full Load left behind, the CDC process replays history from $\mathbf{T_0}$ in strict order. The final event (Insert 2) is always the last operation applied, ensuring the destination matches the source perfectly.
 
-## Detailed docMongoStream Internal Workflow
+## Internal Workflow
 
 Here is a more detailed but simple explanation of the inner workings of docMongoStream for each of the 2 stages (Full Load and CDC).
 
