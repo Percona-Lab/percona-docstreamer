@@ -42,7 +42,7 @@ You MUST enable change streams on your source DocumentDB cluster, change streams
 | **Source and Target** | **B. Ensure both are running and you are able to connect** | Ensure the service is active and listening on the configured IP/port. Make sure any firewall rules have also been configured accordingly and you are able to connect to both clusters from the host running docMongoStream |
 | **DocumentDB (Source)** | **C. ENABLE CHANGE STREAMS IN DOCUMENTDB** | This might need to be done for each collection depending on your use case. |
 
-You can obtain the DocumentDB AWS CA cert for your cluster by going to the AWS console and browsing to DocumentDB --> Clusters --> <cluster_name_here> and then click on the `Connectivity & Security` tab (sample screenhot below). This is also where you need to gather your DocumentDB URI, in order to configure it in the `config.yaml`.
+You can obtain the DocumentDB AWS CA cert for your cluster by going to the AWS console and browsing to DocumentDB --> Clusters --> <cluster_name_here> and then click on the `Connectivity & Security` tab (sample screenshot below). This is also where you need to gather your DocumentDB URI, in order to configure it in the `config.yaml`.
 
 ![docdb](docdb.png)
 
@@ -86,7 +86,7 @@ You might want to compile docMongoStream for a different architecture (not teste
 
 1. Clone this repo
 2. Make whatever changes to the application you want (not required)
-3. Build it for your specifc architecture, examples below:
+3. Build it for your specific architecture, examples below:
 
 Build for linux
 
