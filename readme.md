@@ -231,7 +231,7 @@ dry_run: False
 
 5. Additional configuration
 
-You can modify any configuration through the config.yaml file, including log locations and performance-related parameters. All options are clearly documented, and you are free to adjust them as needed.
+You can modify any configuration through the [config.yaml](./config.yaml) file, including log locations and performance-related parameters. All options are clearly documented, and you are free to adjust them as needed.
 
 ## Performance & Optimization
 
@@ -295,7 +295,7 @@ The data validation engine is highly configurable to balance performance impact 
 
 | Setting | Default | Description |
 |--------:|--------:|-------------|
-| enabled | true | Master switch for the validation engine. If false, CDC writes occur without verification. |
+| enabled | true | Master switch for the validation engine. If false, final document verification after CDC writes are skipped. CDC is guaranteed to sync the documents; this is an optional additional validation check. |
 | batch_size | 100 | Network vs. Memory Trade-off. Controls how many document IDs are bundled into a single database lookup. Larger batches reduce network round-trips but increase memory usage. |
 | max_validation_workers | 4 | Concurrency Control. The number of parallel worker threads fetching and comparing documents. Increase this if you have spare CPU/Network capacity and notice validation lagging behind CDC. |
 | queue_size | 2000 | Buffer Capacity. The size of the channel buffering CDC events before validation. If the CDC writer is faster than the validator and this buffer fills up, validation requests will be dropped to prevent slowing down the replication stream. |
@@ -752,9 +752,9 @@ This phase starts immediately after the Full Load completes (or on startup if a 
 
 ### 5. Continuous Data Validation
 
-The data validation process in docMongoStream is event-driven. Each time a batch of records is written to the destination through CDC, the corresponding document IDs are immediately queued for validation. This process becomes active only after the Full Data Load has completed and CDC is running. To maintain performance while still providing this valuable functionality, the application stores counters (for statistics) and failure records (for debugging).
+CDC is guaranteed to sync the documents, however, docMongoStream provides an additional layer of validation. The data validation process in docMongoStream is event-driven. Each time a batch of records is written to the destination through CDC, the corresponding document IDs are immediately queued for validation. This process becomes active only after the Full Data Load has completed and CDC is running. To maintain performance while still providing this valuable functionality, the application stores counters (for statistics) and failure records (for debugging).
 
-We have also implemented an auto-healing capability. If a record fails validation due to a mismatch but is later updated by the source application, the tool automatically removes the associated failure entry because the previous state is no longer relevant. While the validation process never modifies data, it allows you to confirm not only that data has been synchronized, but also that records continue to update correctly as your application remains active prior to cutover. This feature provides peace of mind and ensures that the source and destination datasets are an exact match before the final cutover.
+docMongoStream also implements an auto-healing capability. If a record fails validation due to a mismatch but is later updated by the source application, the tool automatically removes the associated failure entry because the previous state is no longer relevant. While the validation process never modifies data, it allows you to confirm not only that data has been synchronized, but also that records continue to update correctly as your application remains active prior to cutover. This feature provides peace of mind and ensures that the source and destination datasets are an exact match before the final cutover.
 
 Please keep in mind that in busy systems it is perfectly normal for some records to be temporarily flagged as invalid until CDC has applied the latest changes. This is expected behavior, particularly in heavily used environments where frequent updates—often to the same records—are common. 
 
@@ -798,7 +798,6 @@ If the tool detects too many errors, it stops logging individual details to prot
         ]
     }
 ```
-
 
 #### Dedicated Validation API
 
