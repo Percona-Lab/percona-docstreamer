@@ -30,11 +30,10 @@ type ValidationRecord struct {
 
 // ValidationStats holds the running totals per collection
 type ValidationStats struct {
-	Namespace  string `bson:"_id" json:"namespace"`
-	Valid      int64  `bson:"valid_count" json:"validCount"`
-	Mismatch   int64  `bson:"mismatch_count" json:"mismatchCount"`
-	Total      int64  `bson:"total_checked" json:"totalChecked"`
-	CapReached bool   `bson:"failure_cap_reached" json:"failureCapReached"` // <--- New Flag
+	Namespace string `bson:"_id" json:"namespace"`
+	Valid     int64  `bson:"valid_count" json:"validCount"`
+	Mismatch  int64  `bson:"mismatch_count" json:"mismatchCount"`
+	Total     int64  `bson:"total_checked" json:"totalChecked"`
 }
 
 type Store struct {
@@ -48,10 +47,20 @@ func NewStore(client *mongo.Client) *Store {
 	failuresColl := client.Database(dbName).Collection("validation_failures")
 	statsColl := client.Database(dbName).Collection("validation_stats")
 
+	s := &Store{
+		client:   client,
+		failures: failuresColl,
+		stats:    statsColl,
+	}
+	s.ensureIndexes()
+	return s
+}
+
+func (s *Store) ensureIndexes() {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_, err := failuresColl.Indexes().CreateOne(ctx, mongo.IndexModel{
+		_, err := s.failures.Indexes().CreateOne(ctx, mongo.IndexModel{
 			Keys:    bson.D{{Key: "namespace", Value: 1}, {Key: "doc_id", Value: 1}},
 			Options: options.Index().SetUnique(true),
 		})
@@ -59,12 +68,6 @@ func NewStore(client *mongo.Client) *Store {
 			logging.PrintWarning(fmt.Sprintf("[VAL STORE] Failed to create index: %v", err), 0)
 		}
 	}()
-
-	return &Store{
-		client:   client,
-		failures: failuresColl,
-		stats:    statsColl,
-	}
 }
 
 // RegisterOutcome updates the DB based on the validation result
@@ -76,58 +79,30 @@ func (s *Store) RegisterOutcome(ctx context.Context, ns string, res ValidationRe
 	filter := bson.D{{Key: "namespace", Value: ns}, {Key: "doc_id", Value: res.DocID}}
 
 	if res.Status == "valid" {
-		// --- VALID CASE ---
 		delRes, err := s.failures.DeleteOne(ctx, filter)
 		if err == nil && delRes.DeletedCount > 0 {
-			// Was a failure, now fixed. -1 Mismatch, +1 Valid
-			// Note: We don't automatically unset CapReached here, complex to calculate.
-			// User can reset via retry or manual intervention if needed.
 			s.updateStats(ctx, ns, 1, -1, 0)
 		} else {
-			// New or already valid. +1 Valid, +1 Total
 			s.updateStats(ctx, ns, 1, 0, 1)
 		}
 	} else {
-		// --- MISMATCH CASE ---
 		update := bson.D{
 			{Key: "$set", Value: bson.D{
 				{Key: "reason", Value: res.Reason},
 				{Key: "detected_at", Value: time.Now().UTC()},
 			}},
 		}
-		updRes, err := s.failures.UpdateOne(ctx, filter, update)
+		opts := options.UpdateOne().SetUpsert(true)
+		updRes, err := s.failures.UpdateOne(ctx, filter, update, opts)
 
-		if err == nil && updRes.MatchedCount > 0 {
-			// Record existed and was updated. Stats don't change.
-			return
-		}
-
-		// It is a NEW failure. Check Safety Cap.
-		maxSamples := int64(config.Cfg.Validation.MaxFailureSamples)
-		if maxSamples <= 0 {
-			maxSamples = 1000
-		}
-
-		// Check count.
-		count, _ := s.failures.CountDocuments(ctx, bson.D{{Key: "namespace", Value: ns}}, options.Count().SetLimit(maxSamples))
-
-		if count < maxSamples {
-			// We have room. Insert the detailed failure record.
-			opts := options.UpdateOne().SetUpsert(true)
-			s.failures.UpdateOne(ctx, filter, update, opts)
-			// Update stats normally
+		if err == nil && updRes.MatchedCount == 0 {
 			s.updateStats(ctx, ns, 0, 1, 1)
-		} else {
-			// Cap reached. Do NOT insert record.
-			// Update stats AND set cap flag to true.
-			s.updateStats(ctx, ns, 0, 1, 1, true)
 		}
 	}
 }
 
-// updateStats updates the aggregate counters.
-// Optional last arg: setCapReached (bool). If true, sets failure_cap_reached=true
-func (s *Store) updateStats(ctx context.Context, ns string, validInc, mismatchInc, totalInc int64, setCapReached ...bool) {
+// updateStats updates the aggregate counters
+func (s *Store) updateStats(ctx context.Context, ns string, validInc, mismatchInc, totalInc int64) {
 	if validInc == 0 && mismatchInc == 0 && totalInc == 0 {
 		return
 	}
@@ -137,21 +112,13 @@ func (s *Store) updateStats(ctx context.Context, ns string, validInc, mismatchIn
 
 	opts := options.UpdateOne().SetUpsert(true)
 	filter := bson.D{{Key: "_id", Value: ns}}
-
-	setFields := bson.D{
-		{Key: "last_updated", Value: time.Now().UTC()},
-	}
-	if len(setCapReached) > 0 && setCapReached[0] {
-		setFields = append(setFields, bson.E{Key: "failure_cap_reached", Value: true})
-	}
-
 	update := bson.D{
 		{Key: "$inc", Value: bson.D{
 			{Key: "valid_count", Value: validInc},
 			{Key: "mismatch_count", Value: mismatchInc},
 			{Key: "total_checked", Value: totalInc},
 		}},
-		{Key: "$set", Value: setFields},
+		{Key: "$set", Value: bson.D{{Key: "last_updated", Value: time.Now().UTC()}}},
 	}
 	_, err := s.stats.UpdateOne(ctx, filter, update, opts)
 
@@ -167,12 +134,12 @@ func (s *Store) Invalidate(ctx context.Context, ns, docID string) {
 	}
 	filter := bson.D{{Key: "namespace", Value: ns}, {Key: "doc_id", Value: docID}}
 	res, _ := s.failures.DeleteOne(ctx, filter)
+
 	if res.DeletedCount > 0 {
 		s.updateStats(ctx, ns, 0, -1, -1)
 	}
 }
 
-// GetAllFailureIDs returns all document IDs that are currently marked as failures
 func (s *Store) GetAllFailureIDs(ctx context.Context) ([]ValidationRecord, error) {
 	cursor, err := s.failures.Find(ctx, bson.D{})
 	if err != nil {
@@ -186,17 +153,72 @@ func (s *Store) GetAllFailureIDs(ctx context.Context) ([]ValidationRecord, error
 	return results, nil
 }
 
-// GetStats returns the counters for all namespaces
 func (s *Store) GetStats(ctx context.Context) ([]ValidationStats, error) {
 	cursor, err := s.stats.Find(ctx, bson.D{})
 	if err != nil {
 		return nil, err
 	}
 	defer cursor.Close(ctx)
-
 	var stats []ValidationStats
 	if err := cursor.All(ctx, &stats); err != nil {
 		return nil, err
 	}
 	return stats, nil
+}
+
+// Reset clears all validation data (Hard Reset)
+func (s *Store) Reset(ctx context.Context) error {
+	if err := s.failures.Drop(ctx); err != nil {
+		return err
+	}
+	if err := s.stats.Drop(ctx); err != nil {
+		return err
+	}
+	s.ensureIndexes()
+	return nil
+}
+
+// Reconcile fixes "Ghost Mismatches" by synchronizing stats with actual failure records
+func (s *Store) Reconcile(ctx context.Context) error {
+	// 1. Get all namespaces from stats
+	cursor, err := s.stats.Find(ctx, bson.D{})
+	if err != nil {
+		return err
+	}
+	defer cursor.Close(ctx)
+
+	var stats []ValidationStats
+	if err := cursor.All(ctx, &stats); err != nil {
+		return err
+	}
+
+	// 2. For each namespace, count actual failures
+	for _, stat := range stats {
+		actualFailures, err := s.failures.CountDocuments(ctx, bson.D{{Key: "namespace", Value: stat.Namespace}})
+		if err != nil {
+			logging.PrintError(fmt.Sprintf("[VAL STORE] Failed to count failures for %s: %v", stat.Namespace, err), 0)
+			continue
+		}
+
+		// 3. Calculate new Valid count.
+		// Assume Total is correct (or close enough), adjust Valid to match Total - Failures
+		newMismatch := actualFailures
+		newValid := stat.Total - newMismatch
+
+		if newValid < 0 {
+			newValid = 0 // Should not happen unless DB is very messed up
+		}
+
+		// 4. Force Update
+		filter := bson.D{{Key: "_id", Value: stat.Namespace}}
+		update := bson.D{
+			{Key: "$set", Value: bson.D{
+				{Key: "mismatch_count", Value: newMismatch},
+				{Key: "valid_count", Value: newValid},
+				// We keep total_checked as is, assuming it tracks "effort" correctly
+			}},
+		}
+		s.stats.UpdateOne(ctx, filter, update)
+	}
+	return nil
 }

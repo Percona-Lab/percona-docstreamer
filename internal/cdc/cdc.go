@@ -22,7 +22,7 @@ type CDCManager struct {
 	sourceClient *mongo.Client
 	targetClient *mongo.Client
 	eventQueue   chan *ChangeEvent
-	// Updated channel type to carry Batch struct (Models + IDs)
+	// channel type carries Batch struct (Models + IDs)
 	flushQueues        []chan map[string]*Batch
 	bulkWriters        []*BulkWriter
 	startAt            bson.Timestamp

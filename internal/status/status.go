@@ -18,12 +18,11 @@ import (
 
 // ValidationInfo shows the sync progress
 type ValidationInfo struct {
-	TotalChecked    int64    `json:"totalChecked"`
-	ValidCount      int64    `json:"validCount"`
-	MismatchCount   int64    `json:"mismatchCount"`
-	SyncPercent     float64  `json:"syncPercent"`
-	LastValidatedAt string   `json:"lastValidatedAt"`
-	Warnings        []string `json:"warnings,omitempty"` // <--- New Warnings field
+	TotalChecked    int64   `json:"totalChecked"`
+	ValidCount      int64   `json:"validCount"`
+	MismatchCount   int64   `json:"mismatchCount"`
+	SyncPercent     float64 `json:"syncPercent"`
+	LastValidatedAt string  `json:"lastValidatedAt"`
 }
 
 // Status represents the current state of the migration
@@ -269,7 +268,7 @@ func ByteToHuman(bytes int64) string {
 func (m *Manager) getValidationStats(ctx context.Context) ValidationInfo {
 	coll := m.targetClient.Database(config.Cfg.Migration.MetadataDB).Collection("validation_stats")
 
-	// Aggregate totals + max timestamp + check if ANY collection hit the cap
+	// Aggregate totals + max timestamp
 	pipeline := mongo.Pipeline{
 		{{Key: "$group", Value: bson.D{
 			{Key: "_id", Value: nil},
@@ -277,7 +276,6 @@ func (m *Manager) getValidationStats(ctx context.Context) ValidationInfo {
 			{Key: "valid", Value: bson.D{{Key: "$sum", Value: "$valid_count"}}},
 			{Key: "mismatch", Value: bson.D{{Key: "$sum", Value: "$mismatch_count"}}},
 			{Key: "lastVal", Value: bson.D{{Key: "$max", Value: "$last_updated"}}},
-			{Key: "capReached", Value: bson.D{{Key: "$max", Value: "$failure_cap_reached"}}}, // Will be true if any doc is true
 		}}},
 	}
 
@@ -288,11 +286,10 @@ func (m *Manager) getValidationStats(ctx context.Context) ValidationInfo {
 	defer cursor.Close(ctx)
 
 	var result struct {
-		Total      int64     `bson:"total"`
-		Valid      int64     `bson:"valid"`
-		Mismatch   int64     `bson:"mismatch"`
-		LastVal    time.Time `bson:"lastVal"`
-		CapReached bool      `bson:"capReached"`
+		Total    int64     `bson:"total"`
+		Valid    int64     `bson:"valid"`
+		Mismatch int64     `bson:"mismatch"`
+		LastVal  time.Time `bson:"lastVal"`
 	}
 
 	if cursor.Next(ctx) {
@@ -311,19 +308,12 @@ func (m *Manager) getValidationStats(ctx context.Context) ValidationInfo {
 		lastValStr = result.LastVal.Format(time.RFC3339)
 	}
 
-	// Build Warnings
-	var warnings []string
-	if result.CapReached {
-		warnings = append(warnings, fmt.Sprintf("Failure sample limit reached (%d). Some mismatch details are not stored. Check logs/DB for full counts.", config.Cfg.Validation.MaxFailureSamples))
-	}
-
 	return ValidationInfo{
 		TotalChecked:    result.Total,
 		ValidCount:      result.Valid,
 		MismatchCount:   result.Mismatch,
 		SyncPercent:     percent,
 		LastValidatedAt: lastValStr,
-		Warnings:        warnings, // <--- Populated warning
 	}
 }
 

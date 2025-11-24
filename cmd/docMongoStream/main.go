@@ -403,9 +403,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	tracker := validator.NewInFlightTracker()
 	valStore := validator.NewStore(targetClient)
 
-	// Note: We use '=' because apiServer is declared above for the signal handler
 	apiServer = api.NewServer(config.Cfg.Migration.StatusHTTPPort)
-	// Note: We use '=' because statusManager is declared above for the signal handler
 	statusManager = status.NewManager(targetClient, false)
 
 	validationManager := validator.NewManager(sourceClient, targetClient, tracker, valStore, statusManager)
@@ -416,6 +414,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	apiServer.RegisterRoute("/validate", validationManager.HandleValidateRequest)
 	apiServer.RegisterRoute("/validate/retry", validationManager.HandleRetryFailures)
 	apiServer.RegisterRoute("/validate/stats", validationManager.HandleGetStats)
+	apiServer.RegisterRoute("/validate/reset", validationManager.HandleReset)
 
 	apiServer.Start()
 

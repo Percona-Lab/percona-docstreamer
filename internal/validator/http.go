@@ -61,7 +61,6 @@ func (vm *Manager) HandleRetryFailures(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 
-	// Intelligent Response: Check if there was anything to retry
 	if count == 0 {
 		json.NewEncoder(w).Encode(map[string]string{
 			"status":  "ok",
@@ -70,7 +69,6 @@ func (vm *Manager) HandleRetryFailures(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// UPDATED MESSAGE: Clarify that this is a check, not a fix
 	json.NewEncoder(w).Encode(map[string]string{
 		"status":  "accepted",
 		"message": fmt.Sprintf("Queued re-validation check for %d documents. This process updates status but does not repair data.", count),
@@ -97,4 +95,43 @@ func (vm *Manager) HandleGetStats(w http.ResponseWriter, r *http.Request) {
 	} else {
 		json.NewEncoder(w).Encode(stats)
 	}
+}
+
+// HandleReset clears or reconciles validation data
+// Default: Smart Reset (Reconcile stats with actual DB records)
+// Query Param: ?mode=erase (Wipe all stats to zero)
+func (vm *Manager) HandleReset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "Method not allowed. Use POST.", http.StatusMethodNotAllowed)
+		return
+	}
+
+	mode := r.URL.Query().Get("mode")
+
+	// Optional: Hard Reset (Destructive Wipe)
+	if mode == "erase" {
+		if err := vm.store.Reset(r.Context()); err != nil {
+			http.Error(w, fmt.Sprintf("Failed to reset stats: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "ok",
+			"message": "HARD RESET: Validation stats and failure records have been wiped.",
+		})
+		return
+	}
+
+	// Default: Smart Reset (Reconcile)
+	if err := vm.store.Reconcile(r.Context()); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to reconcile stats: %v", err), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "ok",
+		"message": "Validation stats successfully reconciled with stored failures.",
+	})
 }

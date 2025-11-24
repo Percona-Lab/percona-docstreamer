@@ -288,6 +288,21 @@ This setting determines the write pipeline's capacity during live synchronizatio
 | `cdc.batch_interval_ms` | Maximum wait time before flushing an incomplete batch. Lower values reduce latency; higher values increase overall throughput. This ensures low-volume changes are still applied quickly |
 | `cdc.max_await_time_ms` | Max time (in ms) for the change stream to wait for new events |
 
+
+### Validation Optimization
+
+The data validation engine is highly configurable to balance performance impact against data integrity assurance. You can tune these settings via [config.yaml](./config.yaml) under the `validation` section.
+
+| Setting | Default | Description |
+|--------:|--------:|-------------|
+| enabled | true | Master switch for the validation engine. If false, CDC writes occur without verification. |
+| batch_size | 100 | Network vs. Memory Trade-off. Controls how many document IDs are bundled into a single database lookup. Larger batches reduce network round-trips but increase memory usage. |
+| max_validation_workers | 4 | Concurrency Control. The number of parallel worker threads fetching and comparing documents. Increase this if you have spare CPU/Network capacity and notice validation lagging behind CDC. |
+| queue_size | 2000 | Buffer Capacity. The size of the channel buffering CDC events before validation. If the CDC writer is faster than the validator and this buffer fills up, validation requests will be dropped to prevent slowing down the replication stream. |
+| retry_interval_ms | 500 | Hot Key Handling. If a record fails validation because it is actively being modified (detected via dirty tracking), the validator waits this long before re-checking it. |
+| max_retries | 3 | Persistence. How many times to retry a "Hot Key" before giving up. After this many attempts, the record is marked as a mismatch/skipped to move on. |
+
+
 ## How to Use docMongoStream
 
 docMongoStream operates as a background process managed by simple commands, so its usage is rather straight forward. Once you have edited the configuration file accordingly, all you need to do is run the commands as shown below.
@@ -741,7 +756,7 @@ The data validation process in docMongoStream is event-driven. Each time a batch
 
 We have also implemented an auto-healing capability. If a record fails validation due to a mismatch but is later updated by the source application, the tool automatically removes the associated failure entry because the previous state is no longer relevant. While the validation process never modifies data, it allows you to confirm not only that data has been synchronized, but also that records continue to update correctly as your application remains active prior to cutover. This feature provides peace of mind and ensures that the source and destination datasets are an exact match before the final cutover.
 
-Please keep in mind that in busy systems it is perfectly normal for some records to be temporarily flagged as invalid until CDC has applied the latest changes. This is expected behavior, particularly in heavily used environments where frequent updates—often to the same records—are common. To prevent database bloat during systemic data mismatches (e.g., schema mismatches due to high volume of updates to the same records many times in many collections), the tool limits the number of detailed failure records stored.
+Please keep in mind that in busy systems it is perfectly normal for some records to be temporarily flagged as invalid until CDC has applied the latest changes. This is expected behavior, particularly in heavily used environments where frequent updates—often to the same records—are common. 
 
 #### Status
 
@@ -847,6 +862,23 @@ Response:
 
 ```json
 [{"namespace":"lws_1.test_1","validCount":27880,"mismatchCount":0,"totalChecked":27880,"failureCapReached":false},{"namespace":"lws_1.test_2","validCount":24312,"mismatchCount":0,"totalChecked":24312,"failureCapReached":false},{"namespace":"lws_1.test_3","validCount":23695,"mismatchCount":0,"totalChecked":23695,"failureCapReached":false}]
+```
+
+4. Smart Reset (Default) 
+
+Use this if you think stats are wrong ("Ghost Mismatches"). It sets mismatch_count to match the actual number of failure documents.
+
+```bash
+curl -X POST http://localhost:8080/validate/reset
+```
+
+
+5. Hard Reset (Erase)
+
+Use this to wipe all validation stats to 0.
+
+```bash
+curl -X POST http://localhost:8080/validate/reset?mode=erase
 ```
 
 ## Resuming & Checkpointing

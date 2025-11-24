@@ -16,12 +16,6 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
-const (
-	MaxRetries = 3
-	RetryDelay = 500 * time.Millisecond
-	QueueSize  = 2000 // Increased to handle CDC burst
-)
-
 // ValidationTask holds a batch of IDs to verify
 type ValidationTask struct {
 	Namespace string
@@ -49,12 +43,19 @@ type Manager struct {
 
 func NewManager(source, target *mongo.Client, tracker *InFlightTracker, store *Store, statusMgr *status.Manager) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// Ensure sane defaults if config is zero
+	queueSize := config.Cfg.Validation.QueueSize
+	if queueSize < 100 {
+		queueSize = 2000
+	}
+
 	vm := &Manager{
 		sourceClient:    source,
 		targetClient:    target,
 		tracker:         tracker,
-		retryQueue:      make(chan RetryItem, QueueSize),
-		validationQueue: make(chan ValidationTask, QueueSize),
+		retryQueue:      make(chan RetryItem, queueSize),
+		validationQueue: make(chan ValidationTask, queueSize),
 		store:           store,
 		statusMgr:       statusMgr,
 		shutdownCtx:     ctx,
@@ -62,9 +63,20 @@ func NewManager(source, target *mongo.Client, tracker *InFlightTracker, store *S
 	}
 
 	// Start workers with WaitGroup tracking
-	vm.wg.Add(2)
+	// Launch multiple queue workers for parallelism
+	workerCount := config.Cfg.Validation.MaxValidationWorkers
+	if workerCount < 1 {
+		workerCount = 1
+	}
+
+	vm.wg.Add(1 + workerCount) // 1 Retry Worker + N Queue Workers
+
 	go vm.startRetryWorker()
-	go vm.startQueueWorker()
+
+	logging.PrintInfo(fmt.Sprintf("[VAL] Starting %d parallel CDC validation workers...", workerCount), 0)
+	for i := 0; i < workerCount; i++ {
+		go vm.startQueueWorker(i)
+	}
 
 	return vm
 }
@@ -106,9 +118,8 @@ func (vm *Manager) ValidateAsync(ns string, ids []string) {
 }
 
 // startQueueWorker processes the stream of IDs from CDC
-func (vm *Manager) startQueueWorker() {
+func (vm *Manager) startQueueWorker(workerID int) {
 	defer vm.wg.Done()
-	logging.PrintInfo("[VAL] CDC Validation Worker started.", 0)
 
 	for task := range vm.validationQueue {
 		if vm.shutdownCtx.Err() != nil {
@@ -129,6 +140,14 @@ func (vm *Manager) startQueueWorker() {
 // startRetryWorker handles retries with shutdown awareness
 func (vm *Manager) startRetryWorker() {
 	defer vm.wg.Done()
+
+	// Use configured retry delay
+	delayMS := config.Cfg.Validation.RetryIntervalMS
+	if delayMS < 10 {
+		delayMS = 500
+	}
+	retryDelay := time.Duration(delayMS) * time.Millisecond
+
 	for {
 		select {
 		case <-vm.shutdownCtx.Done():
@@ -137,7 +156,7 @@ func (vm *Manager) startRetryWorker() {
 			select {
 			case <-vm.shutdownCtx.Done():
 				return
-			case <-time.After(RetryDelay):
+			case <-time.After(retryDelay):
 				vm.validateSingle(item)
 			}
 		}
@@ -247,8 +266,13 @@ func (vm *Manager) validateSingle(item RetryItem) {
 		return
 	}
 
+	maxRetries := config.Cfg.Validation.MaxRetries
+	if maxRetries < 1 {
+		maxRetries = 3
+	}
+
 	if vm.tracker.IsDirty(item.ID) {
-		if item.AttemptCount >= MaxRetries {
+		if item.AttemptCount >= maxRetries {
 			logging.PrintWarning(fmt.Sprintf("[VAL] Dropping Hot Key %s", item.ID), 0)
 			return
 		}

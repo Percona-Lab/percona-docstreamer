@@ -74,10 +74,12 @@ type ClonerConfig struct {
 
 // ValidationConfig holds settings for online data validation
 type ValidationConfig struct {
-	Enabled           bool `mapstructure:"enabled"`
-	BatchSize         int  `mapstructure:"batch_size"`
-	RetryIntervalMS   int  `mapstructure:"retry_interval_ms"`
-	MaxFailureSamples int  `mapstructure:"max_failure_samples"` // <--- NEW CAP
+	Enabled              bool `mapstructure:"enabled"`
+	BatchSize            int  `mapstructure:"batch_size"`
+	RetryIntervalMS      int  `mapstructure:"retry_interval_ms"`
+	MaxValidationWorkers int  `mapstructure:"max_validation_workers"`
+	MaxRetries           int  `mapstructure:"max_retries"`
+	QueueSize            int  `mapstructure:"queue_size"`
 }
 
 // Config holds all configuration for the application
@@ -145,7 +147,9 @@ func LoadConfig() {
 	viper.SetDefault("validation.enabled", true)
 	viper.SetDefault("validation.batch_size", 100)
 	viper.SetDefault("validation.retry_interval_ms", 500)
-	viper.SetDefault("validation.max_failure_samples", 1000) // Default Cap: 1000 docs per collection
+	viper.SetDefault("validation.max_validation_workers", 4)
+	viper.SetDefault("validation.max_retries", 3)
+	viper.SetDefault("validation.queue_size", 2000)
 
 	// --- 2. Read config file ---
 	viper.SetConfigName("config")
@@ -187,7 +191,6 @@ func LoadConfig() {
 	})
 }
 
-// ... [Keep helper functions: addQueryParam, buildTLSParams, BuildDocDBURI, BuildMongoURI] ...
 func addQueryParam(params *url.Values, key, value string) {
 	if value != "" && value != "none" {
 		params.Add(key, value)

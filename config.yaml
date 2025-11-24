@@ -15,11 +15,14 @@
 logging:
   # Log level (e.g., "debug", "info", "warn", "error")
   level: "info"
+ 
   # Path to the log file.
   # The directory will be created if it doesn't exist.
   file_path: "logs/docMongoStream.log"
+ 
   # Path to CDC ops log
   ops_log_path: "logs/cdc.log"
+ 
   # Path to full load ops log
   full_load_log_path: "logs/full_load.log"
 
@@ -54,29 +57,36 @@ migration:
   # Port for the HTTP /status endpoint
   status_http_port: "8080"
   network_compressors: "zlib,snappy"
+  
   # Databases to skip during discovery
   exclude_dbs:
     - "admin"
     - "local"
     - "config"
+ 
   # Collections to skip during discovery (format: "dbname.collname")
   # If you want to skip all collections for a given database, use exclude_dbs setting instead
   exclude_collections: []  
+ 
   # max_concurrent_workers: This is the max number of collections to copy at the same time
   # Controls how many collections are migrated simultaneously during the full load stage
   # Example: If you have 50 collections and set this to 2, docMongoStream will migrate 2 collections at a time.
   # As soon as one finishes, the next one starts.
   max_concurrent_workers: 2
+ 
   # Database and collections to keep track of the migration
   metadata_db: "docMongoStream"
+ 
   checkpoint_collection: "checkpoints"
   checkpoint_doc_id: "cdc_resume_timestamp"
   status_collection: "status"
   status_doc_id: "migration_status"
+ 
   # Set the following to True if you want to start the migration all over from scratch
   # This will drop all databases and collections in the destination environment
   # except for admin, local and config
   destroy: False
+ 
   # Set the following to True if you do not want to make any changes and just want to validate you are able to connect 
   # to source and destination
   dry_run: False
@@ -98,32 +108,44 @@ validation:
   # the validator will wait this many milliseconds before checking it again.
   # Default: 500ms
   retry_interval_ms: 500
-  
-  # Max Failure Samples: The maximum number of detailed failure records to store in the 
-  # 'validation_failures' collection per namespace.
-  # This acts as a circuit breaker to prevent the metadata database from growing too large 
-  # if a systemic issue causes millions of mismatches.
-  # Note: The 'mismatch_count' statistic will always track the TOTAL number of errors, 
-  # regardless of this cap. This only limits the samples stored for debugging.
-  # Default: 1000
-  max_failure_samples: 1000
+
+  # Max Validation Workers: How many concurrent threads to use for verifying data.
+  # Increase this to speed up validation if you have spare CPU/Network capacity.
+  # Default: 4
+  max_validation_workers: 4
+
+  # Max Retries: How many times to retry validation for a "Hot Key" (actively modifying record)
+  # before giving up and marking it as skipped/mismatched.
+  # Default: 3
+  max_retries: 3
+
+  # Queue Size: The buffer size for the validation channel.
+  # If the CDC writer is faster than the validator, this buffer fills up.
+  # If full, CDC will drop validation requests to avoid slowing down replication.
+  # Default: 2000
+  queue_size: 2000
 
 # -----------------------------------------------
 # Full Load Settings
 # -----------------------------------------------
 cloner:
   # num_read_workers: Controls how many threads are used to read data for a single collection
-  # This is the number of parallel readers (read wrokers) fetching from DocumentDB for one collection
+  # This is the number of parallel readers (read workers) fetching from DocumentDB for one collection
   num_read_workers: 4
+  
   # num_insert_workers: Controls how many threads are used to write data for a single collection
   # This is the number of parallel writers (insert workers) pushing to MongoDB for one given collection 
   num_insert_workers: 8
+  
   # read_batch_size: Number of documents per read batch
   read_batch_size: 1000
+  
   # insert_batch_size: Number of documents per insert batch
   insert_batch_size: 1000
+  
   # insert_batch_bytes: Max size (in bytes) of a single insert batch
   insert_batch_bytes: 16777216 # 16MB
+
   # segment_size_docs: Size (in docs) of a segment for parallel reads
   # A collection of 1M docs will be split into 100 segments of 10k docs
   segment_size_docs: 10000
@@ -134,11 +156,14 @@ cloner:
 cdc:
   # batch_size: How many operations to batch together
   batch_size: 1000
+  
   # batch_interval_ms: Max time to wait (in ms) before flushing a batch
   # This ensures low-volume changes are still applied quickly
   batch_interval_ms: 500
+  
   # max_await_time_ms: Max time (in ms) for the change stream to wait for new events
   max_await_time_ms: 1000
+  
   # max_write_workers: Controls concurrency during the cdc phase
   # After the full load finishes, this setting controls how many threads apply the stream of real-time changes.
   # This determines how "wide" your write pipeline is during the live cdc phase. A higher number allows for more parallelism when replaying real-time events
