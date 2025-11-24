@@ -30,11 +30,12 @@ type ChangeEvent struct {
 	ID            bson.Raw       `bson:"_id"`
 	OperationType OperationType  `bson:"operationType"`
 	ClusterTime   bson.Timestamp `bson:"clusterTime"`
-	FullDocument  bson.Raw       `bson:"fullDocument"`
-	Namespace     Namespace      `bson:"ns"`
-	DocumentKey   bson.M         `bson:"documentKey"`
-	To            Namespace      `bson:"to,omitempty"`
-	UpdateFields  bson.M         `bson:"updateDescription,omitempty"`
+	// CHANGED: Use bson.M instead of bson.Raw to prevent buffer reuse corruption during async processing
+	FullDocument bson.M    `bson:"fullDocument"`
+	Namespace    Namespace `bson:"ns"`
+	DocumentKey  bson.M    `bson:"documentKey"`
+	To           Namespace `bson:"to,omitempty"`
+	UpdateFields bson.M    `bson:"updateDescription,omitempty"`
 }
 
 // Namespace holds the db and collection

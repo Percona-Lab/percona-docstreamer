@@ -9,7 +9,9 @@
 # e.g., export DOCDB_ENDPOINT=other.host
 # -----------------------------------------------
 
+# -----------------------------------------------
 # Logging Configuration
+# -----------------------------------------------
 logging:
   # Log level (e.g., "debug", "info", "warn", "error")
   level: "info"
@@ -21,7 +23,9 @@ logging:
   # Path to full load ops log
   full_load_log_path: "logs/full_load.log"
 
+# -----------------------------------------------
 # Source DocumentDB
+# -----------------------------------------------
 docdb:
   endpoint: "localhost"
   port: "7777"
@@ -30,7 +34,9 @@ docdb:
   tls_allow_invalid_hostnames: true
   extra_params: ""
 
+# -----------------------------------------------
 # Target MongoDB
+# -----------------------------------------------
 mongo:
   endpoint: "dan-ps-lab-mongos00.tp.int.percona.com"
   port: "27017"
@@ -38,7 +44,9 @@ mongo:
   tls_allow_invalid_hostnames: true 
   extra_params: ""
 
+# -----------------------------------------------
 # General Migration Settings
+# -----------------------------------------------
 migration:
   # Prefix for environment variables (e.g., MIGRATION_DOCDB_USER)
   env_prefix: "MIGRATION"
@@ -73,7 +81,36 @@ migration:
   # to source and destination
   dry_run: False
 
+# -----------------------------------------------
+# Online Data Validation Settings
+# -----------------------------------------------
+validation:
+  # Enabled: If true, every batch written by CDC is immediately queued for verification.
+  # This ensures data consistency in real-time.
+  enabled: True
+  
+  # Batch Size: How many documents to validate in a single lookup operation.
+  # Larger batches reduce network round-trips but increase memory usage.
+  # Default: 100
+  batch_size: 100
+  
+  # Retry Interval (ms): If a record fails validation because it is being written to (Hot Key),
+  # the validator will wait this many milliseconds before checking it again.
+  # Default: 500ms
+  retry_interval_ms: 500
+  
+  # Max Failure Samples: The maximum number of detailed failure records to store in the 
+  # 'validation_failures' collection per namespace.
+  # This acts as a circuit breaker to prevent the metadata database from growing too large 
+  # if a systemic issue causes millions of mismatches.
+  # Note: The 'mismatch_count' statistic will always track the TOTAL number of errors, 
+  # regardless of this cap. This only limits the samples stored for debugging.
+  # Default: 1000
+  max_failure_samples: 1000
+
+# -----------------------------------------------
 # Full Load Settings
+# -----------------------------------------------
 cloner:
   # num_read_workers: Controls how many threads are used to read data for a single collection
   # This is the number of parallel readers (read wrokers) fetching from DocumentDB for one collection
@@ -91,7 +128,9 @@ cloner:
   # A collection of 1M docs will be split into 100 segments of 10k docs
   segment_size_docs: 10000
 
+# -----------------------------------------------
 # Change Data Capture (CDC) Settings
+# -----------------------------------------------
 cdc:
   # batch_size: How many operations to batch together
   batch_size: 1000

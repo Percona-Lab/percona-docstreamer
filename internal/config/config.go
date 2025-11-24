@@ -72,14 +72,23 @@ type ClonerConfig struct {
 	InsertBatchBytes int64 `mapstructure:"insert_batch_bytes"`
 }
 
+// ValidationConfig holds settings for online data validation
+type ValidationConfig struct {
+	Enabled           bool `mapstructure:"enabled"`
+	BatchSize         int  `mapstructure:"batch_size"`
+	RetryIntervalMS   int  `mapstructure:"retry_interval_ms"`
+	MaxFailureSamples int  `mapstructure:"max_failure_samples"` // <--- NEW CAP
+}
+
 // Config holds all configuration for the application
 type Config struct {
-	Logging   LoggingConfig   `mapstructure:"logging"`
-	DocDB     DocDBConfig     `mapstructure:"docdb"`
-	Mongo     MongoConfig     `mapstructure:"mongo"`
-	Migration MigrationConfig `mapstructure:"migration"`
-	Cloner    ClonerConfig    `mapstructure:"cloner"`
-	CDC       CDCConfig       `mapstructure:"cdc"`
+	Logging    LoggingConfig    `mapstructure:"logging"`
+	DocDB      DocDBConfig      `mapstructure:"docdb"`
+	Mongo      MongoConfig      `mapstructure:"mongo"`
+	Migration  MigrationConfig  `mapstructure:"migration"`
+	Cloner     ClonerConfig     `mapstructure:"cloner"`
+	CDC        CDCConfig        `mapstructure:"cdc"`
+	Validation ValidationConfig `mapstructure:"validation"`
 }
 
 // Cfg is the global config object
@@ -97,13 +106,13 @@ func LoadConfig() {
 	viper.SetDefault("docdb.port", "27017")
 	viper.SetDefault("docdb.ca_file", "global-bundle.pem")
 	viper.SetDefault("docdb.extra_params", "")
-	viper.SetDefault("docdb.tls_allow_invalid_hostnames", false) // Default to secure
+	viper.SetDefault("docdb.tls_allow_invalid_hostnames", false)
 
 	viper.SetDefault("mongo.endpoint", "localhost")
 	viper.SetDefault("mongo.port", "27017")
 	viper.SetDefault("mongo.ca_file", "")
 	viper.SetDefault("mongo.extra_params", "")
-	viper.SetDefault("mongo.tls_allow_invalid_hostnames", false) // Default to secure
+	viper.SetDefault("mongo.tls_allow_invalid_hostnames", false)
 
 	viper.SetDefault("migration.network_compressors", "zlib,snappy")
 	viper.SetDefault("migration.exclude_dbs", []string{"admin", "local", "config"})
@@ -124,15 +133,21 @@ func LoadConfig() {
 	viper.SetDefault("cloner.num_insert_workers", 8)
 	viper.SetDefault("cloner.read_batch_size", 1000)
 	viper.SetDefault("cloner.insert_batch_size", 1000)
-	viper.SetDefault("cloner.insert_batch_bytes", 16*1024*1024) // 16MB
+	viper.SetDefault("cloner.insert_batch_bytes", 16*1024*1024)
 	viper.SetDefault("cloner.segment_size_docs", 10000)
 
 	viper.SetDefault("cdc.batch_size", 1000)
 	viper.SetDefault("cdc.batch_interval_ms", 500)
 	viper.SetDefault("cdc.max_await_time_ms", 1000)
-	viper.SetDefault("cdc.max_write_workers", 4) // <--- DEFAULT (Use a sensible default like 4 or 8)
+	viper.SetDefault("cdc.max_write_workers", 4)
 
-	// --- 2. Read config file , we will search in any of the path's below---
+	// Validation Defaults
+	viper.SetDefault("validation.enabled", true)
+	viper.SetDefault("validation.batch_size", 100)
+	viper.SetDefault("validation.retry_interval_ms", 500)
+	viper.SetDefault("validation.max_failure_samples", 1000) // Default Cap: 1000 docs per collection
+
+	// --- 2. Read config file ---
 	viper.SetConfigName("config")
 	viper.SetConfigType("yaml")
 	viper.AddConfigPath(".")
@@ -148,21 +163,19 @@ func LoadConfig() {
 	}
 
 	// --- 3. Read Environment Variables ---
-	// --- Load prefix from config file FIRST ---
 	prefix := viper.GetString("migration.env_prefix")
 	if prefix == "" {
-		prefix = "MIGRATION" // Fallback just in case
+		prefix = "MIGRATION"
 	}
-	viper.SetEnvPrefix(prefix) // e.g., MIGRATION_DOCDB_USER
+	viper.SetEnvPrefix(prefix)
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	viper.AutomaticEnv()
 
-	// --- 4. Unmarshal all settings into our Cfg struct ---
+	// --- 4. Unmarshal ---
 	if err := viper.Unmarshal(&Cfg); err != nil {
 		log.Fatalf("Fatal error unmarshaling config: %v\n", err)
 	}
 
-	// --- 5. Watch the config file for live changes ---
 	viper.WatchConfig()
 	viper.OnConfigChange(func(e fsnotify.Event) {
 		log.Printf("Config file changed: %s. Reloading...", e.Name)
@@ -174,14 +187,13 @@ func LoadConfig() {
 	})
 }
 
-// --- helper function to build query params ---
+// ... [Keep helper functions: addQueryParam, buildTLSParams, BuildDocDBURI, BuildMongoURI] ...
 func addQueryParam(params *url.Values, key, value string) {
 	if value != "" && value != "none" {
 		params.Add(key, value)
 	}
 }
 
-// --- helper to de-duplicate tlsAllowInvalidHostnames ---
 func buildTLSParams(extraParams string, allowInvalid bool) string {
 	params, _ := url.ParseQuery(extraParams)
 	if allowInvalid && params.Get("tlsAllowInvalidHostnames") == "" {
@@ -190,7 +202,6 @@ func buildTLSParams(extraParams string, allowInvalid bool) string {
 	return params.Encode()
 }
 
-// BuildDocDBURI
 func (c *Config) BuildDocDBURI(user, password string) string {
 	useTunnel := (c.DocDB.Endpoint == "localhost" || c.DocDB.Endpoint == "127.0.0.1")
 	params := url.Values{}
@@ -222,7 +233,6 @@ func (c *Config) BuildDocDBURI(user, password string) string {
 		c.DocDB.Endpoint, c.DocDB.Port, params.Encode())
 }
 
-// BuildMongoURI
 func (c *Config) BuildMongoURI(user, password string) string {
 	params := url.Values{}
 	if c.Mongo.CaFile != "" {

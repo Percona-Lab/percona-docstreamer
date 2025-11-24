@@ -16,6 +16,16 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
+// ValidationInfo shows the sync progress
+type ValidationInfo struct {
+	TotalChecked    int64    `json:"totalChecked"`
+	ValidCount      int64    `json:"validCount"`
+	MismatchCount   int64    `json:"mismatchCount"`
+	SyncPercent     float64  `json:"syncPercent"`
+	LastValidatedAt string   `json:"lastValidatedAt"`
+	Warnings        []string `json:"warnings,omitempty"` // <--- New Warnings field
+}
+
 // Status represents the current state of the migration
 type Status struct {
 	State                string         `json:"state"`
@@ -47,15 +57,16 @@ type InitialSync struct {
 }
 
 type StatusOutput struct {
-	OK                        bool        `json:"ok"`
-	State                     string      `json:"state"`
-	Info                      string      `json:"info"`
-	TimeSinceLastEventSeconds float64     `json:"timeSinceLastEventSeconds"` // Metric: Source Idle Time (Grows when quiet)
-	CDCLagSeconds             float64     `json:"cdcLagSeconds"`             // Metric: Processing Latency (Stays low when quiet)
-	EventsApplied             int64       `json:"totalEventsApplied"`
-	LastSourceEventTime       OpTimeInfo  `json:"lastSourceEventTime"`
-	LastBatchAppliedAt        string      `json:"lastBatchAppliedAt"`
-	InitialSync               InitialSync `json:"initialSync"`
+	OK                        bool           `json:"ok"`
+	State                     string         `json:"state"`
+	Info                      string         `json:"info"`
+	TimeSinceLastEventSeconds float64        `json:"timeSinceLastEventSeconds"`
+	CDCLagSeconds             float64        `json:"cdcLagSeconds"`
+	EventsApplied             int64          `json:"totalEventsApplied"`
+	Validation                ValidationInfo `json:"validation"`
+	LastSourceEventTime       OpTimeInfo     `json:"lastSourceEventTime"`
+	LastBatchAppliedAt        string         `json:"lastBatchAppliedAt"`
+	InitialSync               InitialSync    `json:"initialSync"`
 }
 
 type Manager struct {
@@ -94,6 +105,13 @@ func (m *Manager) SetState(state, message string) {
 	m.state = fmt.Sprintf("%s (%s)", state, message)
 	m.lastStateChange = time.Now().UTC()
 	logging.PrintInfo(fmt.Sprintf("[STATUS] State changed to: %s", m.state), 0)
+}
+
+// IsCDCActive checks if the application is currently in the CDC phase
+func (m *Manager) IsCDCActive() bool {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+	return strings.HasPrefix(m.state, "running") && m.initialSyncCompleted
 }
 
 func (m *Manager) SetError(errMsg string) {
@@ -138,16 +156,12 @@ func (m *Manager) GetEventsApplied() int64 {
 	return m.eventsApplied
 }
 
-// UpdateCDCStats updates the CDC counters and records wall time if progress is made
 func (m *Manager) UpdateCDCStats(eventsApplied int64, lastEventTS bson.Timestamp) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
-
-	// Only update the "Last Applied" wall clock time if we actually applied something new
 	if eventsApplied > m.eventsApplied {
 		m.lastBatchAppliedAt = time.Now().UTC()
 	}
-
 	m.eventsApplied = eventsApplied
 	m.lastEventTimestamp = lastEventTS
 }
@@ -218,31 +232,18 @@ func (m *Manager) Persist(ctx context.Context) {
 	}
 }
 
-func (m *Manager) StartServer(port string) {
-	if port == "" {
-		port = "8080"
-	}
-	addr := ":" + port
-	mux := http.NewServeMux()
-	mux.HandleFunc("/status", m.statusHandler)
-	logging.PrintInfo(fmt.Sprintf("Starting status HTTP server on :%s/status", port), 0)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		logging.PrintWarning(fmt.Sprintf("Status server failed: %v", err), 0)
-	}
-}
-
-func (m *Manager) statusHandler(w http.ResponseWriter, r *http.Request) {
+func (m *Manager) StatusHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	json, err := m.ToJSON()
+	jsonBytes, err := m.ToJSON(r.Context())
 	if err != nil {
 		http.Error(w, "Failed to serialize status", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(json)
+	w.Write(jsonBytes)
 }
 
 func ByteToHuman(bytes int64) string {
@@ -264,11 +265,72 @@ func ByteToHuman(bytes int64) string {
 	return fmt.Sprintf("%d B", bytes)
 }
 
-func (m *Manager) ToJSON() ([]byte, error) {
+// getValidationStats helper to fetch validation stats directly from DB
+func (m *Manager) getValidationStats(ctx context.Context) ValidationInfo {
+	coll := m.targetClient.Database(config.Cfg.Migration.MetadataDB).Collection("validation_stats")
+
+	// Aggregate totals + max timestamp + check if ANY collection hit the cap
+	pipeline := mongo.Pipeline{
+		{{Key: "$group", Value: bson.D{
+			{Key: "_id", Value: nil},
+			{Key: "total", Value: bson.D{{Key: "$sum", Value: "$total_checked"}}},
+			{Key: "valid", Value: bson.D{{Key: "$sum", Value: "$valid_count"}}},
+			{Key: "mismatch", Value: bson.D{{Key: "$sum", Value: "$mismatch_count"}}},
+			{Key: "lastVal", Value: bson.D{{Key: "$max", Value: "$last_updated"}}},
+			{Key: "capReached", Value: bson.D{{Key: "$max", Value: "$failure_cap_reached"}}}, // Will be true if any doc is true
+		}}},
+	}
+
+	cursor, err := coll.Aggregate(ctx, pipeline)
+	if err != nil {
+		return ValidationInfo{}
+	}
+	defer cursor.Close(ctx)
+
+	var result struct {
+		Total      int64     `bson:"total"`
+		Valid      int64     `bson:"valid"`
+		Mismatch   int64     `bson:"mismatch"`
+		LastVal    time.Time `bson:"lastVal"`
+		CapReached bool      `bson:"capReached"`
+	}
+
+	if cursor.Next(ctx) {
+		if err := cursor.Decode(&result); err != nil {
+			logging.PrintWarning(fmt.Sprintf("[STATUS] Failed to decode stats: %v", err), 0)
+		}
+	}
+
+	percent := 0.0
+	if result.Total > 0 {
+		percent = (float64(result.Valid) / float64(result.Total)) * 100.0
+	}
+
+	lastValStr := ""
+	if !result.LastVal.IsZero() {
+		lastValStr = result.LastVal.Format(time.RFC3339)
+	}
+
+	// Build Warnings
+	var warnings []string
+	if result.CapReached {
+		warnings = append(warnings, fmt.Sprintf("Failure sample limit reached (%d). Some mismatch details are not stored. Check logs/DB for full counts.", config.Cfg.Validation.MaxFailureSamples))
+	}
+
+	return ValidationInfo{
+		TotalChecked:    result.Total,
+		ValidCount:      result.Valid,
+		MismatchCount:   result.Mismatch,
+		SyncPercent:     percent,
+		LastValidatedAt: lastValStr,
+		Warnings:        warnings, // <--- Populated warning
+	}
+}
+
+func (m *Manager) ToJSON(ctx context.Context) ([]byte, error) {
 	m.lock.RLock()
 	defer m.lock.RUnlock()
 
-	// 1. Last Source Event Info
 	opTimeInfo := OpTimeInfo{}
 	if m.lastEventTimestamp.T > 0 {
 		opTimeInfo.TS = fmt.Sprintf("%d.%d", m.lastEventTimestamp.T, m.lastEventTimestamp.I)
@@ -279,24 +341,14 @@ func (m *Manager) ToJSON() ([]byte, error) {
 	var idleTime float64
 	var cdcLag float64
 
-	// Only calculate if we have processed at least one event
 	if m.initialSyncCompleted && m.lastEventTimestamp.T > 0 {
 		eventTime := time.Unix(int64(m.lastEventTimestamp.T), 0)
-
-		// Metric 1: Time Since Last Event (Idle Time)
-		// Grows when source is quiet
 		idleTime = time.Since(eventTime).Seconds()
 		if idleTime < 0 {
 			idleTime = 0.0
 		}
 
-		// Metric 2: CDC Lag (End-to-End Latency)
-		// Difference between when event happened (Source) and when it was applied (Dest)
-		// Stays constant/low when source is quiet
 		if !m.lastBatchAppliedAt.IsZero() {
-			// If we haven't applied any batches in > 10 seconds,
-			// assume the pipeline is idle/caught up and reset Lag to 0.
-			// This handles the case where the source stops writing, preventing "frozen" lag stats.
 			if time.Since(m.lastBatchAppliedAt) > 10*time.Second {
 				cdcLag = 0.0
 			} else {
@@ -322,13 +374,16 @@ func (m *Manager) ToJSON() ([]byte, error) {
 		lastBatchStr = m.lastBatchAppliedAt.Format(time.RFC3339)
 	}
 
+	valInfo := m.getValidationStats(ctx)
+
 	s := StatusOutput{
 		OK:                        baseState != "error",
 		State:                     baseState,
 		Info:                      info,
-		TimeSinceLastEventSeconds: idleTime, // IDLE TIME
-		CDCLagSeconds:             cdcLag,   // LATENCY
+		TimeSinceLastEventSeconds: idleTime,
+		CDCLagSeconds:             cdcLag,
 		EventsApplied:             m.eventsApplied,
+		Validation:                valInfo,
 		LastSourceEventTime:       opTimeInfo,
 		LastBatchAppliedAt:        lastBatchStr,
 		InitialSync: InitialSync{

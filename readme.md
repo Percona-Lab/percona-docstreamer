@@ -415,27 +415,34 @@ Sample output
 
 ```bash
 --- docMongoStream Status (Live) ---
-PID: 1973713 (Querying http://localhost:8080/status)
+PID: 1318823 (Querying http://localhost:8080/status)
 {
     "ok": true,
     "state": "running",
     "info": "Change Data Capture",
-    "timeSinceLastEventSeconds": 11474.269888194,
-    "cdcLagSeconds": 2.407,
-    "totalEventsApplied": 440000,
-    "lastSourceEventTime": {
-        "ts": "1763682329.1002",
-        "isoDate": "2025-11-20T23:45:29Z"
+    "timeSinceLastEventSeconds": 27.660679778,
+    "cdcLagSeconds": 27.364062096,
+    "totalEventsApplied": 99192,
+    "validation": {
+        "totalChecked": 55643,
+        "validCount": 55643,
+        "mismatchCount": 0,
+        "syncPercent": 100,
+        "lastValidatedAt": "2025-11-24T19:31:45Z"
     },
-    "lastBatchAppliedAt": "2025-11-20T23:45:31Z",
+    "lastSourceEventTime": {
+        "ts": "1764012678.22",
+        "isoDate": "2025-11-24T19:31:18Z"
+    },
+    "lastBatchAppliedAt": "2025-11-24T19:31:45Z",
     "initialSync": {
         "completed": true,
-        "completionLagSeconds": 112,
+        "completionLagSeconds": 5,
         "cloneCompleted": true,
-        "estimatedCloneSizeBytes": 794409586,
-        "clonedSizeBytes": 794409586,
-        "estimatedCloneSizeHuman": "757.6 MB",
-        "clonedSizeHuman": "757.6 MB"
+        "estimatedCloneSizeBytes": 2216505,
+        "clonedSizeBytes": 2216505,
+        "estimatedCloneSizeHuman": "2.1 MB",
+        "clonedSizeHuman": "2.1 MB"
     }
 }
 ```
@@ -479,6 +486,13 @@ The status command provides real-time metrics on the health and progress of your
 * cdcLagSeconds (Replication Latency):
     * Meaning: The time difference (latency) between when an event occurred on the Source and when it was successfully applied to the Target.
     * Interpretation: This is your true "lag." It should stay close to 0 (typically < 2 seconds). If this number spikes, it means the tool cannot keep up with the volume of changes. If no events are being applied and state is running, it usually means your source database is idle.
+
+* validation: Tracks the number of documents that are a perfect match between Source and Destination
+    * totalChecked: This is the number of total CDC events checked
+    * validCount: Number of documents that are an exact match
+    * mismatchCount: Number or active discrepancies
+    * syncPercent: Percentage of documents that are in perfect sync
+    * lastValidatedAt: Last time the records were validated
 
 * totalEventsApplied: The total number of operations replicated since the CDC phase started.
 
@@ -689,6 +703,8 @@ The tool operates in 4 distinct stages:
 - Full Data Load  
 - CDC (Continuous Sync)  
 
+In addition to the above, docMongoStream includes an Event-Driven Validation Engine. Unlike traditional migration tools that just "copy and hope," our tool verifies data integrity in real-time as changes are applied.
+
 ### 1. Validation
 
 When you run `./docMongoStream start`, the tool loads the config.yaml file, prompts for credentials, and connects to both the source DocumentDB and the target MongoDB to verify authentication and connectivity. If migration.destroy is set to true, it will prompt you for confirmation before proceeding.
@@ -719,6 +735,119 @@ This phase starts immediately after the Full Load completes (or on startup if a 
 
 **Idempotency:** Because the CDC stream overlaps with the Full Load (covering the same time period), it handles duplicate keys gracefully by using Upsert/Replace operations. This ensures that the target data always converges to the latest state from the source.
 
+### 5. Continuous Data Validation
+
+The data validation process in docMongoStream is event-driven. Each time a batch of records is written to the destination through CDC, the corresponding document IDs are immediately queued for validation. This process becomes active only after the Full Data Load has completed and CDC is running. To maintain performance while still providing this valuable functionality, the application stores counters (for statistics) and failure records (for debugging).
+
+We have also implemented an auto-healing capability. If a record fails validation due to a mismatch but is later updated by the source application, the tool automatically removes the associated failure entry because the previous state is no longer relevant. While the validation process never modifies data, it allows you to confirm not only that data has been synchronized, but also that records continue to update correctly as your application remains active prior to cutover. This feature provides peace of mind and ensures that the source and destination datasets are an exact match before the final cutover.
+
+Please keep in mind that in busy systems it is perfectly normal for some records to be temporarily flagged as invalid until CDC has applied the latest changes. This is expected behavior, particularly in heavily used environments where frequent updates—often to the same records—are common. To prevent database bloat during systemic data mismatches (e.g., schema mismatches due to high volume of updates to the same records many times in many collections), the tool limits the number of detailed failure records stored.
+
+#### Status
+
+The status api provides the current validation status. You can see the live validation statistics by running the status command. Look for the validation block:
+
+```bash
+./docMongoStream status
+```
+
+Output Example (Healthy) -- this is just the section pertinent to the validation:
+
+```bash
+....
+.....
+    "validation": {
+        "totalChecked": 15420,
+        "validCount": 15420,
+        "mismatchCount": 0,
+        "syncPercent": 100,
+        "lastValidatedAt": "2023-10-27T10:05:00Z"
+    }
+```
+
+Output Example (Systemic Failure with Cap Reached):
+
+If the tool detects too many errors, it stops logging individual details to protect performance, but continues counting the total errors.
+
+```bash
+...
+....
+    "validation": {
+        "totalChecked": 50000,
+        "validCount": 45000,
+        "mismatchCount": 5000,
+        "syncPercent": 90.0,
+        "lastValidatedAt": "2023-10-27T10:05:00Z",
+        "warnings": [
+            "Failure sample limit reached (1000). Some mismatch details are not stored. Check logs/DB for full counts."
+        ]
+    }
+```
+
+
+#### Dedicated Validation API
+
+docMongoStream also exposes the validator via its API (default port 8080) to interact with the validator manually. You can use the API to perform the following actions:
+
+1. Check Specific Records
+
+If you suspect specific documents are out of sync, you can check them as shown below, this will run synchronously and returns the result.
+
+```bash
+curl -X POST http://localhost:8080/validate \
+     -H "Content-Type: application/json" \
+     -d '{
+           "namespace": "inventory.products",
+           "ids": ["64f8a2b1c9e7", "64f8a2b1c9e8"]
+         }'
+```
+
+Response:
+
+```bash
+[
+    {
+        "docId": "64f8a2b1c9e7",
+        "status": "valid"
+    },
+    {
+        "docId": "64f8a2b1c9e8",
+        "status": "mismatch",
+        "reason": "Field content differs"
+    }
+]
+```
+
+2. Check All Known Failures
+
+If you have fixed an issue or suspect a transient error caused mismatches, you can ask the system to re-check all IDs flagged as a mismatch to find out if they have synced.
+
+```bash
+curl -X POST http://localhost:8080/validate/retry
+```
+
+Response:
+
+```bash
+{
+    "status": "accepted",
+    "message": "Queued re-validation check for 42 documents. This process updates status but does not repair data."
+}
+```
+
+3. Get Raw Stats
+
+You can retrieve raw counters for integration with external monitoring tools (Prometheus, Grafana, etc.).
+
+```bash
+curl http://localhost:8080/validate/stats
+```
+
+Response:
+
+```json
+[{"namespace":"lws_1.test_1","validCount":27880,"mismatchCount":0,"totalChecked":27880,"failureCapReached":false},{"namespace":"lws_1.test_2","validCount":24312,"mismatchCount":0,"totalChecked":24312,"failureCapReached":false},{"namespace":"lws_1.test_3","validCount":23695,"mismatchCount":0,"totalChecked":23695,"failureCapReached":false}]
+```
 
 ## Resuming & Checkpointing
 

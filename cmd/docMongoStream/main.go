@@ -26,6 +26,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 	"golang.org/x/term"
 
+	"github.com/Percona-Lab/docMongoStream/internal/api"
 	"github.com/Percona-Lab/docMongoStream/internal/cdc"
 	"github.com/Percona-Lab/docMongoStream/internal/checkpoint"
 	"github.com/Percona-Lab/docMongoStream/internal/cloner"
@@ -36,6 +37,7 @@ import (
 	"github.com/Percona-Lab/docMongoStream/internal/pid"
 	"github.com/Percona-Lab/docMongoStream/internal/status"
 	"github.com/Percona-Lab/docMongoStream/internal/topo"
+	"github.com/Percona-Lab/docMongoStream/internal/validator"
 )
 
 // --- Helper function for password prompt ---
@@ -348,6 +350,8 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	defer cancel()
 
 	var statusManager *status.Manager
+	// We need to declare apiServer here so the signal handler closure can access it
+	var apiServer *api.Server
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -361,6 +365,11 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 			statusManager.SetState("stopping", "Flushing pending events... Please wait.")
 			statusManager.Persist(context.Background())
 		}
+		// Gracefully stop the new API server
+		if apiServer != nil {
+			apiServer.Stop(context.Background())
+		}
+
 		cancel()
 	}()
 
@@ -390,9 +399,26 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	}
 	defer targetClient.Disconnect(context.TODO())
 
+	// --- 1. Initialize Shared Components ---
+	tracker := validator.NewInFlightTracker()
+	valStore := validator.NewStore(targetClient)
+
+	// Note: We use '=' because apiServer is declared above for the signal handler
+	apiServer = api.NewServer(config.Cfg.Migration.StatusHTTPPort)
+	// Note: We use '=' because statusManager is declared above for the signal handler
 	statusManager = status.NewManager(targetClient, false)
-	go statusManager.StartServer(config.Cfg.Migration.StatusHTTPPort)
-	defer statusManager.Persist(context.Background())
+
+	validationManager := validator.NewManager(sourceClient, targetClient, tracker, valStore, statusManager)
+	checkpointManager := checkpoint.NewManager(targetClient)
+
+	// --- 2. Register API Routes ---
+	apiServer.RegisterRoute("/status", statusManager.StatusHandler)
+	apiServer.RegisterRoute("/validate", validationManager.HandleValidateRequest)
+	apiServer.RegisterRoute("/validate/retry", validationManager.HandleRetryFailures)
+	apiServer.RegisterRoute("/validate/stats", validationManager.HandleGetStats)
+
+	apiServer.Start()
+
 	statusManager.SetState("connecting", "Connections established. Pinging...")
 
 	if err = sourceClient.Ping(ctx, readpref.Primary()); err != nil {
@@ -405,7 +431,6 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		logging.PrintError(err.Error(), 0)
 		return
 	}
-	checkpointManager := checkpoint.NewManager(targetClient)
 
 	var startAt bson.Timestamp
 	var collectionsToMigrate []discover.CollectionInfo
@@ -490,18 +515,33 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		logging.PrintPhase("2", "FULL DATA LOAD (SKIPPED)")
 		statusManager.LoadAndMerge(ctx)
 		startAt = resumeAt
-		logging.PrintInfo(fmt.Sprintf("Resuming CDC from global checkpoint: %v", resumeAt), 0)
 		statusManager.SetCloneCompleted()
 	}
 
 	logging.PrintPhase("3", "CONTINUOUS SYNC (CDC)")
 	statusManager.SetState("running", "Change Data Capture")
-	cdcManager := cdc.NewManager(sourceClient, targetClient, config.Cfg.Migration.CheckpointDocID, startAt, checkpointManager, statusManager)
+
+	cdcManager := cdc.NewManager(
+		sourceClient,
+		targetClient,
+		config.Cfg.Migration.CheckpointDocID,
+		startAt,
+		checkpointManager,
+		statusManager,
+		tracker,
+		valStore,
+		validationManager,
+	)
+
 	cdcManager.Start(ctx)
+
+	// --- GRACEFUL SHUTDOWN ---
+	// Wait for validation workers to drain before exiting and triggering Client Disconnects
+	validationManager.Close()
+
 	logging.PrintInfo("CDC process stopped. Exiting.", 0)
 }
 
-// stopCmd finds the PID and stops the process
 var stopCmd = &cobra.Command{
 	Use:   "stop",
 	Short: "Finds the running application and stops it",
