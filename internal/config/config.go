@@ -139,7 +139,7 @@ func LoadConfig() {
 	viper.SetDefault("cloner.num_insert_workers", 8)
 	viper.SetDefault("cloner.read_batch_size", 1000)
 	viper.SetDefault("cloner.insert_batch_size", 1000)
-	viper.SetDefault("cloner.insert_batch_bytes", 16*1024*1024)
+	viper.SetDefault("cloner.insert_batch_bytes", 48*1024*1024)
 	viper.SetDefault("cloner.segment_size_docs", 10000)
 
 	viper.SetDefault("cdc.batch_size", 1000)

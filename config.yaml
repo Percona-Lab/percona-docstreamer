@@ -145,7 +145,7 @@ cloner:
   insert_batch_size: 1000
   
   # insert_batch_bytes: Max size (in bytes) of a single insert batch
-  insert_batch_bytes: 16777216 # 16MB
+  insert_batch_bytes: 50331648 # 48MB
 
   # segment_size_docs: Size (in docs) of a segment for parallel reads
   # A collection of 1M docs will be split into 100 segments of 10k docs
