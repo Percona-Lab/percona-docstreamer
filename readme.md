@@ -245,79 +245,15 @@ dry_run: False
 
 You can modify any configuration through the [config.yaml](./config.yaml) file, including log locations and performance-related parameters. All options are clearly documented, and you are free to adjust them as needed.
 
-## Performance & Optimization
-
-### Full Load Optimization
-
-docMongoStream uses dedicated worker pools for both migration phases, eliminating sequential bottlenecks and maximizing concurrent I/O. The Full Load phase relies on splitting work into as many parallel jobs as possible without overwhelming the source DocumentDB or target MongoDB I/O queues. However, the settings multiply each other and if you configure them too high, you can easily saturate your CPU or network. The formula below might help you tune these settings accordingly:
-
-***Total Threads = migration.max_concurrent_workers * cloner.num_read_workers + cloner.num_insert_workers***
-
-Lets take our default values set in [config.yaml](./config.yaml) 
-
-- migration.max_concurrent_workers: 2
-- cloner.num_read_workers: 4
-- cloner.num_insert_workers: 8
-
-This will give us 2 collections doing the full migration at once and each of these collections will have 12 workers (4 read + 8 write). Even though we have 12 workers and 2 collections for a total of 24 threads, there is a split depending on how many are read and write. The total of active threads in this case will be the following for each given environment:
-
-***Source***
-
-Total Source Connections = 2 Collections * 4 Read Workers (8 concurrent threads)\
-Note: There is also 1 "segmenter" thread per collection calculating ID ranges, so it's technically ~10 threads, but the segmenter load is very light compared to the readers.
-
-***Destination***
-
-Only the Insert Workers connect to the destination.\
-Total Destination Connections = 2 Collections * 8 Insert Workers (16 concurrent threads)
-
-| Setting | Purpose |
-|--------:|---------|
-| `migration.max_concurrent_workers` | Maximum number of collections to copy at the same time, this controls how many collections are migrated simultaneously during the full load stage |
-| `cloner.segment_size_docs` | Defines the size of each data chunk when splitting large collections. Size (in docs) of a segment for parallel reads. Helps prevent massive collections/long-running queries from timing out or monopolizing cluster resources.  e.g. A collection of 1M docs will be split into 100 segments of 10k docs|
-| `cloner.num_read_workers` | Controls how many threads are used to read data for a single collection from the source DocumentDB |
-| `cloner.num_insert_workers` | Controls how many threads are used to write data for a single collection into the destination MongoDB. Higher values (e.g., 8–16) improve throughput if the target cluster is capable. |
-| `cloner.read_batch_size` | Number of documents per read batch | 
-| `cloner.insert_batch_size` | Number of documents per insert batch |
-| `cloner.insert_batch_bytes` | Max size (in bytes) of a single insert batch, default 16777216 bytes (16MB) |
-
-
-### CDC Optimization
-
-Change Data Capture (CDC) performance is largely governed by concurrency and batching efficiency. You can optimize the process using the `max_write_workers` setting, in combination with the batch size. `max_write_workers` controls the number of concurrent background routines that act as "consumers" during the CDC phase. These workers are responsible for processing batched change events and applying them to the target MongoDB.
-
-This setting determines the write pipeline's capacity during live synchronization. A higher value enables greater parallelism when replaying real-time events. You can increase this value to utilize more target resources and improve real-time throughput. This is particularly effective if the source (DocumentDB) has a high volume of changes and the target (MongoDB) has ample CPU and I/O capacity.
-
-**Note:** Setting this value too high may saturate connections or CPU resources on the target MongoDB cluster, potentially degrading the performance of other operations.
-
-**Note on Partitioning:** docMongoStream uses Key-Based Partitioning to guarantee strict data ordering. This means all updates for a specific document are handled by the same worker. In rare cases of "Hot Keys" (a single document receiving massive update volume), one worker may be utilized more than others. This is an intentional trade-off to ensure data integrity.
-
-
-| Setting | Purpose |
-|--------:|---------|
-| `cdc.max_write_workers` | Number of concurrent background workers that act as CDC consumers. Increase this value to utilize more target MongoDB resources and improve real-time throughput. (Default: 4) |
-| `cdc.batch_size` | Number of operations (inserts/updates/deletes) grouped into a single network request. Larger batches reduce network overhead per operation. |
-| `cdc.batch_interval_ms` | Maximum wait time before flushing an incomplete batch. Lower values reduce latency; higher values increase overall throughput. This ensures low-volume changes are still applied quickly |
-| `cdc.max_await_time_ms` | Max time (in ms) for the change stream to wait for new events |
-
-
-### Validation Optimization
-
-The data validation engine is highly configurable to balance performance impact against data integrity assurance. You can tune these settings via [config.yaml](./config.yaml) under the `validation` section.
-
-| Setting | Default | Description |
-|--------:|--------:|-------------|
-| enabled | true | Master switch for the validation engine. If false, final document verification after CDC writes are skipped. CDC is guaranteed to sync the documents; this is an optional additional validation check. |
-| batch_size | 100 | Network vs. Memory Trade-off. Controls how many document IDs are bundled into a single database lookup. Larger batches reduce network round-trips but increase memory usage. |
-| max_validation_workers | 4 | Concurrency Control. The number of parallel worker threads fetching and comparing documents. Increase this if you have spare CPU/Network capacity and notice validation lagging behind CDC. |
-| queue_size | 2000 | Buffer Capacity. The size of the channel buffering CDC events before validation. If the CDC writer is faster than the validator and this buffer fills up, validation requests will be dropped to prevent slowing down the replication stream. |
-| retry_interval_ms | 500 | Hot Key Handling. If a record fails validation because it is actively being modified (detected via dirty tracking), the validator waits this long before re-checking it. |
-| max_retries | 3 | Persistence. How many times to retry a "Hot Key" before giving up. After this many attempts, the record is marked as a mismatch/skipped to move on. |
-
-
 ## How to Use docMongoStream
 
-docMongoStream operates as a background process managed by simple commands, so its usage is rather straight forward. Once you have edited the configuration file accordingly, all you need to do is run the commands as shown below.
+docMongoStream runs as a background process that is controlled through a small set of simple commands, making its operation straightforward. After updating the configuration file to match your environment, you can execute the appropriate commands for each specific use case as shown below.
+
+In general, the data-migration workflow from source to destination follows these steps:
+
+1. Configure docMongoStream as explained above
+2. Run `docMongoStream start`
+3. When ready to cutover, run `docMongoStream stop`
 
 ### Start
 
@@ -816,6 +752,76 @@ _  /_/ // /_/ / /__ _  /  / / / /_/ /  / / /  /_/ // /_/ /     ____/ // /_ _  / 
 {"level":"info","message":"CDC batch applied","s":"cdc","batch_size":293,"elapsed_secs":0.023002195,"namespaces":["cvg_1.test_5"],"time":"2025-11-17 16:23:14.849"}
 ```
 </details>
+
+## Performance & Optimization
+
+### Full Load Optimization
+
+docMongoStream uses dedicated worker pools for both migration phases, eliminating sequential bottlenecks and maximizing concurrent I/O. The Full Load phase relies on splitting work into as many parallel jobs as possible without overwhelming the source DocumentDB or target MongoDB I/O queues. However, the settings multiply each other and if you configure them too high, you can easily saturate your CPU or network. The formula below might help you tune these settings accordingly:
+
+***Total Threads = migration.max_concurrent_workers * cloner.num_read_workers + cloner.num_insert_workers***
+
+Lets take our default values set in [config.yaml](./config.yaml) 
+
+- migration.max_concurrent_workers: 2
+- cloner.num_read_workers: 4
+- cloner.num_insert_workers: 8
+
+This will give us 2 collections doing the full migration at once and each of these collections will have 12 workers (4 read + 8 write). Even though we have 12 workers and 2 collections for a total of 24 threads, there is a split depending on how many are read and write. The total of active threads in this case will be the following for each given environment:
+
+***Source***
+
+Total Source Connections = 2 Collections * 4 Read Workers (8 concurrent threads)\
+Note: There is also 1 "segmenter" thread per collection calculating ID ranges, so it's technically ~10 threads, but the segmenter load is very light compared to the readers.
+
+***Destination***
+
+Only the Insert Workers connect to the destination.\
+Total Destination Connections = 2 Collections * 8 Insert Workers (16 concurrent threads)
+
+| Setting | Purpose |
+|--------:|---------|
+| `migration.max_concurrent_workers` | Maximum number of collections to copy at the same time, this controls how many collections are migrated simultaneously during the full load stage |
+| `cloner.segment_size_docs` | Defines the size of each data chunk when splitting large collections. Size (in docs) of a segment for parallel reads. Helps prevent massive collections/long-running queries from timing out or monopolizing cluster resources.  e.g. A collection of 1M docs will be split into 100 segments of 10k docs|
+| `cloner.num_read_workers` | Controls how many threads are used to read data for a single collection from the source DocumentDB |
+| `cloner.num_insert_workers` | Controls how many threads are used to write data for a single collection into the destination MongoDB. Higher values (e.g., 8–16) improve throughput if the target cluster is capable. |
+| `cloner.read_batch_size` | Number of documents per read batch | 
+| `cloner.insert_batch_size` | Number of documents per insert batch |
+| `cloner.insert_batch_bytes` | Max size (in bytes) of a single insert batch, default 16777216 bytes (16MB) |
+
+
+### CDC Optimization
+
+Change Data Capture (CDC) performance is largely governed by concurrency and batching efficiency. You can optimize the process using the `max_write_workers` setting, in combination with the batch size. `max_write_workers` controls the number of concurrent background routines that act as "consumers" during the CDC phase. These workers are responsible for processing batched change events and applying them to the target MongoDB.
+
+This setting determines the write pipeline's capacity during live synchronization. A higher value enables greater parallelism when replaying real-time events. You can increase this value to utilize more target resources and improve real-time throughput. This is particularly effective if the source (DocumentDB) has a high volume of changes and the target (MongoDB) has ample CPU and I/O capacity.
+
+**Note:** Setting this value too high may saturate connections or CPU resources on the target MongoDB cluster, potentially degrading the performance of other operations.
+
+**Note on Partitioning:** docMongoStream uses Key-Based Partitioning to guarantee strict data ordering. This means all updates for a specific document are handled by the same worker. In rare cases of "Hot Keys" (a single document receiving massive update volume), one worker may be utilized more than others. This is an intentional trade-off to ensure data integrity.
+
+
+| Setting | Purpose |
+|--------:|---------|
+| `cdc.max_write_workers` | Number of concurrent background workers that act as CDC consumers. Increase this value to utilize more target MongoDB resources and improve real-time throughput. (Default: 4) |
+| `cdc.batch_size` | Number of operations (inserts/updates/deletes) grouped into a single network request. Larger batches reduce network overhead per operation. |
+| `cdc.batch_interval_ms` | Maximum wait time before flushing an incomplete batch. Lower values reduce latency; higher values increase overall throughput. This ensures low-volume changes are still applied quickly |
+| `cdc.max_await_time_ms` | Max time (in ms) for the change stream to wait for new events |
+
+
+### Validation Optimization
+
+The data validation engine is highly configurable to balance performance impact against data integrity assurance. You can tune these settings via [config.yaml](./config.yaml) under the `validation` section.
+
+| Setting | Default | Description |
+|--------:|--------:|-------------|
+| enabled | true | Master switch for the validation engine. If false, final document verification after CDC writes are skipped. CDC is guaranteed to sync the documents; this is an optional additional validation check. |
+| batch_size | 100 | Network vs. Memory Trade-off. Controls how many document IDs are bundled into a single database lookup. Larger batches reduce network round-trips but increase memory usage. |
+| max_validation_workers | 4 | Concurrency Control. The number of parallel worker threads fetching and comparing documents. Increase this if you have spare CPU/Network capacity and notice validation lagging behind CDC. |
+| queue_size | 2000 | Buffer Capacity. The size of the channel buffering CDC events before validation. If the CDC writer is faster than the validator and this buffer fills up, validation requests will be dropped to prevent slowing down the replication stream. |
+| retry_interval_ms | 500 | Hot Key Handling. If a record fails validation because it is actively being modified (detected via dirty tracking), the validator waits this long before re-checking it. |
+| max_retries | 3 | Persistence. How many times to retry a "Hot Key" before giving up. After this many attempts, the record is marked as a mismatch/skipped to move on. |
+
 
 ## How docMongoStream Works
 
