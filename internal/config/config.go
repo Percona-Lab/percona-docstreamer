@@ -46,20 +46,22 @@ type MongoConfig struct {
 
 // MigrationConfig holds general migration settings
 type MigrationConfig struct {
-	NetworkCompressors   string   `mapstructure:"network_compressors"`
-	ExcludeDBs           []string `mapstructure:"exclude_dbs"`
-	ExcludeCollections   []string `mapstructure:"exclude_collections"`
-	MetadataDB           string   `mapstructure:"metadata_db"`
-	CheckpointCollection string   `mapstructure:"checkpoint_collection"`
-	CheckpointDocID      string   `mapstructure:"checkpoint_doc_id"`
-	StatusCollection     string   `mapstructure:"status_collection"`
-	StatusDocID          string   `mapstructure:"status_doc_id"`
-	PIDFilePath          string   `mapstructure:"pid_file_path"`
-	MaxConcurrentWorkers int      `mapstructure:"max_concurrent_workers"`
-	Destroy              bool     `mapstructure:"destroy"`
-	EnvPrefix            string   `mapstructure:"env_prefix"`
-	StatusHTTPPort       string   `mapstructure:"status_http_port"`
-	DryRun               bool     `mapstructure:"dry_run"`
+	NetworkCompressors           string   `mapstructure:"network_compressors"`
+	ExcludeDBs                   []string `mapstructure:"exclude_dbs"`
+	ExcludeCollections           []string `mapstructure:"exclude_collections"`
+	MetadataDB                   string   `mapstructure:"metadata_db"`
+	CheckpointCollection         string   `mapstructure:"checkpoint_collection"`
+	CheckpointDocID              string   `mapstructure:"checkpoint_doc_id"`
+	StatusCollection             string   `mapstructure:"status_collection"`
+	StatusDocID                  string   `mapstructure:"status_doc_id"`
+	ValidationStatsCollection    string   `mapstructure:"validation_stats_collection"`
+	ValidationFailuresCollection string   `mapstructure:"validation_failures_collection"`
+	PIDFilePath                  string   `mapstructure:"pid_file_path"`
+	MaxConcurrentWorkers         int      `mapstructure:"max_concurrent_workers"`
+	Destroy                      bool     `mapstructure:"destroy"`
+	EnvPrefix                    string   `mapstructure:"env_prefix"`
+	StatusHTTPPort               string   `mapstructure:"status_http_port"`
+	DryRun                       bool     `mapstructure:"dry_run"`
 }
 
 // ClonerConfig holds full-load specific settings
@@ -125,6 +127,8 @@ func LoadConfig() {
 	viper.SetDefault("migration.checkpoint_doc_id", "cdc_resume_timestamp")
 	viper.SetDefault("migration.status_collection", "status")
 	viper.SetDefault("migration.status_doc_id", "migration_status")
+	viper.SetDefault("migration.validation_stats_collection", "validation_stats")
+	viper.SetDefault("migration.validation_failures_collection", "validation_failures")
 	viper.SetDefault("migration.pid_file_path", "./docMongoStream.pid")
 	viper.SetDefault("migration.destroy", false)
 	viper.SetDefault("migration.dry_run", false)

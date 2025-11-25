@@ -119,7 +119,7 @@ db.getSiblingDB('admin').createUser({
 db.getSiblingDB('admin').createUser({
    user: 'streamer',
    pwd: 'superSecretPassword',
-   roles: ['restore', 'clusterMonitor', 'clusterManager','readWriteAnyDatabase']
+   roles: ['restore', 'clusterMonitor', 'clusterManager','readWriteAnyDatabase','dbAdminAnyDatabase']
   });
 ```  
 

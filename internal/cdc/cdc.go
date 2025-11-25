@@ -36,6 +36,9 @@ type CDCManager struct {
 	workerWG           sync.WaitGroup
 	totalEventsApplied atomic.Int64
 	checkpointDocID    string
+	// Maps for fast exclusion lookup
+	excludeDBs   map[string]bool
+	excludeColls map[string]bool
 }
 
 func NewManager(source, target *mongo.Client, checkpointDocID string, startAt bson.Timestamp, checkpoint *checkpoint.Manager, statusMgr *status.Manager, tracker *validator.InFlightTracker, store *validator.Store, valMgr *validator.Manager) *CDCManager {
@@ -66,6 +69,17 @@ func NewManager(source, target *mongo.Client, checkpointDocID string, startAt bs
 		writers[i] = NewBulkWriter(target, config.Cfg.CDC.BatchSize)
 	}
 
+	// --- Initialize Exclusion Maps ---
+	excludeDBs := make(map[string]bool)
+	for _, db := range config.Cfg.Migration.ExcludeDBs {
+		excludeDBs[db] = true
+	}
+
+	excludeColls := make(map[string]bool)
+	for _, ns := range config.Cfg.Migration.ExcludeCollections {
+		excludeColls[ns] = true
+	}
+
 	mgr := &CDCManager{
 		sourceClient:     source,
 		targetClient:     target,
@@ -82,6 +96,8 @@ func NewManager(source, target *mongo.Client, checkpointDocID string, startAt bs
 		shutdownWG:       sync.WaitGroup{},
 		workerWG:         sync.WaitGroup{},
 		checkpointDocID:  checkpointDocID,
+		excludeDBs:       excludeDBs,
+		excludeColls:     excludeColls,
 	}
 	mgr.totalEventsApplied.Store(initialEvents)
 	return mgr
@@ -162,6 +178,19 @@ func (m *CDCManager) startFlushWorkers() {
 
 func (m *CDCManager) Start(ctx context.Context) error {
 	logging.PrintInfo(fmt.Sprintf("Starting cluster-wide CDC... Resuming from checkpoint: %v", m.startAt), 0)
+
+	// --- Reconcile stats on startup ---
+	// This fixes any drift between stats aggregation and actual failure records
+	// caused by previous crashes or race conditions.
+	go func() {
+		logging.PrintInfo("[CDC] Reconciling validation statistics...", 0)
+		if err := m.validatorMgr.ReconcileStats(ctx); err != nil {
+			logging.PrintWarning(fmt.Sprintf("[CDC] Stats reconciliation failed: %v", err), 0)
+		} else {
+			logging.PrintInfo("[CDC] Validation statistics reconciled.", 0)
+		}
+	}()
+
 	m.startFlushWorkers()
 	m.shutdownWG.Add(1)
 	go m.processChanges(ctx)
@@ -199,6 +228,21 @@ func (m *CDCManager) getWorkerIndex(docID interface{}) int {
 	return int(h.Sum32()) % numWorkers
 }
 
+// shouldSkip checks if the event belongs to an excluded database or collection
+func (m *CDCManager) shouldSkip(event *ChangeEvent) bool {
+	// 1. Check DB exclusion first (fastest check)
+	if m.excludeDBs[event.Namespace.Database] {
+		return true
+	}
+
+	// 2. Check Collection exclusion
+	// We only format the string if the DB check passed, saving CPU.
+	ns := fmt.Sprintf("%s.%s", event.Namespace.Database, event.Namespace.Collection)
+
+	// Simply return the value from the map (true if excluded, false if not)
+	return m.excludeColls[ns]
+}
+
 func (m *CDCManager) processChanges(ctx context.Context) {
 	defer m.shutdownWG.Done()
 	defer func() {
@@ -209,6 +253,11 @@ func (m *CDCManager) processChanges(ctx context.Context) {
 
 	ticker := time.NewTicker(time.Duration(config.Cfg.CDC.BatchIntervalMS) * time.Millisecond)
 	defer ticker.Stop()
+
+	// --- Auto-Retry Ticker (Every 60s) ---
+	// This helps clear "false positive" validation failures when the system is quiet.
+	retryTicker := time.NewTicker(60 * time.Second)
+	defer retryTicker.Stop()
 
 	for {
 		select {
@@ -221,7 +270,12 @@ func (m *CDCManager) processChanges(ctx context.Context) {
 			return
 
 		case event := <-m.eventQueue:
+			// Filter Excluded Events
 			m.lastSuccessfulTS = event.ClusterTime
+
+			if m.shouldSkip(event) {
+				continue
+			}
 
 			if m.isDDL(event) {
 				m.handleDDL(ctx, event)
@@ -254,6 +308,17 @@ func (m *CDCManager) processChanges(ctx context.Context) {
 				}
 			}
 			m.statusManager.UpdateCDCStats(m.totalEventsApplied.Load(), m.lastSuccessfulTS)
+			// --- Persist status to DB regularly so external tools see "running"
+			m.statusManager.Persist(context.Background())
+
+		case <-retryTicker.C:
+			// --- Auto-Retry Logic ---
+			// If CDC is caught up (Lag ~ 0) and there are known failures, try to re-validate them.
+			stats := m.statusManager.GetStats()
+			if stats.CDCLagSeconds == 0 && stats.Validation.MismatchCount > 0 {
+				logging.PrintInfo(fmt.Sprintf("[Auto-Retry] System is idle (Lag: 0s). Retrying %d known validation failures...", stats.Validation.MismatchCount), 0)
+				go m.validatorMgr.RetryAllFailures(context.Background())
+			}
 		}
 	}
 }

@@ -44,8 +44,8 @@ type Store struct {
 
 func NewStore(client *mongo.Client) *Store {
 	dbName := config.Cfg.Migration.MetadataDB
-	failuresColl := client.Database(dbName).Collection("validation_failures")
-	statsColl := client.Database(dbName).Collection("validation_stats")
+	failuresColl := client.Database(dbName).Collection(config.Cfg.Migration.ValidationFailuresCollection)
+	statsColl := client.Database(dbName).Collection(config.Cfg.Migration.ValidationStatsCollection)
 
 	s := &Store{
 		client:   client,

@@ -349,7 +349,10 @@ func (cm *CopyManager) readWorker(
 
 		// Open-ended query
 		idFilter := bson.D{{Key: "$gte", Value: segment.Min}}
-		if segment.Max.Value != nil && !segment.Max.Equal(cm.initialMaxKey) {
+
+		// Consistently apply upper bound check to handle mixed-type ranges strictly.
+		// We rely on CDC to capture any inserts beyond initialMaxKey, ensuring consistency.
+		if segment.Max.Value != nil {
 			idFilter = append(idFilter, bson.E{Key: "$lte", Value: segment.Max})
 		}
 

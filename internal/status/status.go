@@ -266,36 +266,42 @@ func ByteToHuman(bytes int64) string {
 
 // getValidationStats helper to fetch validation stats directly from DB
 func (m *Manager) getValidationStats(ctx context.Context) ValidationInfo {
-	coll := m.targetClient.Database(config.Cfg.Migration.MetadataDB).Collection("validation_stats")
+	statsColl := m.targetClient.Database(config.Cfg.Migration.MetadataDB).Collection(config.Cfg.Migration.ValidationStatsCollection)
+	failColl := m.targetClient.Database(config.Cfg.Migration.MetadataDB).Collection(config.Cfg.Migration.ValidationFailuresCollection)
 
-	// Aggregate totals + max timestamp
+	// 1. Aggregate totals (cumulative throughput) from stats
 	pipeline := mongo.Pipeline{
 		{{Key: "$group", Value: bson.D{
 			{Key: "_id", Value: nil},
 			{Key: "total", Value: bson.D{{Key: "$sum", Value: "$total_checked"}}},
 			{Key: "valid", Value: bson.D{{Key: "$sum", Value: "$valid_count"}}},
-			{Key: "mismatch", Value: bson.D{{Key: "$sum", Value: "$mismatch_count"}}},
 			{Key: "lastVal", Value: bson.D{{Key: "$max", Value: "$last_updated"}}},
 		}}},
 	}
 
-	cursor, err := coll.Aggregate(ctx, pipeline)
+	cursor, err := statsColl.Aggregate(ctx, pipeline)
 	if err != nil {
 		return ValidationInfo{}
 	}
 	defer cursor.Close(ctx)
 
 	var result struct {
-		Total    int64     `bson:"total"`
-		Valid    int64     `bson:"valid"`
-		Mismatch int64     `bson:"mismatch"`
-		LastVal  time.Time `bson:"lastVal"`
+		Total   int64     `bson:"total"`
+		Valid   int64     `bson:"valid"`
+		LastVal time.Time `bson:"lastVal"`
 	}
 
 	if cursor.Next(ctx) {
 		if err := cursor.Decode(&result); err != nil {
 			logging.PrintWarning(fmt.Sprintf("[STATUS] Failed to decode stats: %v", err), 0)
 		}
+	}
+
+	// 2. Count ACTUAL active failures
+	currentMismatch, err := failColl.CountDocuments(ctx, bson.D{})
+	if err != nil {
+		logging.PrintWarning(fmt.Sprintf("[STATUS] Failed to count failures: %v", err), 0)
+		currentMismatch = 0
 	}
 
 	percent := 0.0
@@ -311,9 +317,38 @@ func (m *Manager) getValidationStats(ctx context.Context) ValidationInfo {
 	return ValidationInfo{
 		TotalChecked:    result.Total,
 		ValidCount:      result.Valid,
-		MismatchCount:   result.Mismatch,
+		MismatchCount:   currentMismatch, // Use live count
 		SyncPercent:     percent,
 		LastValidatedAt: lastValStr,
+	}
+}
+
+// GetStats returns a snapshot of the current status for internal logic
+func (m *Manager) GetStats() StatusOutput {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+
+	var cdcLag float64
+	if m.initialSyncCompleted && m.lastEventTimestamp.T > 0 {
+		eventTime := time.Unix(int64(m.lastEventTimestamp.T), 0)
+		if !m.lastBatchAppliedAt.IsZero() {
+			if time.Since(m.lastBatchAppliedAt) > 10*time.Second {
+				cdcLag = 0.0
+			} else {
+				cdcLag = m.lastBatchAppliedAt.Sub(eventTime).Seconds()
+				if cdcLag < 0 {
+					cdcLag = 0.0
+				}
+			}
+		}
+	}
+
+	// We use a background context here because this is for internal logic
+	valInfo := m.getValidationStats(context.Background())
+
+	return StatusOutput{
+		CDCLagSeconds: cdcLag,
+		Validation:    valInfo,
 	}
 }
 

@@ -76,11 +76,12 @@ migration:
  
   # Database and collections to keep track of the migration
   metadata_db: "docMongoStream"
- 
   checkpoint_collection: "checkpoints"
   checkpoint_doc_id: "cdc_resume_timestamp"
   status_collection: "status"
   status_doc_id: "migration_status"
+  validation_stats_collection: "validation_stats"
+  validation_failures_collection: "validation_failures"
  
   # Set the following to True if you want to start the migration all over from scratch
   # This will drop all databases and collections in the destination environment

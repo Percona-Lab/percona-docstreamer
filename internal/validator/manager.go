@@ -261,6 +261,11 @@ func (vm *Manager) RetryAllFailures(ctx context.Context) (int, error) {
 	return len(failures), nil
 }
 
+// ReconcileStats fixes drift between validation_stats and validation_failures
+func (vm *Manager) ReconcileStats(ctx context.Context) error {
+	return vm.store.Reconcile(ctx)
+}
+
 func (vm *Manager) validateSingle(item RetryItem) {
 	if vm.shutdownCtx.Err() != nil {
 		return

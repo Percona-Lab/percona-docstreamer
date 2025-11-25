@@ -215,11 +215,11 @@ func startAction(cmd *cobra.Command, args []string) {
 	}
 	logging.PrintSuccess(fmt.Sprintf("Application started in background with PID: %d", runCmd.Process.Pid), 0)
 
-	// --- FIX: Zombie & Exit Detection ---
+	// --- Zombie & Exit Detection ---
 	// Create a channel that closes when the child process exits.
 	processExitChan := make(chan struct{})
 	go func() {
-		// Wait ensures the zombie is reaped if it exits while we are still parent.
+		// Wait ensures the zombie is reaped if it exits while we are still parent, no walking deads here
 		runCmd.Wait()
 		close(processExitChan)
 	}()
@@ -360,7 +360,7 @@ func monitorStartup(logPath string, offset int64, pidVal int, port string, exitC
 	defer ticker.Stop()
 
 	for {
-		// --- FIX: Check if process has exited ---
+		// --- Check if process has exited ---
 		select {
 		case <-exitChan:
 			// Process has died or exited. Read final logs and quit.
@@ -522,7 +522,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		logging.PrintError(err.Error(), 0)
 		return
 	}
-	// --- FIX: Disconnect with timeout ---
+	// --- Disconnect with timeout ---
 	defer func() {
 		dCtx, dCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer dCancel()
@@ -538,7 +538,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		logging.PrintError(err.Error(), 0)
 		return
 	}
-	// --- FIX: Disconnect with timeout ---
+	// --- Disconnect with timeout ---
 	defer func() {
 		dCtx, dCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer dCancel()
@@ -547,7 +547,44 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		}
 	}()
 
-	// --- 1. Initialize Shared Components ---
+	// --- 1. EARLY CHECKPOINT CHECK & CLEANUP ---
+	// We init CheckpointManager first to check if we are resuming or starting fresh.
+	checkpointManager := checkpoint.NewManager(targetClient)
+	resumeAt, found := checkpointManager.GetResumeTimestamp(ctx, config.Cfg.Migration.CheckpointDocID)
+
+	if destroy {
+		logging.PrintPhase("1", "DISCOVERY (for Destroy)")
+		collectionsToMigrate, err := discover.DiscoverCollections(ctx, sourceClient)
+		if err != nil {
+			logging.PrintError(err.Error(), 0)
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		dbsFromSource := extractDBNames(collectionsToMigrate)
+		logging.PrintPhase("DESTROY", "Dropping target databases...")
+		dbops.DropAllDatabases(ctx, targetClient, dbsFromSource)
+		found = false
+	}
+
+	// --- Cleanup Stale Metadata on Fresh Start ---
+	if !found {
+		logging.PrintInfo("No valid global checkpoint found. Starting fresh.", 0)
+		logging.PrintInfo("Cleaning up stale metadata (Status, Checkpoints, Validation)...", 0)
+
+		// Drop the entire metadata database to ensure a clean slate for Status,
+		// Checkpoints (orphaned ones), and Validation errors.
+		err := targetClient.Database(config.Cfg.Migration.MetadataDB).Drop(ctx)
+		if err != nil {
+			logging.PrintWarning(fmt.Sprintf("Failed to drop metadata DB: %v", err), 0)
+		} else {
+			logging.PrintSuccess("Metadata cleanup complete.", 0)
+		}
+	}
+
+	// --- 2. Initialize Shared Components (AFTER CLEANUP) ---
+	// Now we initialize statusManager, so it loads a fresh (empty) state from DB.
 	tracker := validator.NewInFlightTracker()
 	valStore := validator.NewStore(targetClient)
 
@@ -555,12 +592,10 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	statusManager = status.NewManager(targetClient, false)
 
 	validationManager := validator.NewManager(sourceClient, targetClient, tracker, valStore, statusManager)
-	// --- FIX: Ensure Validator is always closed to stop workers ---
+	// --- Ensure Validator is always closed to stop workers ---
 	defer validationManager.Close()
 
-	checkpointManager := checkpoint.NewManager(targetClient)
-
-	// --- 2. Register API Routes ---
+	// --- 3. Register API Routes ---
 	apiServer.RegisterRoute("/status", statusManager.StatusHandler)
 	apiServer.RegisterRoute("/validate", validationManager.HandleValidateRequest)
 	apiServer.RegisterRoute("/validate/retry", validationManager.HandleRetryFailures)
@@ -584,29 +619,6 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 
 	var startAt bson.Timestamp
 	var collectionsToMigrate []discover.CollectionInfo
-
-	resumeAt, found := checkpointManager.GetResumeTimestamp(ctx, config.Cfg.Migration.CheckpointDocID)
-
-	if destroy {
-		logging.PrintPhase("1", "DISCOVERY (for Destroy)")
-		statusManager.SetState("discovering", "Discovering source DBs to destroy...")
-		collectionsToMigrate, err = discover.DiscoverCollections(ctx, sourceClient)
-		if err != nil {
-			statusManager.SetError(err.Error())
-			logging.PrintError(err.Error(), 0)
-			return
-		}
-		// Check context after destroy discovery
-		if ctx.Err() != nil {
-			return
-		}
-
-		dbsFromSource := extractDBNames(collectionsToMigrate)
-		logging.PrintPhase("DESTROY", "Dropping target databases...")
-		statusManager.SetState("destroying", "Dropping target databases...")
-		dbops.DropAllDatabases(ctx, targetClient, dbsFromSource)
-		found = false
-	}
 
 	if !found {
 		// --- CAPTURE T0 BEFORE DISCOVERY ---
@@ -722,7 +734,6 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 
 	cdcManager.Start(ctx)
 
-	// Note: validationManager.Close() is now called by defer at the top.
 	logging.PrintInfo("CDC process stopped. Exiting.", 0)
 }
 
