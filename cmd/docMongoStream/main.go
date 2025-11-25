@@ -87,148 +87,243 @@ capture (CDC) migration from AWS DocumentDB to MongoDB.`,
 	},
 }
 
+// startAction contains the core logic for starting the migration.
+func startAction(cmd *cobra.Command, args []string) {
+	logging.PrintPhase("1", "VALIDATION")
+	docdbUser := viper.GetString("docdb.user")
+	mongoUser := viper.GetString("mongo.user")
+	docdbPass := viper.GetString("DOCDB_PASS")
+	mongoPass := viper.GetString("MONGO_PASS")
+	if docdbUser == "" {
+		logging.PrintError("Missing source DocumentDB username.", 0)
+		os.Exit(1)
+	}
+	if mongoUser == "" {
+		logging.PrintError("Missing target MongoDB username.", 0)
+		os.Exit(1)
+	}
+	var err error
+	if docdbPass == "" {
+		docdbPass, err = getPassword(fmt.Sprintf("Enter DocumentDB password for user '%s': ", docdbUser))
+		if err != nil {
+			os.Exit(1)
+		}
+	}
+	if mongoPass == "" {
+		mongoPass, err = getPassword(fmt.Sprintf("Enter MongoDB password for user '%s': ", mongoUser))
+		if err != nil {
+			os.Exit(1)
+		}
+	}
+	docdbURI := config.Cfg.BuildDocDBURI(docdbUser, docdbPass)
+	mongoURI := config.Cfg.BuildMongoURI(mongoUser, mongoPass)
+
+	logging.PrintStep("Connecting to source DocumentDB...", 0)
+	tlsConfig := &tls.Config{InsecureSkipVerify: config.Cfg.DocDB.TlsAllowInvalidHostnames}
+	clientOpts := options.Client().ApplyURI(docdbURI).SetTLSConfig(tlsConfig)
+	sourceClient, err := mongo.Connect(clientOpts)
+	if err != nil {
+		logging.PrintError(fmt.Sprintf("Failed to create source client: %v", err), 0)
+		os.Exit(1)
+	}
+	defer sourceClient.Disconnect(context.TODO())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err = sourceClient.Ping(ctx, readpref.Primary()); err != nil {
+		logging.PrintError(fmt.Sprintf("Failed to connect to source: %v", err), 0)
+		os.Exit(1)
+	}
+
+	logging.PrintStep("Connecting to target MongoDB...", 0)
+	mongoTlsConfig := &tls.Config{InsecureSkipVerify: config.Cfg.Mongo.TlsAllowInvalidHostnames}
+	mongoClientOpts := options.Client().ApplyURI(mongoURI).SetTLSConfig(mongoTlsConfig)
+	targetClient, err := mongo.Connect(mongoClientOpts)
+	if err != nil {
+		logging.PrintError(fmt.Sprintf("Failed to create target client: %v", err), 0)
+		os.Exit(1)
+	}
+	defer targetClient.Disconnect(context.TODO())
+	ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err = targetClient.Ping(ctx, readpref.Primary()); err != nil {
+		logging.PrintError(fmt.Sprintf("Failed to connect to target: %v", err), 0)
+		os.Exit(1)
+	}
+	logging.PrintSuccess("Connections successful.", 0)
+
+	logging.PrintStep("Validating DocumentDB Change Stream configuration...", 0)
+	ctxValidate, cancelValidate := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelValidate()
+
+	isStreamEnabled, err := dbops.ValidateDocDBStreamConfig(ctxValidate, sourceClient)
+	if err != nil {
+		logging.PrintError(fmt.Sprintf("Failed to validate change stream configuration: %v", err), 0)
+		os.Exit(1)
+	}
+	if !isStreamEnabled {
+		logging.PrintError("CRITICAL: DocumentDB cluster-wide change stream is NOT enabled.", 0)
+		os.Exit(1)
+	}
+	logging.PrintSuccess("DocumentDB Change Stream configuration is valid.", 0)
+
+	if config.Cfg.Migration.DryRun {
+		logging.PrintSuccess("Dry Run mode enabled via configuration. Exiting.", 0)
+		os.Exit(0)
+	}
+
+	if pidVal, err := pid.Read(); err == nil && pid.IsRunning(pidVal) {
+		logging.PrintError(fmt.Sprintf("Application is already running with PID %d.", pidVal), 0)
+		os.Exit(1)
+	}
+
+	if config.Cfg.Migration.Destroy {
+		checkpointManager := checkpoint.NewManager(targetClient)
+		_, found := checkpointManager.GetResumeTimestamp(ctx, config.Cfg.Migration.CheckpointDocID)
+		if found {
+			logging.PrintWarning("--- DESTROY DATA CONFIRMATION ---", 0)
+			confirmed, err := getConfirmation("Type 'yes' to confirm and destroy all target data: ")
+			if err != nil || !confirmed {
+				os.Exit(1)
+			}
+			logging.PrintSuccess("Destruction confirmed. Proceeding.", 0)
+		}
+	}
+
+	logging.PrintPhase("2", "LAUNCHING BACKGROUND PROCESS")
+	executable, err := os.Executable()
+	if err != nil {
+		os.Exit(1)
+	}
+
+	var hiddenargs = []string{"run",
+		"--docdb-user", docdbUser,
+		"--mongo-user", mongoUser,
+		"--docdb-pass", docdbPass,
+		"--mongo-pass", mongoPass,
+	}
+	if config.Cfg.Migration.Destroy {
+		hiddenargs = append(hiddenargs, "--destroy")
+	}
+
+	runCmd := exec.Command(executable, hiddenargs...)
+	runCmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid: true, // Detach
+	}
+	if err := runCmd.Start(); err != nil {
+		logging.PrintError(fmt.Sprintf("Failed to launch background process: %v", err), 0)
+		os.Exit(1)
+	}
+	logging.PrintSuccess(fmt.Sprintf("Application started in background with PID: %d", runCmd.Process.Pid), 0)
+
+	logFile, err := os.Open(config.Cfg.Logging.FilePath)
+	var initialOffset int64 = 0
+	if err == nil {
+		initialOffset, _ = logFile.Seek(0, 2) // Go to end of existing logs
+		logFile.Close()
+	}
+
+	// Monitor via API and Logs
+	monitorStartup(config.Cfg.Logging.FilePath, initialOffset, runCmd.Process.Pid, config.Cfg.Migration.StatusHTTPPort)
+}
+
+// stopAction encapsulates the logic to signal the app to stop and tail the logs until it exits.
+func stopAction(phaseTitle string) error {
+	logging.PrintPhase("X", phaseTitle)
+
+	pidVal, err := pid.Read()
+	if err != nil {
+		return fmt.Errorf("could not read PID file. Is the application running")
+	}
+
+	// 1. Open log file before stopping to catch shutdown logs
+	logFile, err := os.Open(config.Cfg.Logging.FilePath)
+	if err == nil {
+		logFile.Seek(0, 2)
+	}
+	defer func() {
+		if logFile != nil {
+			logFile.Close()
+		}
+	}()
+
+	// 2. Send Stop Signal
+	if err := pid.Stop(); err != nil {
+		return err
+	}
+	logging.PrintSuccess("Stop signal sent.", 0)
+
+	// 3. Tail logs until exit
+	if logFile != nil {
+		reader := bufio.NewReader(logFile)
+		for {
+			line, err := reader.ReadString('\n')
+			if err == nil {
+				fmt.Print(line)
+			} else if err != io.EOF {
+				break
+			} else {
+				time.Sleep(100 * time.Millisecond)
+			}
+
+			if !pid.IsRunning(pidVal) {
+				// Drain remainder
+				for {
+					line, err := reader.ReadString('\n')
+					if err == nil {
+						fmt.Print(line)
+					} else {
+						break
+					}
+				}
+				break
+			}
+		}
+	}
+	return nil
+}
+
 var startCmd = &cobra.Command{
 	Use:   "start",
 	Short: "Starts the full load and CDC migration",
 	Long: `Starts the migration process in the background.
 This command will tail the logs until the application API is healthy,
 then it will detach and return you to the command prompt.`,
+	Run: startAction,
+}
+
+var stopCmd = &cobra.Command{
+	Use:   "stop",
+	Short: "Finds the running application and stops it",
 	Run: func(cmd *cobra.Command, args []string) {
-		logging.PrintPhase("1", "VALIDATION")
-		docdbUser := viper.GetString("docdb.user")
-		mongoUser := viper.GetString("mongo.user")
-		docdbPass := viper.GetString("DOCDB_PASS")
-		mongoPass := viper.GetString("MONGO_PASS")
-		if docdbUser == "" {
-			logging.PrintError("Missing source DocumentDB username.", 0)
+		if err := stopAction("STOPPING APPLICATION"); err != nil {
+			logging.PrintError(err.Error(), 0)
 			os.Exit(1)
 		}
-		if mongoUser == "" {
-			logging.PrintError("Missing target MongoDB username.", 0)
-			os.Exit(1)
-		}
-		var err error
-		if docdbPass == "" {
-			docdbPass, err = getPassword(fmt.Sprintf("Enter DocumentDB password for user '%s': ", docdbUser))
-			if err != nil {
+		logging.PrintSuccess("Application stopped.", 0)
+	},
+}
+
+var restartCmd = &cobra.Command{
+	Use:   "restart",
+	Short: "Restarts the application",
+	Long:  `Stops the running application (if any) and starts it again.`,
+	Run: func(cmd *cobra.Command, args []string) {
+		// 1. Check if running and Stop
+		pidVal, err := pid.Read()
+		if err == nil && pid.IsRunning(pidVal) {
+			if err := stopAction("STOPPING FOR RESTART"); err != nil {
+				logging.PrintError(fmt.Sprintf("Failed to stop application: %v", err), 0)
 				os.Exit(1)
 			}
-		}
-		if mongoPass == "" {
-			mongoPass, err = getPassword(fmt.Sprintf("Enter MongoDB password for user '%s': ", mongoUser))
-			if err != nil {
-				os.Exit(1)
-			}
-		}
-		docdbURI := config.Cfg.BuildDocDBURI(docdbUser, docdbPass)
-		mongoURI := config.Cfg.BuildMongoURI(mongoUser, mongoPass)
-
-		logging.PrintStep("Connecting to source DocumentDB...", 0)
-		tlsConfig := &tls.Config{InsecureSkipVerify: config.Cfg.DocDB.TlsAllowInvalidHostnames}
-		clientOpts := options.Client().ApplyURI(docdbURI).SetTLSConfig(tlsConfig)
-		sourceClient, err := mongo.Connect(clientOpts)
-		if err != nil {
-			logging.PrintError(fmt.Sprintf("Failed to create source client: %v", err), 0)
-			os.Exit(1)
-		}
-		defer sourceClient.Disconnect(context.TODO())
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err = sourceClient.Ping(ctx, readpref.Primary()); err != nil {
-			logging.PrintError(fmt.Sprintf("Failed to connect to source: %v", err), 0)
-			os.Exit(1)
+			logging.PrintSuccess("Application stopped.", 0)
+			// Brief pause to ensure OS releases resources
+			time.Sleep(1 * time.Second)
+		} else {
+			logging.PrintInfo("Application is not running. Proceeding to start.", 0)
 		}
 
-		logging.PrintStep("Connecting to target MongoDB...", 0)
-		mongoTlsConfig := &tls.Config{InsecureSkipVerify: config.Cfg.Mongo.TlsAllowInvalidHostnames}
-		mongoClientOpts := options.Client().ApplyURI(mongoURI).SetTLSConfig(mongoTlsConfig)
-		targetClient, err := mongo.Connect(mongoClientOpts)
-		if err != nil {
-			logging.PrintError(fmt.Sprintf("Failed to create target client: %v", err), 0)
-			os.Exit(1)
-		}
-		defer targetClient.Disconnect(context.TODO())
-		ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err = targetClient.Ping(ctx, readpref.Primary()); err != nil {
-			logging.PrintError(fmt.Sprintf("Failed to connect to target: %v", err), 0)
-			os.Exit(1)
-		}
-		logging.PrintSuccess("Connections successful.", 0)
-
-		logging.PrintStep("Validating DocumentDB Change Stream configuration...", 0)
-		ctxValidate, cancelValidate := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancelValidate()
-
-		isStreamEnabled, err := dbops.ValidateDocDBStreamConfig(ctxValidate, sourceClient)
-		if err != nil {
-			logging.PrintError(fmt.Sprintf("Failed to validate change stream configuration: %v", err), 0)
-			os.Exit(1)
-		}
-		if !isStreamEnabled {
-			logging.PrintError("CRITICAL: DocumentDB cluster-wide change stream is NOT enabled.", 0)
-			os.Exit(1)
-		}
-		logging.PrintSuccess("DocumentDB Change Stream configuration is valid.", 0)
-
-		if config.Cfg.Migration.DryRun {
-			logging.PrintSuccess("Dry Run mode enabled via configuration. Exiting.", 0)
-			os.Exit(0)
-		}
-
-		if pidVal, err := pid.Read(); err == nil && pid.IsRunning(pidVal) {
-			logging.PrintError(fmt.Sprintf("Application is already running with PID %d.", pidVal), 0)
-			os.Exit(1)
-		}
-
-		if config.Cfg.Migration.Destroy {
-			checkpointManager := checkpoint.NewManager(targetClient)
-			_, found := checkpointManager.GetResumeTimestamp(ctx, config.Cfg.Migration.CheckpointDocID)
-			if found {
-				logging.PrintWarning("--- DESTROY DATA CONFIRMATION ---", 0)
-				confirmed, err := getConfirmation("Type 'yes' to confirm and destroy all target data: ")
-				if err != nil || !confirmed {
-					os.Exit(1)
-				}
-				logging.PrintSuccess("Destruction confirmed. Proceeding.", 0)
-			}
-		}
-
-		logging.PrintPhase("2", "LAUNCHING BACKGROUND PROCESS")
-		executable, err := os.Executable()
-		if err != nil {
-			os.Exit(1)
-		}
-
-		var hiddenargs = []string{"run",
-			"--docdb-user", docdbUser,
-			"--mongo-user", mongoUser,
-			"--docdb-pass", docdbPass,
-			"--mongo-pass", mongoPass,
-		}
-		if config.Cfg.Migration.Destroy {
-			hiddenargs = append(hiddenargs, "--destroy")
-		}
-
-		runCmd := exec.Command(executable, hiddenargs...)
-		runCmd.SysProcAttr = &syscall.SysProcAttr{
-			Setsid: true, // Detach
-		}
-		if err := runCmd.Start(); err != nil {
-			logging.PrintError(fmt.Sprintf("Failed to launch background process: %v", err), 0)
-			os.Exit(1)
-		}
-		logging.PrintSuccess(fmt.Sprintf("Application started in background with PID: %d", runCmd.Process.Pid), 0)
-
-		logFile, err := os.Open(config.Cfg.Logging.FilePath)
-		var initialOffset int64 = 0
-		if err == nil {
-			initialOffset, _ = logFile.Seek(0, 2) // Go to end of existing logs
-			logFile.Close()
-		}
-
-		// Monitor via API and Logs
-		monitorStartup(config.Cfg.Logging.FilePath, initialOffset, runCmd.Process.Pid, config.Cfg.Migration.StatusHTTPPort)
+		// 2. Start
+		startAction(cmd, args)
 	},
 }
 
@@ -541,66 +636,6 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	logging.PrintInfo("CDC process stopped. Exiting.", 0)
 }
 
-var stopCmd = &cobra.Command{
-	Use:   "stop",
-	Short: "Finds the running application and stops it",
-	Run: func(cmd *cobra.Command, args []string) {
-		logging.PrintPhase("X", "STOPPING APPLICATION")
-
-		pidVal, err := pid.Read()
-		if err != nil {
-			logging.PrintError("Could not read PID file. Is the application running?", 0)
-			os.Exit(1)
-		}
-
-		// 1. Open log file before stopping
-		logFile, err := os.Open(config.Cfg.Logging.FilePath)
-		if err == nil {
-			logFile.Seek(0, 2)
-		}
-		defer func() {
-			if logFile != nil {
-				logFile.Close()
-			}
-		}()
-
-		// 2. Send Stop Signal
-		if err := pid.Stop(); err != nil {
-			logging.PrintError(err.Error(), 0)
-			os.Exit(1)
-		}
-		logging.PrintSuccess("Stop signal sent.", 0)
-
-		// 3. Tail logs until exit
-		if logFile != nil {
-			reader := bufio.NewReader(logFile)
-			for {
-				line, err := reader.ReadString('\n')
-				if err == nil {
-					fmt.Print(line)
-				} else if err != io.EOF {
-					break
-				} else {
-					time.Sleep(100 * time.Millisecond)
-				}
-
-				if !pid.IsRunning(pidVal) {
-					// Drain remainder
-					for {
-						line, err := reader.ReadString('\n')
-						if err == nil {
-							fmt.Print(line)
-						} else {
-							break
-						}
-					}
-					break
-				}
-			}
-		}
-	},
-}
-
 func extractDBNames(collections []discover.CollectionInfo) []string {
 	dbMap := make(map[string]bool)
 	for _, coll := range collections {
@@ -677,6 +712,7 @@ func init() {
 	viper.BindEnv("MONGO_PASS")
 
 	rootCmd.AddCommand(startCmd)
+	rootCmd.AddCommand(restartCmd)
 	rootCmd.AddCommand(stopCmd)
 	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(runCmd)

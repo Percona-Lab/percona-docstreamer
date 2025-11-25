@@ -177,6 +177,7 @@ Usage:
 
 Available Commands:
   help        Help about any command
+  restart     Restarts the application
   start       Starts the full load and CDC migration
   status      Checks and prints the current status of the migration
   stop        Finds the running application and stops it
@@ -207,10 +208,21 @@ You are able to exclude entire databases (the ones below are recommended and sho
 2. Exclude collections
 
 You can exclude specific collections from the migration; however, if you intend to skip all collections within a particular database, use exclude_dbs instead.
-Use the format "dbname.collname", and separate multiple entries with commas.
+Use the format "dbname.collname", and separate multiple entries with commas or in separate lines as shown below.
+
+Do not exclude any collections:
 
 ```yaml
 exclude_collections: []  
+```
+
+Exclude some collections:
+
+```yaml
+  exclude_collections:
+    - "dbnamehere.collection1"
+    - "anotherdbhere.collection3"
+    - "somedb.collection2"
 ```
 
 3. Destroy destination databases
@@ -307,15 +319,15 @@ The data validation engine is highly configurable to balance performance impact 
 
 docMongoStream operates as a background process managed by simple commands, so its usage is rather straight forward. Once you have edited the configuration file accordingly, all you need to do is run the commands as shown below.
 
-### Start / Resume
+### Start
 
 The start command can be used to start a brand new migration and to resume a migration that has been stopped. docMongoStream will check if a full migration has already completed and it will resume from the last checkpoint.  
 
 ```bash
 ./docMongoStream start --docdb-user=your_docdb_user --mongo-user=your_mongo_user
 ```
-
-Sample output:
+<details>
+<summary>Sample output:</summary>
 
 ```bash
 2025/11/20 19:14:44 [INFO] CDC Operations logger initialized (file: logs/cdc.log)
@@ -381,6 +393,7 @@ _  /_/ // /_/ / /__ _  /  / / / /_/ /  / / /  /_/ // /_/ /     ____/ // /_ _  / 
 2025/11/20 19:14:46 [INFO] [CDC] Starting 4 concurrent write workers...
 2025/11/20 19:14:46 [TASK] [CDC] Starting cluster-wide change stream watcher...
 ```
+</details>
 
 ### Stop
 
@@ -388,7 +401,8 @@ _  /_/ // /_/ / /__ _  /  / / / /_/ /  / / /  /_/ // /_/ /     ____/ // /_ _  / 
 ./docMongoStream stop
 ```
 
-Sample Output:
+<details>
+<summary>Sample Output:</summary>
 
 ```bash
 2025/11/20 21:55:16
@@ -420,13 +434,108 @@ _  /_/ // /_/ / /__ _  /  / / / /_/ /  / / /  /_/ // /_/ /     ____/ // /_ _  / 
 2025/11/20 21:55:16 [INFO] CDC process stopped. Exiting.
 ```
 
+</details>
+
+### Restart
+
+You can use this command when you need to apply configuration changes and then restart the existing migration. This is particularly useful after making optimization adjustments to ensure the migration reloads and restarts with the updated settings.
+
+```bash
+./docMongoStream restart
+```
+
+<details>
+<summary>Sample output:</summary>
+
+```bash
+./docMongoStream restart
+2025/11/24 22:22:42 [INFO] CDC Operations logger initialized (file: logs/cdc.log)
+2025/11/24 22:22:42 [INFO] Full Load logger initialized (file: logs/full_load.log)
+2025/11/24 22:22:42
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+________            ______  ___                                ____________
+___  __ \______________   |/  /___________________ ______      __  ___/_  /__________________ _______ ___
+__  / / /  __ \  ___/_  /|_/ /_  __ \_  __ \_  __ `/  __ \     _____ \_  __/_  ___/  _ \  __ `/_  __ `__ \
+_  /_/ // /_/ / /__ _  /  / / / /_/ /  / / /  /_/ // /_/ /     ____/ // /_ _  /   /  __/ /_/ /_  / / / / /
+/_____/ \____/\___/ /_/  /_/  \____//_/ /_/\__, / \____/      /____/ \__/ /_/    \___/\__,_/ /_/ /_/ /_/
+                                           /____/
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+2025/11/24 22:22:42
+--- Phase X: STOPPING FOR RESTART ---
+2025/11/24 22:22:42 [OK]   Stop signal sent.
+2025/11/24 22:22:42 [OK]   Stop signal sent.
+2025/11/24 22:22:42 [WARN] Received signal: terminated. Initiating graceful shutdown...
+2025/11/24 22:22:42 [INFO] !!! PLEASE WAIT: Flushing final CDC batches to destination...
+2025/11/24 22:22:42 [INFO] !!! DO NOT FORCE QUIT (Ctrl+C), or data may be lost.
+2025/11/24 22:22:42 [INFO] [STATUS] State changed to: stopping (Flushing pending events... Please wait.)
+2025/11/24 22:22:42 [INFO] Stopping API Server...
+2025/11/24 22:22:42 [INFO] [CDC] Watcher stopped. Waiting for processor to finalize...
+2025/11/24 22:22:42 [INFO] [CDC cdc_resume_timestamp] Found resume timestamp: {1764038958 3}
+2025/11/24 22:22:42 [INFO] [VAL] Shutting down validation workers...
+2025/11/24 22:22:42 [INFO] [VAL] Validation workers stopped.
+2025/11/24 22:22:42 [INFO] CDC process stopped. Exiting.
+2025/11/24 22:22:42 [OK]   Application stopped.
+2025/11/24 22:22:43
+--- Phase 1: VALIDATION ---
+2025/11/24 22:22:43 [TASK] Connecting to source DocumentDB...
+2025/11/24 22:22:44 [TASK] Connecting to target MongoDB...
+2025/11/24 22:22:44 [OK]   Connections successful.
+2025/11/24 22:22:44 [TASK] Validating DocumentDB Change Stream configuration...
+2025/11/24 22:22:44 [INFO] [VALIDATE] Running $listChangeStreams on admin DB...
+2025/11/24 22:22:44 [INFO] [VALIDATE] Found 15 enabled change streams:
+2025/11/24 22:22:44 [INFO] [VALIDATE]   - my_awesome_app.*
+2025/11/24 22:22:44 [INFO] [VALIDATE]   - my_awesome_app.users
+2025/11/24 22:22:44 [INFO] [VALIDATE]   - percona_db_1.test_1
+2025/11/24 22:22:44 [INFO] [VALIDATE]   - percona_db_1.test_5
+2025/11/24 22:22:44 [INFO] [VALIDATE]   - percona_db_1.test_2
+2025/11/24 22:22:44 [INFO] [VALIDATE]   - percona_db_1.test_3
+2025/11/24 22:22:44 [INFO] [VALIDATE]   - percona_db_1.test_4
+2025/11/24 22:22:44 [INFO] [VALIDATE]   - percona_db_2.test_1
+2025/11/24 22:22:44 [INFO] [VALIDATE]   - percona_db_2.test_2
+2025/11/24 22:22:44 [INFO] [VALIDATE]   - percona_db_2.test_3
+2025/11/24 22:22:44 [INFO] [VALIDATE]   - percona_db_2.test_4
+2025/11/24 22:22:44 [INFO] [VALIDATE]   - percona_db_2.test_5
+2025/11/24 22:22:44 [INFO] [VALIDATE]   - tobeignored.skipme_1
+2025/11/24 22:22:44 [INFO] [VALIDATE]   - alpha.test_1
+2025/11/24 22:22:44 [INFO] [VALIDATE]   - CLUSTER_WIDE (*.*)
+2025/11/24 22:22:44 [OK]   DocumentDB Change Stream configuration is valid.
+2025/11/24 22:22:44
+--- Phase 2: LAUNCHING BACKGROUND PROCESS ---
+2025/11/24 22:22:44 [OK]   Application started in background with PID: 1663258
+2025/11/24 22:22:44 [INFO] CDC Operations logger initialized (file: logs/cdc.log)
+2025/11/24 22:22:44 [INFO] Full Load logger initialized (file: logs/full_load.log)
+2025/11/24 22:22:44 [INFO] Writing PID 1663258 to docMongoStream.pid
+2025/11/24 22:22:44 [INFO] Status manager initialized (collection: docMongoStream.status)
+2025/11/24 22:22:44 [INFO] [VAL] Starting 4 parallel CDC validation workers...
+2025/11/24 22:22:44 [INFO] Checkpoint manager initialized (collection: docMongoStream.checkpoints)
+2025/11/24 22:22:44 [INFO] [STATUS] State changed to: connecting (Connections established. Pinging...)
+2025/11/24 22:22:44 [INFO] API Server starting on port 8080...
+2025/11/24 22:22:45 [INFO] [CDC cdc_resume_timestamp] Found resume timestamp: {1764038958 3}
+2025/11/24 22:22:45
+--- Phase 1: DISCOVERY (SKIPPED) ---
+2025/11/24 22:22:45
+--- Phase 2: FULL DATA LOAD (SKIPPED) ---
+2025/11/24 22:22:45
+--- Phase 3: CONTINUOUS SYNC (CDC) ---
+2025/11/24 22:22:45 [INFO] [STATUS] State changed to: running (Change Data Capture)
+2025/11/24 22:22:45 [INFO] [CDC cdc_resume_timestamp] Found resume timestamp: {1764038958 3}
+2025/11/24 22:22:45 [INFO] [CDC cdc_resume_timestamp] Loaded checkpoint. Resuming from {1764038958 3}
+2025/11/24 22:22:45 [INFO] [CDC] Resuming event count from 1817845
+2025/11/24 22:22:45 [INFO] Starting cluster-wide CDC... Resuming from checkpoint: {1764038958 3}
+2025/11/24 22:22:45 [INFO] [CDC] Starting 4 partition-aware write workers...
+2025/11/24 22:22:45 [OK]   Application is healthy (State: running).
+```
+</details>
+
 ### Status
 
 ```bash
 ./docMongoStream status
 ```
 
-Sample output
+<details>
+<summary>Sample output:</summary>
 
 ```bash
 --- docMongoStream Status (Live) ---
@@ -461,6 +570,7 @@ PID: 1318823 (Querying http://localhost:8080/status)
     }
 }
 ```
+</details>
 
 #### Understanding the status output
 
@@ -531,7 +641,8 @@ docMongoStream generates three separate logs, each of the logs location and name
 2. Full Load Log (`logs/full_load.log`): Dedicated to the initial full synchronization process. This log, together with the status endpoint, helps you monitor the progress of the initial sync.
 3. CDC Log (`logs/cdc.log`): Dedicated to Change Data Capture (CDC) operations. These operations begin only after the full sync is complete, so this log will remain empty until that point. Use it, along with the status endpoint, to track CDC progress.
 
-Application log sample:
+<details>
+<summary>Application log sample:</summary>
 
 ```bash
 2025/11/17 16:13:33 [INFO] CDC Operations logger initialized (file: logs/cdc.log)
@@ -669,8 +780,10 @@ _  /_/ // /_/ / /__ _  /  / / / /_/ /  / / /  /_/ // /_/ /     ____/ // /_ _  / 
 2025/11/17 16:13:47 [INFO] [CDC] Starting 4 concurrent write workers...
 2025/11/17 16:13:47 [TASK] [CDC] Starting cluster-wide change stream watcher...
 ```
+</details>
 
-full sync log:
+<details>
+<summary>full sync log:</summary>
 
 ```json
 {"level":"info","message":"Full load batch applied","s":"clone_batch","ns":"test.car","doc_count":3,"byte_size":90,"elapsed_secs":0.016270551,"time":"2025-11-17 16:13:46.115"}
@@ -685,8 +798,10 @@ full sync log:
 {"level":"info","message":"Full load for namespace completed","s":"clone","ns":"cvg_1.test_4","doc_count":2000,"elapsed_secs":1.241415552,"time":"2025-11-17 16:13:47.638"}
 {"level":"info","message":"Full load for namespace completed","s":"clone","ns":"cvg_1.test_2","doc_count":2739,"elapsed_secs":1.469130041,"time":"2025-11-17 16:13:47.752"}
 ```
+</details>
 
-cdc log:
+<details>
+<summary>cdc log:</summary>
 
 ```json
 {"level":"info","message":"CDC batch applied","s":"cdc","batch_size":606,"elapsed_secs":0.066290354,"namespaces":["cvg_1.test_1"],"time":"2025-11-17 16:23:10.392"}
@@ -700,6 +815,7 @@ cdc log:
 {"level":"info","message":"CDC batch applied","s":"cdc","batch_size":606,"elapsed_secs":0.038757109,"namespaces":["cvg_1.test_5"],"time":"2025-11-17 16:23:14.364"}
 {"level":"info","message":"CDC batch applied","s":"cdc","batch_size":293,"elapsed_secs":0.023002195,"namespaces":["cvg_1.test_5"],"time":"2025-11-17 16:23:14.849"}
 ```
+</details>
 
 ## How docMongoStream Works
 
@@ -955,7 +1071,8 @@ The transition to CDC requires a single, cluster-wide moment in time—the Check
 **Note:**  
 This means the CDC stream will replay events that occurred during the Full Load. This is intentional and necessary to ensure that no data is missed ("zero data loss"), and the idempotent write logic handles these replayed events gracefully.
 
-***DocumentDB exposes the following, which we can leverage for checkpointing***
+<details>
+<summary>***DocumentDB exposes the following, which we can leverage for checkpointing***</summary>
 
 ```sql
 rs0 [direct: primary] test> db.hello()
@@ -987,6 +1104,7 @@ rs0 [direct: primary] test> db.hello()
   ok: 1
 }
 ```
+</details>
 
 #### Maintaining Chronological Order and Correction
 
