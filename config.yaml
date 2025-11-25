@@ -136,6 +136,9 @@ cloner:
   
   # num_insert_workers: Controls how many threads are used to write data for a single collection
   # This is the number of parallel writers (insert workers) pushing to MongoDB for one given collection 
+  # Increase writers to achieve 1:8 ratio with readers, this typically provides an effective performance
+  # however it is important to keep in mind this is per collection, so tune this wisely (see max_concurrent_workers)
+  # e.g. If num_read_workers = 4 then set num_insert_workers to 32 (e.g. 4 * 8 = 32)
   num_insert_workers: 8
   
   # read_batch_size: Number of documents per read batch
@@ -168,8 +171,8 @@ cdc:
   # max_write_workers: Controls concurrency during the cdc phase
   # After the full load finishes, this setting controls how many threads apply the stream of real-time changes.
   # This determines how "wide" your write pipeline is during the live cdc phase. A higher number allows for more parallelism when replaying real-time events
-  # Increase this value to utilize more target MongoDB resources and improve real-time throughput. (Default: 4)
+  # Increase this value to utilize more target MongoDB resources and improve real-time throughput. (Default: 8)
   # Increasing this value helps if you have a very high volume of changes on the source (DocumentDB) and your target (MongoDB) has plenty of CPU/IO capacity. 
   # It prevents the application from falling behind simply because it can't write fast enough.
   # Resource Usage: Setting this too high can saturate the connections or CPU on your target MongoDB cluster, potentially slowing down other operations.
-  max_write_workers: 4              
+  max_write_workers: 8              
