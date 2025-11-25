@@ -215,6 +215,15 @@ func startAction(cmd *cobra.Command, args []string) {
 	}
 	logging.PrintSuccess(fmt.Sprintf("Application started in background with PID: %d", runCmd.Process.Pid), 0)
 
+	// --- FIX: Zombie & Exit Detection ---
+	// Create a channel that closes when the child process exits.
+	processExitChan := make(chan struct{})
+	go func() {
+		// Wait ensures the zombie is reaped if it exits while we are still parent.
+		runCmd.Wait()
+		close(processExitChan)
+	}()
+
 	logFile, err := os.Open(config.Cfg.Logging.FilePath)
 	var initialOffset int64 = 0
 	if err == nil {
@@ -223,12 +232,12 @@ func startAction(cmd *cobra.Command, args []string) {
 	}
 
 	// Monitor via API and Logs
-	monitorStartup(config.Cfg.Logging.FilePath, initialOffset, runCmd.Process.Pid, config.Cfg.Migration.StatusHTTPPort)
+	monitorStartup(config.Cfg.Logging.FilePath, initialOffset, runCmd.Process.Pid, config.Cfg.Migration.StatusHTTPPort, processExitChan)
 }
 
 // stopAction encapsulates the logic to signal the app to stop and tail the logs until it exits.
 func stopAction(phaseTitle string) error {
-	logging.PrintPhase("X", phaseTitle)
+	logging.PrintPhase("4", phaseTitle)
 
 	pidVal, err := pid.Read()
 	if err != nil {
@@ -328,7 +337,7 @@ var restartCmd = &cobra.Command{
 }
 
 // monitorStartup tails logs AND polls the status endpoint for readiness
-func monitorStartup(logPath string, offset int64, pidVal int, port string) {
+func monitorStartup(logPath string, offset int64, pidVal int, port string, exitChan chan struct{}) {
 	if port == "" {
 		port = "8080"
 	}
@@ -351,6 +360,23 @@ func monitorStartup(logPath string, offset int64, pidVal int, port string) {
 	defer ticker.Stop()
 
 	for {
+		// --- FIX: Check if process has exited ---
+		select {
+		case <-exitChan:
+			// Process has died or exited. Read final logs and quit.
+			for {
+				line, err := reader.ReadString('\n')
+				if err == nil {
+					fmt.Print(line)
+				} else {
+					break
+				}
+			}
+			logging.PrintInfo("Background process exited.", 0)
+			return
+		default:
+		}
+
 		// 1. Read and print new logs
 		for {
 			line, err := reader.ReadString('\n')
@@ -361,10 +387,10 @@ func monitorStartup(logPath string, offset int64, pidVal int, port string) {
 			}
 		}
 
-		// 2. Check if process crashed
+		// 2. Check if process crashed (PID check fallback)
 		if !pid.IsRunning(pidVal) {
 			logging.PrintError(("Process exited unexpectedly. Check logs for details."), 0)
-			os.Exit(1)
+			return
 		}
 
 		// 3. Poll HTTP Status
@@ -460,9 +486,21 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 			statusManager.SetState("stopping", "Flushing pending events... Please wait.")
 			statusManager.Persist(context.Background())
 		}
-		// Gracefully stop the new API server
+
+		// --- SHUTDOWN WATCHDOG ---
+		// If the app is still running after 15 seconds, force exit to avoid hanging forever.
+		go func() {
+			time.Sleep(15 * time.Second)
+			logging.PrintError("Shutdown timed out. Forcing exit.", 0)
+			pid.Clear()
+			os.Exit(1)
+		}()
+
+		// Gracefully stop the new API server WITH TIMEOUT
 		if apiServer != nil {
-			apiServer.Stop(context.Background())
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer stopCancel()
+			apiServer.Stop(stopCtx)
 		}
 
 		cancel()
@@ -484,7 +522,15 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		logging.PrintError(err.Error(), 0)
 		return
 	}
-	defer sourceClient.Disconnect(context.TODO())
+	// --- FIX: Disconnect with timeout ---
+	defer func() {
+		dCtx, dCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer dCancel()
+		if err := sourceClient.Disconnect(dCtx); err != nil {
+			logging.PrintWarning(fmt.Sprintf("Source disconnect warning: %v", err), 0)
+		}
+	}()
+
 	mongoTlsConfig := &tls.Config{InsecureSkipVerify: config.Cfg.Mongo.TlsAllowInvalidHostnames}
 	mongoClientOpts := options.Client().ApplyURI(mongoURI).SetTLSConfig(mongoTlsConfig)
 	targetClient, err := mongo.Connect(mongoClientOpts)
@@ -492,7 +538,14 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		logging.PrintError(err.Error(), 0)
 		return
 	}
-	defer targetClient.Disconnect(context.TODO())
+	// --- FIX: Disconnect with timeout ---
+	defer func() {
+		dCtx, dCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer dCancel()
+		if err := targetClient.Disconnect(dCtx); err != nil {
+			logging.PrintWarning(fmt.Sprintf("Target disconnect warning: %v", err), 0)
+		}
+	}()
 
 	// --- 1. Initialize Shared Components ---
 	tracker := validator.NewInFlightTracker()
@@ -502,6 +555,9 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	statusManager = status.NewManager(targetClient, false)
 
 	validationManager := validator.NewManager(sourceClient, targetClient, tracker, valStore, statusManager)
+	// --- FIX: Ensure Validator is always closed to stop workers ---
+	defer validationManager.Close()
+
 	checkpointManager := checkpoint.NewManager(targetClient)
 
 	// --- 2. Register API Routes ---
@@ -540,6 +596,11 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 			logging.PrintError(err.Error(), 0)
 			return
 		}
+		// Check context after destroy discovery
+		if ctx.Err() != nil {
+			return
+		}
+
 		dbsFromSource := extractDBNames(collectionsToMigrate)
 		logging.PrintPhase("DESTROY", "Dropping target databases...")
 		statusManager.SetState("destroying", "Dropping target databases...")
@@ -548,6 +609,17 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	}
 
 	if !found {
+		// --- CAPTURE T0 BEFORE DISCOVERY ---
+		// We capture T0 here so that any collections created *during* discovery
+		// will still be picked up by the CDC process later.
+		t0, err := topo.ClusterTime(ctx, sourceClient)
+		if err != nil {
+			statusManager.SetError(err.Error())
+			logging.PrintError(err.Error(), 0)
+			return
+		}
+		logging.PrintInfo(fmt.Sprintf("Captured global T0 (Pre-Discovery): %v", t0), 0)
+
 		logging.PrintPhase("1", "DISCOVERY")
 		statusManager.SetState("discovering", "Discovering collections to migrate...")
 		if !destroy {
@@ -558,6 +630,14 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 				return
 			}
 		}
+
+		// --- CHECK SHUTDOWN SIGNAL ---
+		// If Discovery was canceled, stop here. Do not proceed to full load.
+		if ctx.Err() != nil {
+			logging.PrintWarning("Migration stopped during discovery.", 0)
+			return
+		}
+
 		if len(collectionsToMigrate) == 0 {
 			return
 		}
@@ -565,19 +645,11 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 			statusManager.AddEstimatedBytes(coll.Size)
 		}
 
-		// --- CAPTURE T0 ---
-		t0, err := topo.ClusterTime(ctx, sourceClient)
-		if err != nil {
-			statusManager.SetError(err.Error())
-			logging.PrintError(err.Error(), 0)
-			return
-		}
-		checkpointManager.SaveResumeTimestamp(ctx, config.Cfg.Migration.CheckpointDocID, t0)
-		logging.PrintInfo(fmt.Sprintf("Captured and saved global T0: %v", t0), 0)
-
 		logging.PrintPhase("2", "FULL DATA LOAD")
 		statusManager.SetState("running", "Initial Sync (Full Load)")
 
+		// Note: We do NOT save the checkpoint here yet. If we crash during full load,
+		// we want to restart from the beginning, not skip to CDC.
 		_, err = launchFullLoadWorkers(ctx, sourceClient, targetClient, collectionsToMigrate, statusManager, checkpointManager)
 		if err != nil {
 			if err != context.Canceled {
@@ -586,7 +658,22 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 			}
 			return
 		}
+
+		// --- CHECK SHUTDOWN SIGNAL ---
+		// If Full Load was canceled, stop here. Do NOT save the checkpoint.
+		if ctx.Err() != nil {
+			logging.PrintWarning("Migration stopped during Full Load.", 0)
+			return
+		}
+
 		logging.PrintSuccess("All full load workers complete.", 0)
+
+		// --- SAVE RESUME TIMESTAMP (T0) ---
+		// Full load is complete. Now we persist the checkpoint so that future runs
+		// know to resume from CDC.
+		checkpointManager.SaveResumeTimestamp(ctx, config.Cfg.Migration.CheckpointDocID, t0)
+		logging.PrintInfo(fmt.Sprintf("Saved global resume timestamp: %v", t0), 0)
+
 		statusManager.SetCloneCompleted()
 
 		finalT0, foundT0 := checkpointManager.GetResumeTimestamp(ctx, config.Cfg.Migration.CheckpointDocID)
@@ -612,6 +699,12 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		statusManager.SetCloneCompleted()
 	}
 
+	// --- CHECK SHUTDOWN SIGNAL BEFORE CDC ---
+	if ctx.Err() != nil {
+		logging.PrintWarning("Migration stopped before CDC start.", 0)
+		return
+	}
+
 	logging.PrintPhase("3", "CONTINUOUS SYNC (CDC)")
 	statusManager.SetState("running", "Change Data Capture")
 
@@ -629,10 +722,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 
 	cdcManager.Start(ctx)
 
-	// --- GRACEFUL SHUTDOWN ---
-	// Wait for validation workers to drain before exiting and triggering Client Disconnects
-	validationManager.Close()
-
+	// Note: validationManager.Close() is now called by defer at the top.
 	logging.PrintInfo("CDC process stopped. Exiting.", 0)
 }
 

@@ -204,16 +204,17 @@ func (cm *CopyManager) Do(ctx context.Context) (int64, bson.Timestamp, error) {
 	existingTS, found := cm.checkpointMgr.GetResumeTimestamp(ctx, cm.checkpointDocID)
 
 	if !found {
-		// If not found, capture and save (Backup logic)
+		// If not found, capture newTS just for logging or internal tracking,
+		// but DO NOT SAVE IT. The coordinator (main.go) is responsible for T0.
 		newTS, err := topo.ClusterTime(ctx, cm.sourceClient)
 		if err != nil {
 			return 0, emptyTS, fmt.Errorf("failed to get initial cluster time (T0): %w", err)
 		}
 		initialTS = newTS
-		if cm.checkpointMgr != nil {
-			cm.checkpointMgr.SaveResumeTimestamp(ctx, cm.checkpointDocID, initialTS)
-		}
-		logging.PrintStep(fmt.Sprintf("[%s] Captured and saved initial cluster time (T0): %v", ns, initialTS), 3)
+		// Removed the SaveResumeTimestamp call here to prevent workers from
+		// erroneously marking the full load as "complete" or "started" in a way
+		// that bypasses the coordinator's logic.
+		logging.PrintStep(fmt.Sprintf("[%s] Using local start time (T0): %v", ns, initialTS), 3)
 	} else {
 		initialTS = existingTS
 	}
