@@ -856,7 +856,7 @@ In this stage, docMongoStream scans the source database to identify all valid da
 
 This is the initial snapshot stage.
 
-**Global Time Capture ($\mathbf{T_0}$):** Before a single document is copied, the tool captures the source cluster's current Cluster Time. This timestamp ($\mathbf{T_0}$) becomes the guaranteed starting point for the CDC phase, ensuring strictly zero data loss.
+**Global Time Capture ($\mathbf{T_0}$):** Before Discovery begins, the tool captures the source cluster's current Cluster Time. This timestamp ($\mathbf{T_0}$) becomes the guaranteed starting point for the CDC phase, ensuring strictly zero data loss.
 
 **Parallel Execution:** A collection-level worker pool (configured via `migration.max_concurrent_workers`) orchestrates the migration. Inside each collection, data is processed concurrently by dedicated read and insert workers (`cloner.num_read_workers` and `cloner.num_insert_workers`) to maximize throughput.
 
@@ -879,6 +879,13 @@ CDC is guaranteed to sync the documents, however, docMongoStream provides an add
 docMongoStream also implements an auto-healing capability. If a record fails validation due to a mismatch but is later updated by the source application, the tool automatically removes the associated failure entry because the previous state is no longer relevant. While the validation process never modifies data, it allows you to confirm not only that data has been synchronized, but also that records continue to update correctly as your application remains active prior to cutover. This feature provides peace of mind and ensures that the source and destination datasets are an exact match before the final cutover.
 
 Please keep in mind that in busy systems it is perfectly normal for some records to be temporarily flagged as invalid until CDC has applied the latest changes. This is expected behavior, particularly in heavily used environments where frequent updates—often to the same records—are common. 
+
+#### Self-Healing & Auto-Retry
+
+docMongoStream includes active self-healing mechanisms to ensure statistics match reality:
+
+* Startup Reconciliation: On every process start, the tool automatically scans the validation collections to fix any drift in statistics caused by previous crashes or race conditions.
+* Idle Watchdog: A background process monitors the replication lag. When the system is idle (Lag $\approx$ 0s), it automatically re-queues known validation failures for a check. This clears out "false positives" that occurred because data was being updated during the initial validation check.
 
 #### Status
 
@@ -1008,7 +1015,7 @@ State is managed entirely within the target MongoDB cluster using a dedicated `d
 
 **cdc_resume_timestamp:** This is the single source of truth. It stores the timestamp of the global $\mathbf{T_0}$ (for a fresh run) or the last successfully processed event (during CDC).
 
-**Resume Logic:** On startup, if this document exists, the tool skips Discovery and Full Load and immediately resumes the Change Stream from the stored timestamp.
+**Resume Logic:** On startup, if this document exists, the tool assumes a Full Load was previously completed. It skips Discovery and Full Load and immediately resumes the Change Stream from the stored timestamp. If this document does NOT exist (e.g. partial run crash), the tool cleans up all stale metadata and restarts the Full Load from scratch.
 
 ## Data Migration Strategy
 
@@ -1039,13 +1046,11 @@ To prevent fatal errors during the transition to CDC, all writes in docMongoStre
 
 The CDC phase serves as the Source of Truth for restoring consistency. It replays history to bring the destination into eventual consistency with the source.
 
-#### Global $\mathbf{T_0}$ Architecture
+#### Global Time Capture ($\mathbf{T_0}$)
 
 Unlike tools that attempt to start CDC per-collection (which risks gaps), docMongoStream enforces a Global Start Time ($\mathbf{T_0}$).
 
-- **Capture:** $\mathbf{T_0}$ is recorded via db.hello()/$clusterTime before the Full Load workers launch.
-- **Replay:** The CDC stream starts exactly at $\mathbf{T_0}$.
-- **Overlap:** The stream replays all events that occurred during the Full Load. Thanks to idempotent writes, these "replayed" events simply update the destination to the correct final state.
+Before the Discovery phase begins, the tool captures the source cluster's current Cluster Time. This timestamp ($\mathbf{T_0}$) becomes the guaranteed starting point for the CDC phase. By capturing this before scanning for collections, docMongoStream ensures that any new collections created during the discovery or load phases are successfully captured by the Change Stream.
 
 #### Chronological Correction
 
@@ -1068,8 +1073,8 @@ The transition to CDC requires a single, cluster-wide moment in time—the Check
 1. **Global Capture ($\mathbf{T_0}$):**  
     Before the Full Load phase begins for any collection, the application queries the source DocumentDB for its current cluster time (`$clusterTime`).
 
-2. **Immutable Start Point:**  
-    This timestamp ($\mathbf{T_0}$) is immediately saved to the `cdc_resume_timestamp` checkpoint in the target database. This defines the exact start of the migration session.
+2. **Deferred Persistence:**  
+    This timestamp ($\mathbf{T_0}$) is held in memory during the Full Load. It is saved to the cdc_resume_timestamp checkpoint in the target database only after the Full Load completes successfully. This ensures that if the migration crashes during the initial load, it will restart from scratch rather than attempting to resume from a partially consistent state.
 
 2. **Tailing Start:**  
     When the CDC phase begins (after the Full Load completes), it opens the Change Stream starting exactly at $\mathbf{T_0}$.
