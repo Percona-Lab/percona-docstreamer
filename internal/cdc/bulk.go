@@ -15,6 +15,7 @@ import (
 type Batch struct {
 	Models []mongo.WriteModel
 	IDs    []string
+	LastTS bson.Timestamp // Max timestamp in this batch
 }
 
 // BulkWriter handles buffering changes
@@ -81,6 +82,12 @@ func (b *BulkWriter) AddEvent(event *ChangeEvent) bool {
 	b.batches[ns].Models = append(b.batches[ns].Models, model)
 	if docID != "" {
 		b.batches[ns].IDs = append(b.batches[ns].IDs, docID)
+	}
+
+	// --- Track the latest timestamp in this batch ---
+	if event.ClusterTime.T > b.batches[ns].LastTS.T ||
+		(event.ClusterTime.T == b.batches[ns].LastTS.T && event.ClusterTime.I > b.batches[ns].LastTS.I) {
+		b.batches[ns].LastTS = event.ClusterTime
 	}
 
 	size := len(b.batches[ns].Models)

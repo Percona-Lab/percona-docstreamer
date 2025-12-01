@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,6 +26,8 @@ import (
 type docBatch struct {
 	models []mongo.WriteModel
 	size   int64
+	first  bson.RawValue
+	last   bson.RawValue
 }
 
 // keyRange defines a segment of a collection by its min and max _id
@@ -42,15 +45,38 @@ type Segmenter struct {
 	initialMax   bson.RawValue
 }
 
+// Helper to create a RawValue for MinKey/MaxKey
+func getRawBound(val interface{}) bson.RawValue {
+	raw, _ := bson.Marshal(bson.D{{Key: "v", Value: val}})
+	return bson.Raw(raw).Lookup("v")
+}
+
+// shouldRetry determines if an error is transient and should be retried
+func shouldRetry(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "too many cursors") ||
+		strings.Contains(msg, "incomplete read") ||
+		strings.Contains(msg, "connection") ||
+		strings.Contains(msg, "network") ||
+		strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "cursor not found") ||
+		strings.Contains(msg, "context canceled") {
+		return true
+	}
+	return false
+}
+
 // NewSegmenter creates a segmenter for a collection
 func NewSegmenter(ctx context.Context, mcoll *mongo.Collection, collInfo discover.CollectionInfo) (*Segmenter, error) {
-	min, max, err := getIDKeyRange(ctx, mcoll)
-	if err != nil {
-		if err == mongo.ErrNoDocuments {
-			return nil, io.EOF
-		}
-		return nil, fmt.Errorf("could not get _id range: %w", err)
-	}
+	segSize := config.Cfg.Cloner.SegmentSizeDocs
+	logging.PrintInfo(fmt.Sprintf("[%s] Initializing Segmenter. Configured Segment Size: %d", mcoll.Name(), segSize), 0)
+
+	// Use Logical Boundaries (MinKey -> MaxKey)
+	min := getRawBound(bson.MinKey{})
+	max := getRawBound(bson.MaxKey{})
 
 	return &Segmenter{
 		mcoll: mcoll,
@@ -58,47 +84,53 @@ func NewSegmenter(ctx context.Context, mcoll *mongo.Collection, collInfo discove
 			Min: min,
 			Max: max,
 		},
-		segmentSize: config.Cfg.Cloner.SegmentSizeDocs,
+		segmentSize: segSize,
 		initialMax:  max,
 	}, nil
 }
 
-// getIDKeyRange finds the min and max _id in a collection
-func getIDKeyRange(ctx context.Context, mcoll *mongo.Collection) (min, max bson.RawValue, err error) {
-	minOpts := options.FindOne().SetSort(bson.D{{Key: "_id", Value: 1}}).SetProjection(bson.D{{Key: "_id", Value: 1}})
-	minRes := mcoll.FindOne(ctx, bson.D{}, minOpts)
-	if minRes.Err() != nil {
-		return bson.RawValue{}, bson.RawValue{}, minRes.Err()
-	}
-	minRaw, err := minRes.Raw()
-	if err != nil {
-		return bson.RawValue{}, bson.RawValue{}, fmt.Errorf("could not decode min _id: %w", err)
-	}
-
-	maxOpts := options.FindOne().SetSort(bson.D{{Key: "_id", Value: -1}}).SetProjection(bson.D{{Key: "_id", Value: 1}})
-	maxRes := mcoll.FindOne(ctx, bson.D{}, maxOpts)
-	if maxRes.Err() != nil {
-		return bson.RawValue{}, bson.RawValue{}, maxRes.Err()
-	}
-	maxRaw, err := maxRes.Raw()
-	if err != nil {
-		return bson.RawValue{}, bson.RawValue{}, fmt.Errorf("could not decode max _id: %w", err)
-	}
-
-	return minRaw.Lookup("_id"), maxRaw.Lookup("_id"), nil
-}
-
 // findSegmentMaxKey finds the _id of the document at the segmentSize offset
 func (s *Segmenter) findSegmentMaxKey(ctx context.Context, minKey, maxKey bson.RawValue) (bson.RawValue, error) {
-	// Open-ended query: No $lte maxKey constraint
-	filter := bson.D{{Key: "_id", Value: bson.D{{Key: "$gt", Value: minKey}}}}
+	var minVal interface{}
+	if err := minKey.Unmarshal(&minVal); err != nil {
+		return bson.RawValue{}, fmt.Errorf("failed to unmarshal minKey: %w", err)
+	}
 
+	// Filter: _id > currentMin
+	filter := bson.D{}
+	isMin := false
+	switch minVal.(type) {
+	case bson.MinKey, *bson.MinKey:
+		isMin = true
+	}
+
+	if !isMin {
+		filter = bson.D{{Key: "_id", Value: bson.D{{Key: "$gt", Value: minKey}}}}
+	}
+
+	// Range Query Mode requires Sort order.
 	opts := options.FindOne().
-		SetSort(bson.D{{Key: "_id", Value: 1}}).
+		SetSort(bson.D{{Key: "_id", Value: int32(1)}}).
 		SetSkip(s.segmentSize).
 		SetProjection(bson.D{{Key: "_id", Value: 1}})
 
-	res := s.mcoll.FindOne(ctx, filter, opts)
+	var res *mongo.SingleResult
+	maxRetries := 5
+	for i := 1; i <= maxRetries; i++ {
+		if ctx.Err() != nil {
+			return bson.RawValue{}, ctx.Err()
+		}
+		res = s.mcoll.FindOne(ctx, filter, opts)
+		if res.Err() == nil || res.Err() == mongo.ErrNoDocuments {
+			break
+		}
+		if !shouldRetry(res.Err()) {
+			break
+		}
+		logging.PrintWarning(fmt.Sprintf("[%s] Segmenter find error (attempt %d/%d): %v. Retrying...", s.mcoll.Name(), i, maxRetries, res.Err()), 0)
+		time.Sleep(time.Second * time.Duration(i))
+	}
+
 	if res.Err() != nil {
 		if res.Err() == mongo.ErrNoDocuments {
 			return s.initialMax, nil
@@ -153,18 +185,16 @@ func convertIndexes(indexes []discover.IndexInfo) []mongo.IndexModel {
 	return models
 }
 
-// CopyManager manages the copy pipeline for a *single collection*.
 type CopyManager struct {
 	sourceClient    *mongo.Client
 	targetClient    *mongo.Client
 	collInfo        discover.CollectionInfo
 	statusMgr       *status.Manager
 	checkpointMgr   *checkpoint.Manager
-	checkpointDocID string // Here to ensure consistent ID usage
+	checkpointDocID string
 	initialMaxKey   bson.RawValue
 }
 
-// NewCopyManager creates a new manager for a single collection copy.
 func NewCopyManager(source, target *mongo.Client, collInfo discover.CollectionInfo, statusMgr *status.Manager, checkpointMgr *checkpoint.Manager, checkpointDocID string) *CopyManager {
 	return &CopyManager{
 		sourceClient:    source,
@@ -176,7 +206,6 @@ func NewCopyManager(source, target *mongo.Client, collInfo discover.CollectionIn
 	}
 }
 
-// This function runs the full 3-phase copy operation for one collection
 func (cm *CopyManager) Do(ctx context.Context) (int64, bson.Timestamp, error) {
 	ns := cm.collInfo.Namespace
 	db := cm.collInfo.DB
@@ -198,93 +227,102 @@ func (cm *CopyManager) Do(ctx context.Context) (int64, bson.Timestamp, error) {
 	sourceColl := cm.sourceClient.Database(db).Collection(coll)
 	targetDB := cm.targetClient.Database(db)
 
-	// --- CONDITIONAL T0 SAVE ---
-	// We assume main.go captured it, but this acts as a failsafe or for resuming
 	initialTS := emptyTS
 	existingTS, found := cm.checkpointMgr.GetResumeTimestamp(ctx, cm.checkpointDocID)
 
 	if !found {
-		// If not found, capture newTS just for logging or internal tracking,
-		// but DO NOT SAVE IT. The coordinator (main.go) is responsible for T0.
 		newTS, err := topo.ClusterTime(ctx, cm.sourceClient)
 		if err != nil {
 			return 0, emptyTS, fmt.Errorf("failed to get initial cluster time (T0): %w", err)
 		}
 		initialTS = newTS
-		// Removed the SaveResumeTimestamp call here to prevent workers from
-		// erroneously marking the full load as "complete" or "started" in a way
-		// that bypasses the coordinator's logic.
 		logging.PrintStep(fmt.Sprintf("[%s] Using local start time (T0): %v", ns, initialTS), 3)
 	} else {
 		initialTS = existingTS
 	}
 
-	// --- PHASE 1: Create Collection and Pre-load Indexes ---
 	indexModels := convertIndexes(cm.collInfo.Indexes)
 	targetColl, err := indexer.CreateCollectionAndPreloadIndexes(ctx, targetDB, cm.collInfo, indexModels)
 	if err != nil {
 		return 0, emptyTS, fmt.Errorf("failed to create collection and indexes: %w", err)
 	}
 
-	// --- PHASE 2: Run Data Load Pipeline ---
 	logging.PrintStep(fmt.Sprintf("[%s] Starting parallel data load...", ns), 3)
 	docsWritten, err := cm.runDataPipeline(ctx, sourceColl, targetColl)
 	if err != nil {
 		return 0, emptyTS, fmt.Errorf("data pipeline failed: %w", err)
 	}
 
-	// --- Get Finish Timestamp ---
+	// --- RECONCILIATION CHECK ---
+	if docsWritten < sourceCount {
+		diff := sourceCount - docsWritten
+		logging.PrintWarning(fmt.Sprintf("[%s] MISMATCH DETECTED! Source: %d, Copied: %d. Difference: %d. (Potential data loss due to unsupported types or connection errors)", ns, sourceCount, docsWritten, diff), 0)
+	} else if docsWritten > sourceCount {
+		diff := docsWritten - sourceCount
+		logging.PrintInfo(fmt.Sprintf("[%s] COPY SUCCESS (With Retries): Copied %d documents (Source: %d). %d duplicates processed safely.", ns, docsWritten, sourceCount, diff), 3)
+	} else {
+		logging.PrintSuccess(fmt.Sprintf("[%s] Full Load Verified: %d documents copied.", ns, docsWritten), 3)
+	}
+
 	finishTS, err := topo.ClusterTime(ctx, cm.sourceClient)
 	if err != nil {
 		return 0, emptyTS, fmt.Errorf("failed to get finish cluster time: %w", err)
 	}
 	logging.PrintSuccess(fmt.Sprintf("[%s] Data pipeline complete. Copied %d documents. Finish time: %v", ns, docsWritten, finishTS), 3)
 
-	// --- Per-Collection Checkpoint ---
 	if cm.checkpointMgr != nil {
-		cm.checkpointMgr.SaveCollectionCheckpoint(ctx, ns, finishTS)
+		cm.checkpointMgr.SaveCollectionCheckpoint(ctx, ns, initialTS)
 	}
 
-	// --- PHASE 3: Finalize Indexes ---
 	if err := indexer.FinalizeIndexes(ctx, targetColl, cm.collInfo.Indexes, ns); err != nil {
 		logging.PrintError(fmt.Sprintf("[%s] Index finalization failed: %v", ns, err), 3)
 	}
 
-	// Return T0 so the coordinator knows the earliest start time
 	return docsWritten, initialTS, nil
 }
 
-// runDataPipeline starts the segmenter, read workers, and insert workers
 func (cm *CopyManager) runDataPipeline(ctx context.Context, sourceColl, targetColl *mongo.Collection) (int64, error) {
 	ns := cm.collInfo.Namespace
+	numReadWorkers := config.Cfg.Cloner.NumReadWorkers
 
-	segmentQueue := make(chan keyRange, config.Cfg.Cloner.NumReadWorkers)
+	// --- AUTO-DETECT LINEAR SCAN MODE ---
+	// If discovery flagged this collection, OR if user forced 1 worker via flag.
+	if cm.collInfo.UseLinearScan || numReadWorkers == 1 {
+		if cm.collInfo.UseLinearScan {
+			logging.PrintWarning(fmt.Sprintf("[%s] Auto-Switching to Linear Scan Mode (Unsafe Range Query Detected).", ns), 0)
+		} else {
+			logging.PrintWarning(fmt.Sprintf("[%s] Running in Linear Scan Mode (Forced by config).", ns), 0)
+		}
+		return cm.runLinearScan(ctx, sourceColl, targetColl)
+	}
+
+	segmentQueue := make(chan keyRange, numReadWorkers)
 	docQueue := make(chan docBatch, config.Cfg.Cloner.NumInsertWorkers*2)
 
 	var readWG, insertWG sync.WaitGroup
 	errCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// --- 1. Start Insert Workers ---
+	// 1. Start Insert Workers
 	var docsWritten int64
 	insertWG.Add(config.Cfg.Cloner.NumInsertWorkers)
 	for i := 0; i < config.Cfg.Cloner.NumInsertWorkers; i++ {
 		go cm.insertWorker(errCtx, cancel, &insertWG, targetColl, docQueue, &docsWritten, ns, cm.statusMgr)
 	}
 
-	// --- 2. Start Read Workers ---
-	readWG.Add(config.Cfg.Cloner.NumReadWorkers)
-	for i := 0; i < config.Cfg.Cloner.NumReadWorkers; i++ {
-		go cm.readWorker(errCtx, &readWG, sourceColl, segmentQueue, docQueue, ns, i)
+	// 2. Start Read Workers
+	readWG.Add(numReadWorkers)
+	for i := 0; i < numReadWorkers; i++ {
+		go cm.readWorker(errCtx, cancel, &readWG, sourceColl, segmentQueue, docQueue, ns, i)
 	}
 
-	// --- 3. Start pipeline manager goroutine ---
+	// 3. Start pipeline manager
 	go func() {
 		readWG.Wait()
 		close(docQueue)
 	}()
 
-	// --- 4. Start the Segmenter ---
+	// 4. Start the Segmenter
 	segmenter, err := NewSegmenter(errCtx, sourceColl, cm.collInfo)
 	if err != nil {
 		close(segmentQueue)
@@ -319,19 +357,121 @@ func (cm *CopyManager) runDataPipeline(ctx context.Context, sourceColl, targetCo
 		}
 	}()
 
-	// --- 5. Wait for Insert Workers (end of pipeline) ---
 	insertWG.Wait()
 
-	if errCtx.Err() != nil && errCtx.Err() != context.Canceled {
-		return 0, fmt.Errorf("worker failed: %w", errCtx.Err())
+	if errCtx.Err() != nil {
+		return 0, errCtx.Err()
 	}
 
 	return docsWritten, nil
 }
 
-// readWorker reads from segmentQueue, finds docs in that segment, and pushes to docQueue
+// runLinearScan bypasses the segmenter and range queries entirely
+func (cm *CopyManager) runLinearScan(ctx context.Context, sourceColl, targetColl *mongo.Collection) (int64, error) {
+	ns := cm.collInfo.Namespace
+	docQueue := make(chan docBatch, config.Cfg.Cloner.NumInsertWorkers*2)
+
+	var insertWG sync.WaitGroup
+	errCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var docsWritten int64
+	insertWG.Add(config.Cfg.Cloner.NumInsertWorkers)
+	for i := 0; i < config.Cfg.Cloner.NumInsertWorkers; i++ {
+		go cm.insertWorker(errCtx, cancel, &insertWG, targetColl, docQueue, &docsWritten, ns, cm.statusMgr)
+	}
+
+	// Single linear read process
+	go func() {
+		defer close(docQueue)
+
+		// LINEAR SCAN: Natural Order (No Sort)
+		// This ensures the DB just streams documents in order.
+		// It avoids memory sorts and "mixed type" index failures entirely.
+		readOpts := options.Find().
+			SetBatchSize(int32(config.Cfg.Cloner.ReadBatchSize))
+			// NOTE: NO SORT HERE. This is the key fix for Linear Mode.
+
+		cursor, err := sourceColl.Find(errCtx, bson.D{}, readOpts)
+		if err != nil {
+			logging.PrintError(fmt.Sprintf("[%s] Linear Scan Find failed: %v", ns, err), 0)
+			cancel()
+			return
+		}
+		defer cursor.Close(errCtx)
+
+		batch := docBatch{
+			models: make([]mongo.WriteModel, 0, config.Cfg.Cloner.InsertBatchSize),
+		}
+		var firstID, lastID bson.RawValue
+
+		for cursor.Next(errCtx) {
+			rawDoc := make(bson.Raw, len(cursor.Current))
+			copy(rawDoc, cursor.Current)
+
+			docID, err := rawDoc.LookupErr("_id")
+			if err != nil {
+				logging.PrintError(fmt.Sprintf("[%s] Failed to lookup _id in document. Skipping. Error: %v", ns, err), 0)
+				continue
+			}
+
+			if len(batch.models) == 0 {
+				firstID = docID
+			}
+			lastID = docID
+
+			model := mongo.NewReplaceOneModel().
+				SetFilter(bson.D{{Key: "_id", Value: docID}}).
+				SetReplacement(rawDoc).
+				SetUpsert(true)
+
+			batch.models = append(batch.models, model)
+			batch.size += int64(len(rawDoc))
+
+			if len(batch.models) >= config.Cfg.Cloner.InsertBatchSize || batch.size >= config.Cfg.Cloner.InsertBatchBytes {
+				batch.first = firstID
+				batch.last = lastID
+				select {
+				case docQueue <- batch:
+					batch = docBatch{
+						models: make([]mongo.WriteModel, 0, config.Cfg.Cloner.InsertBatchSize),
+					}
+					firstID = bson.RawValue{}
+				case <-errCtx.Done():
+					return
+				}
+			}
+		}
+
+		if err := cursor.Err(); err != nil {
+			logging.PrintError(fmt.Sprintf("[%s] Linear Scan Cursor failed: %v", ns, err), 0)
+			cancel()
+			return
+		}
+
+		if len(batch.models) > 0 {
+			batch.first = firstID
+			batch.last = lastID
+			select {
+			case docQueue <- batch:
+			case <-errCtx.Done():
+				return
+			}
+		}
+	}()
+
+	insertWG.Wait()
+
+	if errCtx.Err() != nil {
+		return 0, errCtx.Err()
+	}
+
+	return docsWritten, nil
+}
+
 func (cm *CopyManager) readWorker(
 	ctx context.Context,
+	cancel context.CancelFunc,
 	wg *sync.WaitGroup,
 	coll *mongo.Collection,
 	segmentQueue <-chan keyRange,
@@ -343,81 +483,155 @@ func (cm *CopyManager) readWorker(
 	logging.PrintStep(fmt.Sprintf("[%s] Read Worker %d started", ns, workerID), 4)
 
 	for segment := range segmentQueue {
-		if ctx.Err() != nil {
+		var minVal, maxVal interface{}
+		if err := segment.Min.Unmarshal(&minVal); err != nil {
+			logging.PrintError(fmt.Sprintf("Min unmarshal failed: %v", err), 0)
+			cancel()
 			return
 		}
-
-		// Open-ended query
-		idFilter := bson.D{{Key: "$gte", Value: segment.Min}}
-
-		// Consistently apply upper bound check to handle mixed-type ranges strictly.
-		// We rely on CDC to capture any inserts beyond initialMaxKey, ensuring consistency.
 		if segment.Max.Value != nil {
+			if err := segment.Max.Unmarshal(&maxVal); err != nil {
+				logging.PrintError(fmt.Sprintf("Max unmarshal failed: %v", err), 0)
+				cancel()
+				return
+			}
+		}
+
+		isMin := false
+		switch minVal.(type) {
+		case bson.MinKey, *bson.MinKey:
+			isMin = true
+		}
+
+		isMax := false
+		if segment.Max.Value != nil {
+			switch maxVal.(type) {
+			case bson.MaxKey, *bson.MaxKey:
+				isMax = true
+			}
+		}
+
+		idFilter := bson.D{}
+		if !isMin {
+			idFilter = append(idFilter, bson.E{Key: "$gte", Value: segment.Min})
+		}
+		if segment.Max.Value != nil && !isMax {
 			idFilter = append(idFilter, bson.E{Key: "$lte", Value: segment.Max})
 		}
 
-		filter := bson.D{{Key: "_id", Value: idFilter}}
+		var filter bson.D
+		if len(idFilter) == 0 {
+			filter = bson.D{}
+		} else {
+			filter = bson.D{{Key: "_id", Value: idFilter}}
+		}
 
-		// Create options locally to prevent race conditions and type errors
 		readOpts := options.Find().
 			SetBatchSize(int32(config.Cfg.Cloner.ReadBatchSize)).
-			SetSort(bson.D{{Key: "_id", Value: 1}})
+			SetSort(bson.D{{Key: "_id", Value: int32(1)}})
 
-		cursor, err := coll.Find(ctx, filter, readOpts)
-		if err != nil {
-			logging.PrintError(fmt.Sprintf("[%s] Read Worker %d Find failed: %v", ns, workerID, err), 4)
-			return
-		}
+		maxRetries := 5
+		success := false
 
-		batch := docBatch{
-			models: make([]mongo.WriteModel, 0, config.Cfg.Cloner.InsertBatchSize),
-		}
-
-		for cursor.Next(ctx) {
-			rawDoc := make(bson.Raw, len(cursor.Current))
-			copy(rawDoc, cursor.Current)
-
-			docID, err := rawDoc.LookupErr("_id")
-			if err != nil {
-				logging.PrintWarning(fmt.Sprintf("[%s] Read Worker %d found doc with no _id, skipping", ns, workerID), 4)
-				continue
+	RetryLoop:
+		for i := 1; i <= maxRetries; i++ {
+			if ctx.Err() != nil {
+				return
 			}
 
-			model := mongo.NewReplaceOneModel().
-				SetFilter(bson.D{{Key: "_id", Value: docID}}).
-				SetReplacement(rawDoc).
-				SetUpsert(true)
+			cursor, err := coll.Find(ctx, filter, readOpts)
+			if err != nil {
+				if shouldRetry(err) {
+					logging.PrintWarning(fmt.Sprintf("[%s] Read Worker %d Find error (attempt %d/%d): %v. Retrying...", ns, workerID, i, maxRetries, err), 0)
+					time.Sleep(time.Second * time.Duration(i))
+					continue RetryLoop
+				}
+				logging.PrintError(fmt.Sprintf("[%s] Read Worker %d Find fatal error: %v", ns, workerID, err), 4)
+				cancel()
+				return
+			}
 
-			batch.models = append(batch.models, model)
-			batch.size += int64(len(rawDoc))
+			batch := docBatch{
+				models: make([]mongo.WriteModel, 0, config.Cfg.Cloner.InsertBatchSize),
+			}
+			var firstID, lastID bson.RawValue
 
-			if len(batch.models) >= config.Cfg.Cloner.InsertBatchSize || batch.size >= config.Cfg.Cloner.InsertBatchBytes {
+			for cursor.Next(ctx) {
+				rawDoc := make(bson.Raw, len(cursor.Current))
+				copy(rawDoc, cursor.Current)
+
+				docID, err := rawDoc.LookupErr("_id")
+				if err != nil {
+					logging.PrintError(fmt.Sprintf("[%s] Failed to lookup _id in document. Skipping. Error: %v", ns, err), 0)
+					continue
+				}
+
+				if len(batch.models) == 0 {
+					firstID = docID
+				}
+				lastID = docID
+
+				model := mongo.NewReplaceOneModel().
+					SetFilter(bson.D{{Key: "_id", Value: docID}}).
+					SetReplacement(rawDoc).
+					SetUpsert(true)
+
+				batch.models = append(batch.models, model)
+				batch.size += int64(len(rawDoc))
+
+				if len(batch.models) >= config.Cfg.Cloner.InsertBatchSize || batch.size >= config.Cfg.Cloner.InsertBatchBytes {
+					batch.first = firstID
+					batch.last = lastID
+					select {
+					case docQueue <- batch:
+						batch = docBatch{
+							models: make([]mongo.WriteModel, 0, config.Cfg.Cloner.InsertBatchSize),
+							size:   0,
+						}
+						firstID = bson.RawValue{} // Reset
+					case <-ctx.Done():
+						cursor.Close(ctx)
+						return
+					}
+				}
+			}
+
+			if err := cursor.Err(); err != nil {
+				cursor.Close(ctx)
+				if ctx.Err() != nil {
+					return
+				}
+				if shouldRetry(err) {
+					logging.PrintWarning(fmt.Sprintf("[%s] Read Worker %d cursor broken (attempt %d/%d): %v. Retrying segment...", ns, workerID, i, maxRetries, err), 0)
+					time.Sleep(time.Second * time.Duration(i))
+					continue RetryLoop
+				}
+				logging.PrintError(fmt.Sprintf("[%s] Read Worker %d cursor fatal error: %v", ns, workerID, err), 4)
+				cancel()
+				return
+			}
+
+			if len(batch.models) > 0 {
+				batch.first = firstID
+				batch.last = lastID
 				select {
 				case docQueue <- batch:
-					batch = docBatch{
-						models: make([]mongo.WriteModel, 0, config.Cfg.Cloner.InsertBatchSize),
-						size:   0,
-					}
 				case <-ctx.Done():
 					cursor.Close(ctx)
 					return
 				}
 			}
+
+			cursor.Close(ctx)
+			success = true
+			break RetryLoop
 		}
 
-		if len(batch.models) > 0 {
-			select {
-			case docQueue <- batch:
-			case <-ctx.Done():
-				cursor.Close(ctx)
-				return
-			}
+		if !success {
+			logging.PrintError(fmt.Sprintf("[%s] Read Worker %d failed segment after retries.", ns, workerID), 4)
+			cancel()
+			return
 		}
-
-		if err := cursor.Err(); err != nil {
-			logging.PrintWarning(fmt.Sprintf("[%s] Read Worker %d cursor error: %v", ns, workerID, err), 4)
-		}
-		cursor.Close(ctx)
 	}
 }
 
@@ -434,7 +648,6 @@ func (cm *CopyManager) insertWorker(
 ) {
 	defer wg.Done()
 
-	// Define options locally.
 	bulkWriteOpts := options.BulkWrite().
 		SetOrdered(false).
 		SetBypassDocumentValidation(true)
@@ -452,7 +665,7 @@ func (cm *CopyManager) insertWorker(
 
 		var docCount int64
 		if res != nil {
-			docCount = res.InsertedCount + res.UpsertedCount + res.ModifiedCount
+			docCount = res.InsertedCount + res.UpsertedCount + res.MatchedCount
 		}
 		logging.LogFullLoadBatchOp(start, ns, docCount, batch.size, err)
 
@@ -473,7 +686,12 @@ func (cm *CopyManager) insertWorker(
 
 		elapsed := time.Since(start)
 
-		logging.PrintStep(fmt.Sprintf("[%s] Processed batch: %d inserted, %d replaced. (%s) in %s",
-			ns, res.InsertedCount+res.UpsertedCount, res.ModifiedCount, humanize.Bytes(uint64(batch.size)), elapsed), 4)
+		if config.Cfg.Logging.Level == "debug" {
+			logging.PrintStep(fmt.Sprintf("[%s] Processed batch: %d inserted, %d replaced. (%s) in %s. Range: [%v - %v]",
+				ns, res.InsertedCount+res.UpsertedCount, res.ModifiedCount, humanize.Bytes(uint64(batch.size)), elapsed, batch.first, batch.last), 4)
+		} else {
+			logging.PrintStep(fmt.Sprintf("[%s] Processed batch: %d inserted, %d replaced. (%s) in %s",
+				ns, res.InsertedCount+res.UpsertedCount, res.ModifiedCount, humanize.Bytes(uint64(batch.size)), elapsed), 4)
+		}
 	}
 }

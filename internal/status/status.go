@@ -37,6 +37,7 @@ type Status struct {
 	ClonedBytes          int64          `json:"clonedBytes"`
 	EventsApplied        int64          `json:"eventsApplied"`
 	LastEventTimestamp   bson.Timestamp `json:"lastEventTimestamp,omitempty"`
+	LastAppliedTimestamp bson.Timestamp `json:"lastAppliedTimestamp,omitempty"`
 	LastBatchAppliedAt   time.Time      `json:"lastBatchAppliedAt,omitempty"`
 }
 
@@ -64,6 +65,7 @@ type StatusOutput struct {
 	EventsApplied             int64          `json:"totalEventsApplied"`
 	Validation                ValidationInfo `json:"validation"`
 	LastSourceEventTime       OpTimeInfo     `json:"lastSourceEventTime"`
+	LastAppliedEventTime      OpTimeInfo     `json:"lastAppliedEventTime"`
 	LastBatchAppliedAt        string         `json:"lastBatchAppliedAt"`
 	InitialSync               InitialSync    `json:"initialSync"`
 }
@@ -79,6 +81,7 @@ type Manager struct {
 	clonedBytes          int64
 	eventsApplied        int64
 	lastEventTimestamp   bson.Timestamp
+	lastAppliedTimestamp bson.Timestamp
 	lastBatchAppliedAt   time.Time
 
 	targetClient *mongo.Client
@@ -111,6 +114,13 @@ func (m *Manager) IsCDCActive() bool {
 	m.lock.RLock()
 	defer m.lock.RUnlock()
 	return strings.HasPrefix(m.state, "running") && m.initialSyncCompleted
+}
+
+// IsCloneCompleted returns the current full load status
+func (m *Manager) IsCloneCompleted() bool {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+	return m.cloneCompleted
 }
 
 func (m *Manager) SetError(errMsg string) {
@@ -155,14 +165,25 @@ func (m *Manager) GetEventsApplied() int64 {
 	return m.eventsApplied
 }
 
+// UpdateCDCStats updates the "Read" stats
 func (m *Manager) UpdateCDCStats(eventsApplied int64, lastEventTS bson.Timestamp) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
-	if eventsApplied > m.eventsApplied {
-		m.lastBatchAppliedAt = time.Now().UTC()
-	}
 	m.eventsApplied = eventsApplied
 	m.lastEventTimestamp = lastEventTS
+}
+
+// UpdateAppliedStats updates the "Write" stats (called by flush workers)
+func (m *Manager) UpdateAppliedStats(lastAppliedTS bson.Timestamp) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	m.lastBatchAppliedAt = time.Now().UTC()
+
+	// Only update if newer
+	if lastAppliedTS.T > m.lastAppliedTimestamp.T ||
+		(lastAppliedTS.T == m.lastAppliedTimestamp.T && lastAppliedTS.I > m.lastAppliedTimestamp.I) {
+		m.lastAppliedTimestamp = lastAppliedTS
+	}
 }
 
 func (m *Manager) LoadAndMerge(ctx context.Context) error {
@@ -193,6 +214,7 @@ func (m *Manager) LoadAndMerge(ctx context.Context) error {
 	m.clonedBytes = s.ClonedBytes
 	m.eventsApplied = s.EventsApplied
 	m.lastEventTimestamp = s.LastEventTimestamp
+	m.lastAppliedTimestamp = s.LastAppliedTimestamp
 	m.lastBatchAppliedAt = s.LastBatchAppliedAt
 	m.isPersisted = true
 	return nil
@@ -219,6 +241,7 @@ func (m *Manager) Persist(ctx context.Context) {
 		"clonedBytes":          m.clonedBytes,
 		"eventsApplied":        m.eventsApplied,
 		"lastEventTimestamp":   m.lastEventTimestamp,
+		"lastAppliedTimestamp": m.lastAppliedTimestamp,
 		"lastBatchAppliedAt":   m.lastBatchAppliedAt,
 	}
 
@@ -275,6 +298,7 @@ func (m *Manager) getValidationStats(ctx context.Context) ValidationInfo {
 			{Key: "_id", Value: nil},
 			{Key: "total", Value: bson.D{{Key: "$sum", Value: "$total_checked"}}},
 			{Key: "valid", Value: bson.D{{Key: "$sum", Value: "$valid_count"}}},
+			// We ignore mismatch sum from stats as it's historical
 			{Key: "lastVal", Value: bson.D{{Key: "$max", Value: "$last_updated"}}},
 		}}},
 	}
@@ -363,6 +387,14 @@ func (m *Manager) ToJSON(ctx context.Context) ([]byte, error) {
 		opTimeInfo.ISODate = opTime.Format("2006-01-02T15:04:05Z")
 	}
 
+	// Applied Time Info
+	appliedTimeInfo := OpTimeInfo{}
+	if m.lastAppliedTimestamp.T > 0 {
+		appliedTimeInfo.TS = fmt.Sprintf("%d.%d", m.lastAppliedTimestamp.T, m.lastAppliedTimestamp.I)
+		apTime := time.Unix(int64(m.lastAppliedTimestamp.T), 0).UTC()
+		appliedTimeInfo.ISODate = apTime.Format("2006-01-02T15:04:05Z")
+	}
+
 	var idleTime float64
 	var cdcLag float64
 
@@ -410,6 +442,7 @@ func (m *Manager) ToJSON(ctx context.Context) ([]byte, error) {
 		EventsApplied:             m.eventsApplied,
 		Validation:                valInfo,
 		LastSourceEventTime:       opTimeInfo,
+		LastAppliedEventTime:      appliedTimeInfo,
 		LastBatchAppliedAt:        lastBatchStr,
 		InitialSync: InitialSync{
 			Completed:               m.initialSyncCompleted,

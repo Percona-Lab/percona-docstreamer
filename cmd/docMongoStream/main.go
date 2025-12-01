@@ -76,6 +76,13 @@ capture (CDC) migration from AWS DocumentDB to MongoDB.`,
 			return
 		}
 		config.LoadConfig()
+
+		// Check for debug flag and override config if set
+		debug, _ := cmd.Flags().GetBool("debug")
+		if debug {
+			config.Cfg.Logging.Level = "debug"
+		}
+
 		if cmd.Name() != "status" {
 			logging.Init()
 			logging.InitOpLogger()
@@ -205,6 +212,12 @@ func startAction(cmd *cobra.Command, args []string) {
 		hiddenargs = append(hiddenargs, "--destroy")
 	}
 
+	// Pass debug flag to the child process if it was set
+	debug, _ := cmd.Flags().GetBool("debug")
+	if debug {
+		hiddenargs = append(hiddenargs, "--debug")
+	}
+
 	runCmd := exec.Command(executable, hiddenargs...)
 	runCmd.SysProcAttr = &syscall.SysProcAttr{
 		Setsid: true, // Detach
@@ -219,7 +232,7 @@ func startAction(cmd *cobra.Command, args []string) {
 	// Create a channel that closes when the child process exits.
 	processExitChan := make(chan struct{})
 	go func() {
-		// Wait ensures the zombie is reaped if it exits while we are still parent, no walking deads here
+		// Wait ensures the zombie is removed if it exits while we are still parent.
 		runCmd.Wait()
 		close(processExitChan)
 	}()
@@ -547,8 +560,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		}
 	}()
 
-	// --- 1. EARLY CHECKPOINT CHECK & CLEANUP ---
-	// We init CheckpointManager first to check if we are resuming or starting fresh.
+	// --- 1. CHECKPOINT MANAGER & CLEANUP ---
 	checkpointManager := checkpoint.NewManager(targetClient)
 	resumeAt, found := checkpointManager.GetResumeTimestamp(ctx, config.Cfg.Migration.CheckpointDocID)
 
@@ -568,23 +580,32 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		found = false
 	}
 
-	// --- Cleanup Stale Metadata on Fresh Start ---
-	if !found {
-		logging.PrintInfo("No valid global checkpoint found. Starting fresh.", 0)
-		logging.PrintInfo("Cleaning up stale metadata (Status, Checkpoints, Validation)...", 0)
+	// --- Cleanup or Partial Resume ---
+	var startAt bson.Timestamp
+	var anchorFound bool
 
-		// Drop the entire metadata database to ensure a clean slate for Status,
-		// Checkpoints (orphaned ones), and Validation errors.
-		err := targetClient.Database(config.Cfg.Migration.MetadataDB).Drop(ctx)
-		if err != nil {
-			logging.PrintWarning(fmt.Sprintf("Failed to drop metadata DB: %v", err), 0)
+	if !found {
+		// We don't have a global checkpoint (completed full load).
+		// Check if we have an Anchor (partial full load).
+		startAt, anchorFound = checkpointManager.GetAnchorTimestamp(ctx)
+
+		if anchorFound {
+			logging.PrintInfo(fmt.Sprintf("Found partial migration state (Anchor T0: %v). Resuming Full Load...", startAt), 0)
 		} else {
-			logging.PrintSuccess("Metadata cleanup complete.", 0)
+			logging.PrintInfo("No valid global checkpoint or anchor found. Starting fresh.", 0)
+			logging.PrintInfo("Cleaning up stale metadata (Status, Checkpoints, Validation)...", 0)
+
+			// Drop the entire metadata database to ensure a clean slate
+			err := targetClient.Database(config.Cfg.Migration.MetadataDB).Drop(ctx)
+			if err != nil {
+				logging.PrintWarning(fmt.Sprintf("Failed to drop metadata DB: %v", err), 0)
+			} else {
+				logging.PrintSuccess("Metadata cleanup complete.", 0)
+			}
 		}
 	}
 
-	// --- 2. Initialize Shared Components (AFTER CLEANUP) ---
-	// Now we initialize statusManager, so it loads a fresh (empty) state from DB.
+	// --- 2. Initialize Shared Components ---
 	tracker := validator.NewInFlightTracker()
 	valStore := validator.NewStore(targetClient)
 
@@ -592,7 +613,6 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	statusManager = status.NewManager(targetClient, false)
 
 	validationManager := validator.NewManager(sourceClient, targetClient, tracker, valStore, statusManager)
-	// --- Ensure Validator is always closed to stop workers ---
 	defer validationManager.Close()
 
 	// --- 3. Register API Routes ---
@@ -617,20 +637,24 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	var startAt bson.Timestamp
+	// --- 4. EXECUTION LOGIC ---
 	var collectionsToMigrate []discover.CollectionInfo
 
 	if !found {
-		// --- CAPTURE T0 BEFORE DISCOVERY ---
-		// We capture T0 here so that any collections created *during* discovery
-		// will still be picked up by the CDC process later.
-		t0, err := topo.ClusterTime(ctx, sourceClient)
-		if err != nil {
-			statusManager.SetError(err.Error())
-			logging.PrintError(err.Error(), 0)
-			return
+		// Phase 1: DISCOVERY
+		if !anchorFound {
+			t0, err := topo.ClusterTime(ctx, sourceClient)
+			if err != nil {
+				statusManager.SetError(err.Error())
+				logging.PrintError(err.Error(), 0)
+				return
+			}
+			startAt = t0
+			logging.PrintInfo(fmt.Sprintf("Captured global T0 (Pre-Discovery): %v", startAt), 0)
+
+			// Save Anchor immediately to enable resuming later
+			checkpointManager.SaveAnchorTimestamp(ctx, startAt)
 		}
-		logging.PrintInfo(fmt.Sprintf("Captured global T0 (Pre-Discovery): %v", t0), 0)
 
 		logging.PrintPhase("1", "DISCOVERY")
 		statusManager.SetState("discovering", "Discovering collections to migrate...")
@@ -643,75 +667,89 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 			}
 		}
 
-		// --- CHECK SHUTDOWN SIGNAL ---
-		// If Discovery was canceled, stop here. Do not proceed to full load.
 		if ctx.Err() != nil {
 			logging.PrintWarning("Migration stopped during discovery.", 0)
 			return
 		}
 
-		if len(collectionsToMigrate) == 0 {
-			return
-		}
-		for _, coll := range collectionsToMigrate {
-			statusManager.AddEstimatedBytes(coll.Size)
-		}
-
-		logging.PrintPhase("2", "FULL DATA LOAD")
-		statusManager.SetState("running", "Initial Sync (Full Load)")
-
-		// Note: We do NOT save the checkpoint here yet. If we crash during full load,
-		// we want to restart from the beginning, not skip to CDC.
-		_, err = launchFullLoadWorkers(ctx, sourceClient, targetClient, collectionsToMigrate, statusManager, checkpointManager)
-		if err != nil {
-			if err != context.Canceled {
-				statusManager.SetError(err.Error())
-				logging.PrintError(err.Error(), 0)
+		// Phase 2: FULL DATA LOAD
+		if len(collectionsToMigrate) > 0 {
+			completedColls, err := checkpointManager.GetCompletedCollections(ctx)
+			if err != nil {
+				logging.PrintWarning(fmt.Sprintf("Failed to fetch completed checkpoints: %v", err), 0)
 			}
-			return
-		}
 
-		// --- CHECK SHUTDOWN SIGNAL ---
-		// If Full Load was canceled, stop here. Do NOT save the checkpoint.
-		if ctx.Err() != nil {
-			logging.PrintWarning("Migration stopped during Full Load.", 0)
-			return
-		}
+			var toRun []discover.CollectionInfo
+			for _, coll := range collectionsToMigrate {
+				if completedColls[coll.Namespace] {
+					logging.PrintInfo(fmt.Sprintf("Skipping already copied collection: %s", coll.Namespace), 0)
+				} else {
+					toRun = append(toRun, coll)
+					statusManager.AddEstimatedBytes(coll.Size)
+				}
+			}
 
-		logging.PrintSuccess("All full load workers complete.", 0)
+			if len(toRun) > 0 {
+				logging.PrintPhase("2", "FULL DATA LOAD")
+				statusManager.SetState("running", "Initial Sync (Full Load)")
+
+				_, err = launchFullLoadWorkers(ctx, sourceClient, targetClient, toRun, statusManager, checkpointManager)
+				if err != nil {
+					if err != context.Canceled {
+						statusManager.SetError(err.Error())
+						logging.PrintError(err.Error(), 0)
+					}
+					return
+				}
+
+				if ctx.Err() != nil {
+					logging.PrintWarning("Migration stopped during Full Load.", 0)
+					return
+				}
+				logging.PrintSuccess("All full load workers complete.", 0)
+			} else {
+				logging.PrintPhase("2", "FULL DATA LOAD (SKIPPED - ALL DONE)")
+			}
+		}
 
 		// --- SAVE RESUME TIMESTAMP (T0) ---
-		// Full load is complete. Now we persist the checkpoint so that future runs
-		// know to resume from CDC.
-		checkpointManager.SaveResumeTimestamp(ctx, config.Cfg.Migration.CheckpointDocID, t0)
-		logging.PrintInfo(fmt.Sprintf("Saved global resume timestamp: %v", t0), 0)
+		checkpointManager.SaveResumeTimestamp(ctx, config.Cfg.Migration.CheckpointDocID, startAt)
+		logging.PrintInfo(fmt.Sprintf("Saved global resume timestamp: %v", startAt), 0)
+
+		checkpointManager.DeleteAnchorTimestamp(ctx)
 
 		statusManager.SetCloneCompleted()
 
-		finalT0, foundT0 := checkpointManager.GetResumeTimestamp(ctx, config.Cfg.Migration.CheckpointDocID)
-		if !foundT0 {
-			finalT0 = t0
-		}
-
-		// bson.Timestamp is struct{T, I}
+		// Calculate lag for status
 		now := bson.Timestamp{T: uint32(time.Now().Unix()), I: 0}
-		lag := int64(now.T) - int64(finalT0.T)
+		lag := int64(now.T) - int64(startAt.T)
 		if lag < 0 {
 			lag = 0
 		}
 		statusManager.SetInitialSyncCompleted(lag)
 		statusManager.Persist(ctx)
 
-		startAt = finalT0
 	} else {
 		logging.PrintPhase("1", "DISCOVERY (SKIPPED)")
 		logging.PrintPhase("2", "FULL DATA LOAD (SKIPPED)")
-		statusManager.LoadAndMerge(ctx)
+
+		// --- Load Status and Validate Integrity ---
+		if err := statusManager.LoadAndMerge(ctx); err != nil {
+			logging.PrintWarning(fmt.Sprintf("Failed to load previous status: %v", err), 0)
+		}
+
+		// If we have a global checkpoint (Full Load Done),
+		// but status says otherwise, warn the user.
+		if !statusManager.IsCloneCompleted() {
+			logging.PrintWarning("Integrity Check: Global Checkpoint exists (Full Load Done), but Status metadata indicates incomplete.", 0)
+			logging.PrintWarning("This implies a previous crash during the final commit phase.", 0)
+			logging.PrintInfo("Proceeding with CDC based on Global Checkpoint (fail-open).", 0)
+		}
+
 		startAt = resumeAt
 		statusManager.SetCloneCompleted()
 	}
 
-	// --- CHECK SHUTDOWN SIGNAL BEFORE CDC ---
 	if ctx.Err() != nil {
 		logging.PrintWarning("Migration stopped before CDC start.", 0)
 		return
@@ -795,6 +833,8 @@ func launchFullLoadWorkers(ctx context.Context, source, target *mongo.Client, co
 func init() {
 	rootCmd.PersistentFlags().String("docdb-user", "", "Source DocumentDB Username")
 	rootCmd.PersistentFlags().String("mongo-user", "", "Target MongoDB Username")
+	rootCmd.PersistentFlags().Bool("debug", false, "Enable debug logging")
+
 	viper.BindPFlag("docdb.user", rootCmd.PersistentFlags().Lookup("docdb-user"))
 	viper.BindPFlag("mongo.user", rootCmd.PersistentFlags().Lookup("mongo-user"))
 
@@ -803,11 +843,13 @@ func init() {
 	runCmd.Flags().String("docdb-pass", "", "")
 	runCmd.Flags().String("mongo-pass", "", "")
 	runCmd.Flags().Bool("destroy", false, "")
+	runCmd.Flags().Bool("debug", false, "") // Internal debug flag for run command
 	runCmd.Flags().MarkHidden("docdb-user")
 	runCmd.Flags().MarkHidden("mongo-user")
 	runCmd.Flags().MarkHidden("docdb-pass")
 	runCmd.Flags().MarkHidden("mongo-pass")
 	runCmd.Flags().MarkHidden("destroy")
+	runCmd.Flags().MarkHidden("debug")
 
 	viper.BindEnv("DOCDB_PASS")
 	viper.BindEnv("MONGO_PASS")

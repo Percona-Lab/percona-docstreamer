@@ -103,15 +103,22 @@ func NewManager(source, target *mongo.Client, checkpointDocID string, startAt bs
 	return mgr
 }
 
-// handleBulkWrite performs the write AND triggers validation
-func (m *CDCManager) handleBulkWrite(ctx context.Context, batchMap map[string]*Batch) (int64, []string, error) {
+// handleBulkWrite performs the write AND returns the max timestamp in the batch
+func (m *CDCManager) handleBulkWrite(ctx context.Context, batchMap map[string]*Batch) (int64, []string, bson.Timestamp, error) {
 	var totalOps int64
 	var namespaces []string
 	var firstErr error
+	var batchMaxTS bson.Timestamp
 
 	for ns, batch := range batchMap {
 		if len(batch.Models) == 0 {
 			continue
+		}
+
+		// Track max timestamp for this flush
+		if batch.LastTS.T > batchMaxTS.T ||
+			(batch.LastTS.T == batchMaxTS.T && batch.LastTS.I > batchMaxTS.I) {
+			batchMaxTS = batch.LastTS
 		}
 
 		db, coll := splitNamespace(ns)
@@ -146,7 +153,7 @@ func (m *CDCManager) handleBulkWrite(ctx context.Context, batchMap map[string]*B
 		}
 	}
 
-	return totalOps, namespaces, firstErr
+	return totalOps, namespaces, batchMaxTS, firstErr
 }
 
 func (m *CDCManager) startFlushWorkers() {
@@ -161,7 +168,8 @@ func (m *CDCManager) startFlushWorkers() {
 			for batch := range queue {
 				start := time.Now()
 				writeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				flushedCount, namespaces, err := m.handleBulkWrite(writeCtx, batch)
+				// Capture max timestamp returned by handleBulkWrite
+				flushedCount, namespaces, batchMaxTS, err := m.handleBulkWrite(writeCtx, batch)
 				cancel()
 
 				logging.LogCDCOp(start, flushedCount, namespaces, err)
@@ -170,6 +178,8 @@ func (m *CDCManager) startFlushWorkers() {
 					logging.PrintError(fmt.Sprintf("[CDC Worker %d] CRITICAL: Batch flush failed: %v", workerID, err), 0)
 				} else {
 					m.totalEventsApplied.Add(flushedCount)
+					// Update status with the applied timestamp
+					m.statusManager.UpdateAppliedStats(batchMaxTS)
 				}
 			}
 		}(i, m.flushQueues[i])
@@ -179,9 +189,7 @@ func (m *CDCManager) startFlushWorkers() {
 func (m *CDCManager) Start(ctx context.Context) error {
 	logging.PrintInfo(fmt.Sprintf("Starting cluster-wide CDC... Resuming from checkpoint: %v", m.startAt), 0)
 
-	// --- Reconcile stats on startup ---
-	// This fixes any drift between stats aggregation and actual failure records
-	// caused by previous crashes or race conditions.
+	// FIX: Reconcile stats on startup ---
 	go func() {
 		logging.PrintInfo("[CDC] Reconciling validation statistics...", 0)
 		if err := m.validatorMgr.ReconcileStats(ctx); err != nil {
@@ -255,7 +263,6 @@ func (m *CDCManager) processChanges(ctx context.Context) {
 	defer ticker.Stop()
 
 	// --- Auto-Retry Ticker (Every 60s) ---
-	// This helps clear "false positive" validation failures when the system is quiet.
 	retryTicker := time.NewTicker(60 * time.Second)
 	defer retryTicker.Stop()
 
