@@ -250,7 +250,7 @@ func startAction(cmd *cobra.Command, args []string) {
 
 // stopAction encapsulates the logic to signal the app to stop and tail the logs until it exits.
 func stopAction(phaseTitle string) error {
-	logging.PrintPhase("4", phaseTitle)
+	logging.PrintPhase("6", phaseTitle)
 
 	pidVal, err := pid.Read()
 	if err != nil {
@@ -564,9 +564,12 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	checkpointManager := checkpoint.NewManager(targetClient)
 	resumeAt, found := checkpointManager.GetResumeTimestamp(ctx, config.Cfg.Migration.CheckpointDocID)
 
+	// Declared outside to prevent shadowing and persist discovery data if destroy is True
+	var collectionsToMigrate []discover.CollectionInfo
+
 	if destroy {
-		logging.PrintPhase("1", "DISCOVERY (for Destroy)")
-		collectionsToMigrate, err := discover.DiscoverCollections(ctx, sourceClient)
+		logging.PrintPhase("3", "DISCOVERY (for Destroy)")
+		collectionsToMigrate, err = discover.DiscoverCollections(ctx, sourceClient)
 		if err != nil {
 			logging.PrintError(err.Error(), 0)
 			return
@@ -577,6 +580,13 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		dbsFromSource := extractDBNames(collectionsToMigrate)
 		logging.PrintPhase("DESTROY", "Dropping target databases...")
 		dbops.DropAllDatabases(ctx, targetClient, dbsFromSource)
+
+		// Explicitly drop metadata DB here to prevent partial resume detection later
+		logging.PrintPhase("DESTROY", "Dropping metadata database...")
+		if err := targetClient.Database(config.Cfg.Migration.MetadataDB).Drop(ctx); err != nil {
+			logging.PrintWarning(fmt.Sprintf("Failed to drop metadata DB during destroy: %v", err), 0)
+		}
+
 		found = false
 	}
 
@@ -638,7 +648,6 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	}
 
 	// --- 4. EXECUTION LOGIC ---
-	var collectionsToMigrate []discover.CollectionInfo
 
 	if !found {
 		// Phase 1: DISCOVERY
@@ -656,7 +665,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 			checkpointManager.SaveAnchorTimestamp(ctx, startAt)
 		}
 
-		logging.PrintPhase("1", "DISCOVERY")
+		logging.PrintPhase("3", "DISCOVERY")
 		statusManager.SetState("discovering", "Discovering collections to migrate...")
 		if !destroy {
 			collectionsToMigrate, err = discover.DiscoverCollections(ctx, sourceClient)
@@ -690,7 +699,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 			}
 
 			if len(toRun) > 0 {
-				logging.PrintPhase("2", "FULL DATA LOAD")
+				logging.PrintPhase("4", "FULL DATA LOAD")
 				statusManager.SetState("running", "Initial Sync (Full Load)")
 
 				_, err = launchFullLoadWorkers(ctx, sourceClient, targetClient, toRun, statusManager, checkpointManager)
@@ -708,7 +717,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 				}
 				logging.PrintSuccess("All full load workers complete.", 0)
 			} else {
-				logging.PrintPhase("2", "FULL DATA LOAD (SKIPPED - ALL DONE)")
+				logging.PrintPhase("4", "FULL DATA LOAD (SKIPPED - ALL DONE)")
 			}
 		}
 
@@ -730,8 +739,8 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		statusManager.Persist(ctx)
 
 	} else {
-		logging.PrintPhase("1", "DISCOVERY (SKIPPED)")
-		logging.PrintPhase("2", "FULL DATA LOAD (SKIPPED)")
+		logging.PrintPhase("3", "DISCOVERY (SKIPPED)")
+		logging.PrintPhase("4", "FULL DATA LOAD (SKIPPED)")
 
 		// --- Load Status and Validate Integrity ---
 		if err := statusManager.LoadAndMerge(ctx); err != nil {
@@ -755,7 +764,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	logging.PrintPhase("3", "CONTINUOUS SYNC (CDC)")
+	logging.PrintPhase("5", "CONTINUOUS SYNC (CDC)")
 	statusManager.SetState("running", "Change Data Capture")
 
 	cdcManager := cdc.NewManager(
