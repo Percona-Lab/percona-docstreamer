@@ -266,8 +266,6 @@ The start command can be used to start a brand new migration and to resume a mig
 <summary>Sample output:</summary>
 
 ```bash
-2025/11/20 19:14:44 [INFO] CDC Operations logger initialized (file: logs/cdc.log)
-2025/11/20 19:14:44 [INFO] Full Load logger initialized (file: logs/full_load.log)
 2025/11/20 19:14:44
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ________            ______  ___                                ____________
@@ -306,8 +304,6 @@ _  /_/ // /_/ / /__ _  /  / / / /_/ /  / / /  /_/ // /_/ /     ____/ // /_ _  / 
 2025/11/20 19:14:45
 --- Phase 2: LAUNCHING BACKGROUND PROCESS ---
 2025/11/20 19:14:45 [OK]   Application started in background with PID: 1841063
-2025/11/20 19:14:45 [INFO] CDC Operations logger initialized (file: logs/cdc.log)
-2025/11/20 19:14:45 [INFO] Full Load logger initialized (file: logs/full_load.log)
 2025/11/20 19:14:45 [INFO] Writing PID 1841063 to ./docMongoStream.pid
 2025/11/20 19:14:45 [INFO] Status manager initialized (collection: docMongoStream.status)
 2025/11/20 19:14:45 [INFO] [STATUS] State changed to: connecting (Connections established. Pinging...)
@@ -385,8 +381,6 @@ You can use this command when you need to apply configuration changes and then r
 
 ```bash
 ./docMongoStream restart
-2025/11/24 22:22:42 [INFO] CDC Operations logger initialized (file: logs/cdc.log)
-2025/11/24 22:22:42 [INFO] Full Load logger initialized (file: logs/full_load.log)
 2025/11/24 22:22:42
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ________            ______  ___                                ____________
@@ -439,8 +433,6 @@ _  /_/ // /_/ / /__ _  /  / / / /_/ /  / / /  /_/ // /_/ /     ____/ // /_ _  / 
 2025/11/24 22:22:44
 --- Phase 2: LAUNCHING BACKGROUND PROCESS ---
 2025/11/24 22:22:44 [OK]   Application started in background with PID: 1663258
-2025/11/24 22:22:44 [INFO] CDC Operations logger initialized (file: logs/cdc.log)
-2025/11/24 22:22:44 [INFO] Full Load logger initialized (file: logs/full_load.log)
 2025/11/24 22:22:44 [INFO] Writing PID 1663258 to docMongoStream.pid
 2025/11/24 22:22:44 [INFO] Status manager initialized (collection: docMongoStream.status)
 2025/11/24 22:22:44 [INFO] [VAL] Starting 4 parallel CDC validation workers...
@@ -581,8 +573,6 @@ docMongoStream generates three separate logs, each of the logs location and name
 <summary>Application log sample:</summary>
 
 ```bash
-2025/11/17 16:13:33 [INFO] CDC Operations logger initialized (file: logs/cdc.log)
-2025/11/17 16:13:33 [INFO] Full Load logger initialized (file: logs/full_load.log)
 2025/11/17 16:13:33
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ________            ______  ___                                ____________
@@ -624,8 +614,6 @@ _  /_/ // /_/ / /__ _  /  / / / /_/ /  / / /  /_/ // /_/ /     ____/ // /_ _  / 
 2025/11/17 16:13:42 [INFO] Logs are being written to: logs/docMongoStream.log
 2025/11/17 16:13:42 [INFO] To stop the application, run: /home/daniel.almeida/docMongoStream stop
 2025/11/17 16:13:42 [INFO] To check status, run: /home/daniel.almeida/docMongoStream status (or GET http://localhost:8080/status)
-2025/11/17 16:13:42 [INFO] CDC Operations logger initialized (file: logs/cdc.log)
-2025/11/17 16:13:42 [INFO] Full Load logger initialized (file: logs/full_load.log)
 2025/11/17 16:13:42 [INFO] Writing PID 3024785 to ./docMongoStream.pid
 2025/11/17 16:13:42 [INFO] Status manager initialized (collection: docMongoStream.status)
 2025/11/17 16:13:42 [INFO] [STATUS] State changed to: connecting (Connections established. Pinging...)

@@ -48,7 +48,7 @@ func InitOpLogger() {
 
 	// Create the logger
 	OpLog = zerolog.New(file).With().Timestamp().Logger()
-	PrintInfo(fmt.Sprintf("CDC Operations logger initialized (file: %s)", logPath), 1)
+	// PrintInfo(fmt.Sprintf("CDC Operations logger initialized (file: %s)", logPath), 1)
 }
 
 // InitFullLoadLogger configures the FullLoadLog to write to its designated file
@@ -80,7 +80,7 @@ func InitFullLoadLogger() {
 
 	// Create the logger
 	FullLoadLog = zerolog.New(file).With().Timestamp().Logger()
-	PrintInfo(fmt.Sprintf("Full Load logger initialized (file: %s)", logPath), 1)
+	// PrintInfo(fmt.Sprintf("Full Load logger initialized (file: %s)", logPath), 1)
 }
 
 // LogCDCOp writes a structured log entry for a CDC batch operation
