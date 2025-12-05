@@ -105,6 +105,11 @@ func (vm *Manager) CanRun() bool {
 	return vm.statusMgr.IsCDCActive() && config.Cfg.Validation.Enabled
 }
 
+// IsCloneComplete checks if the initial full load phase has completed
+func (vm *Manager) IsCloneComplete() bool {
+	return vm.statusMgr.IsCloneCompleted()
+}
+
 // ValidateAsync is called by CDC to queue records for verification
 func (vm *Manager) ValidateAsync(ns string, ids []string) {
 	if !vm.CanRun() {

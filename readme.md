@@ -560,6 +560,9 @@ The status command provides real-time metrics on the health and progress of your
     * completionLagSeconds: How far behind real-time the migration was at the exact moment the Full Load finished.
     * clonedSizeHuman: Total volume of data copied during the Full load phase.
 
+### API
+
+docMongoStream also has an API that allows you to perform certain status and validation tasks, please see our [api documentation](./api.md) for more details and use case.
 
 ### Logs
 

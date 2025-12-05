@@ -628,6 +628,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	// --- 3. Register API Routes ---
 	apiServer.RegisterRoute("/status", statusManager.StatusHandler)
 	apiServer.RegisterRoute("/validate", validationManager.HandleValidateRequest)
+	apiServer.RegisterRoute("/validate/adhoc", validationManager.HandleAdHocValidation)
 	apiServer.RegisterRoute("/validate/retry", validationManager.HandleRetryFailures)
 	apiServer.RegisterRoute("/validate/stats", validationManager.HandleGetStats)
 	apiServer.RegisterRoute("/validate/reset", validationManager.HandleReset)

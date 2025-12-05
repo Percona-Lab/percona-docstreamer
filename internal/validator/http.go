@@ -45,6 +45,48 @@ func (vm *Manager) HandleValidateRequest(w http.ResponseWriter, r *http.Request)
 	json.NewEncoder(w).Encode(results)
 }
 
+// HandleAdHocValidation provides a dedicated endpoint for on-demand validation
+// that strictly requires the full load to be completed.
+func (vm *Manager) HandleAdHocValidation(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "Method not allowed. Use POST.", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 1. Enforce 'full load completed' prerequisite
+	if !vm.IsCloneComplete() {
+		http.Error(w, "Validation unavailable: Full load (clone) process must be completed first.", http.StatusForbidden)
+		return
+	}
+
+	var req ValidationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if req.Namespace == "" {
+		http.Error(w, "Namespace is required", http.StatusBadRequest)
+		return
+	}
+	if len(req.IDs) == 0 {
+		// Reject request to validate an entire collection as it requires a full scan
+		// which is not supported by the existing API/Manager logic.
+		http.Error(w, "Validation of an entire collection is not currently supported. Provide specific document IDs.", http.StatusBadRequest)
+		return
+	}
+
+	// 2. Perform synchronous validation for the provided records
+	results, err := vm.ValidateSync(r.Context(), req.Namespace, req.IDs)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Validation failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(results)
+}
+
 // HandleRetryFailures triggers a re-check of all known failures
 func (vm *Manager) HandleRetryFailures(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
