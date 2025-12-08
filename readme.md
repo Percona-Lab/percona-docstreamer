@@ -70,6 +70,28 @@ db.adminCommand({modifyChangeStreams: 1, database: "percona_db_1", collection: "
 db.adminCommand({modifyChangeStreams: 1, database: "percona_db_1", collection: "test_3", enable: true});
 ```
 
+## Limitations & Important Notes
+
+### Sharding support not tested
+
+Migration from DocumentDB sharded clusters has not been tested and therefore the behavior is unknown. Support for sharded DocumentDB clusters will be added in the future.
+
+### DocumentDB Cursor Rate Limiting
+
+AWS DocumentDB enforces service quotas, including limits on the number of cursors and the rate of getMore operations, which are fundamental to how change streams work.
+
+Symptom: If the migration falls too far behind (e.g., after being stopped for a long time) or if there is a massive burst of write activity, the docMongoStream tool may hit these rate limits. This can cause the change stream to fail or be terminated by AWS.
+
+Behavior: docMongoStream is designed to be resilient and will attempt to retry and resume the stream. However, persistent rate-limiting from the DocumentDB side may require intervention (e.g., scaling your DocumentDB instance or running the migration during off-peak hours).
+
+### DDL Operation Support
+
+docMongoStream has support for replicating most DDL operations. 
+
+Supported: drop (collection), dropDatabase, rename (collection), create (collection). 
+
+NOT Supported: createIndexes, dropIndexes. These operations will be detected and logged, but skipped. You must manually recreate or drop indexes on the target cluster.
+
 ## Installing docMongoStream
 
 ### The easy way
@@ -812,24 +834,6 @@ The data validation engine is highly configurable to balance performance impact 
 | queue_size | 2000 | Buffer Capacity. The size of the channel buffering CDC events before validation. If the CDC writer is faster than the validator and this buffer fills up, validation requests will be dropped to prevent slowing down the replication stream. |
 | retry_interval_ms | 500 | Hot Key Handling. If a record fails validation because it is actively being modified (detected via dirty tracking), the validator waits this long before re-checking it. |
 | max_retries | 3 | Persistence. How many times to retry a "Hot Key" before giving up. After this many attempts, the record is marked as a mismatch/skipped to move on. |
-
-## Limitations & Important Notes
-
-### DocumentDB Cursor Rate Limiting
-
-AWS DocumentDB enforces service quotas, including limits on the number of cursors and the rate of getMore operations, which are fundamental to how change streams work.
-
-Symptom: If the migration falls too far behind (e.g., after being stopped for a long time) or if there is a massive burst of write activity, the docMongoStream tool may hit these rate limits. This can cause the change stream to fail or be terminated by AWS.
-
-Behavior: docMongoStream is designed to be resilient and will attempt to retry and resume the stream. However, persistent rate-limiting from the DocumentDB side may require intervention (e.g., scaling your DocumentDB instance or running the migration during off-peak hours).
-
-### DDL Operation Support
-
-docMongoStream has support for replicating most DDL operations. 
-
-Supported: drop (collection), dropDatabase, rename (collection), create (collection). 
-
-NOT Supported: createIndexes, dropIndexes. These operations will be detected and logged, but skipped. You must manually recreate or drop indexes on the target cluster.
 
 ## Additional Documentation
 

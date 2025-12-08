@@ -184,3 +184,196 @@ This ensures legitimate mismatches are not confused with race conditions.
 ### Limitation
 Indexes created on the source **after** migration starts (during CDC) are **not** auto-copied and must be applied manually.
 
+
+---
+
+## Q: Are new databases and collections migrated to destination if they were created on source while docMongoStream is running?
+**A:** Yes. New collections and databases created while docMongoStream is running (and while it is paused), will be detected and migrated.
+
+***Example***
+
+Source:
+
+```bash
+rs0 [direct: primary] ind_1> show dbs
+custom_ids  332.83 MiB
+cvg_1        15.66 MiB
+good_ids    300.77 MiB
+ind_1       170.88 MiB
+ind_2       148.76 MiB
+ind_3       131.40 MiB
+sea_1         8.05 MiB
+sea_2         7.64 MiB
+```
+
+Destination:
+
+```bash
+[direct: mongos] ind_1> show dbs
+admin            16.77 MiB
+airline           2.93 GiB
+config            7.84 MiB
+custom_ids       19.31 MiB
+cvg_1             2.14 MiB
+docMongoStream    1.09 MiB
+generic         144.02 MiB
+good_ids         18.36 MiB
+ind_1            64.18 MiB
+rental          638.08 MiB
+sea_1             1.00 MiB
+sea_2           956.00 KiB
+```
+
+Status:
+
+```bash
+./docMongoStream status
+--- docMongoStream Status (Live) ---
+PID: 1908370 (Querying http://localhost:8080/status)
+{
+    "ok": true,
+    "state": "running",
+    "info": "Change Data Capture",
+    "timeSinceLastEventSeconds": 426.268916374,
+    "cdcLagSeconds": 0,
+    "totalEventsApplied": 165575,
+    "validation": {
+        "totalChecked": 160949,
+        "validCount": 160949,
+        "mismatchCount": 0,
+        "syncPercent": 100,
+        "lastValidatedAt": "2025-12-08T14:34:27Z"
+    },
+    "lastSourceEventTime": {
+        "ts": "1765204339.125",
+        "isoDate": "2025-12-08T14:32:19Z"
+    },
+    "lastAppliedEventTime": {
+        "ts": "1765204339.125",
+        "isoDate": "2025-12-08T14:32:19Z"
+    },
+    "lastBatchAppliedAt": "2025-12-08T14:33:44Z",
+    "initialSync": {
+        "completed": true,
+        "completionLagSeconds": 43,
+        "cloneCompleted": true,
+        "estimatedCloneSizeBytes": 224711630,
+        "clonedSizeBytes": 224711630,
+        "estimatedCloneSizeHuman": "214.3 MB",
+        "clonedSizeHuman": "214.3 MB"
+    }
+}
+```
+
+
+Create new database and insert record on source:
+
+```bash
+rs0 [direct: primary] test> use newDB
+switched to db newDB
+rs0 [direct: primary] newDB> db.test.insertMany([{"record":1},{"record":2},{"record":3}])
+{
+  acknowledged: true,
+  insertedIds: {
+    '0': ObjectId('6936e457f345f4ceef5a6467'),
+    '1': ObjectId('6936e457f345f4ceef5a6468'),
+    '2': ObjectId('6936e457f345f4ceef5a6469')
+  }
+}
+rs0 [direct: primary] newDB> db.test.find()
+[
+  { _id: ObjectId('6936e457f345f4ceef5a6467'), record: 1 },
+  { _id: ObjectId('6936e457f345f4ceef5a6468'), record: 2 },
+  { _id: ObjectId('6936e457f345f4ceef5a6469'), record: 3 }
+]
+```
+
+CDC logs:
+
+```bash
+{"level":"info","message":"CDC batch applied","s":"cdc","batch_size":1,"elapsed_secs":0.127438667,"namespaces":["newDB.test"],"time":"2025-12-08 09:44:40.292"}
+{"level":"info","message":"CDC batch applied","s":"cdc","batch_size":1,"elapsed_secs":0.148425636,"namespaces":["newDB.test"],"time":"2025-12-08 09:44:40.313"}
+{"level":"info","message":"CDC batch applied","s":"cdc","batch_size":1,"elapsed_secs":0.148461117,"namespaces":["newDB.test"],"time":"2025-12-08 09:44:40.313"}
+```
+
+Status:
+
+```bash
+./docMongoStream status
+--- docMongoStream Status (Live) ---
+PID: 1908370 (Querying http://localhost:8080/status)
+{
+    "ok": true,
+    "state": "running",
+    "info": "Change Data Capture",
+    "timeSinceLastEventSeconds": 63.377820916,
+    "cdcLagSeconds": 0,
+    "totalEventsApplied": 165578,
+    "validation": {
+        "totalChecked": 160952,
+        "validCount": 160952,
+        "mismatchCount": 0,
+        "syncPercent": 100,
+        "lastValidatedAt": "2025-12-08T14:44:40Z"
+    },
+    "lastSourceEventTime": {
+        "ts": "1765205079.12",
+        "isoDate": "2025-12-08T14:44:39Z"
+    },
+    "lastAppliedEventTime": {
+        "ts": "1765205079.12",
+        "isoDate": "2025-12-08T14:44:39Z"
+    },
+    "lastBatchAppliedAt": "2025-12-08T14:44:40Z",
+    "initialSync": {
+        "completed": true,
+        "completionLagSeconds": 43,
+        "cloneCompleted": true,
+        "estimatedCloneSizeBytes": 224711630,
+        "clonedSizeBytes": 224711630,
+        "estimatedCloneSizeHuman": "214.3 MB",
+        "clonedSizeHuman": "214.3 MB"
+    }
+}
+```
+
+Destination:
+
+```bash
+[direct: mongos] ind_1> show dbs
+admin             16.76 MiB
+airline            2.93 GiB
+config             7.83 MiB
+custom_ids        19.31 MiB
+cvg_1              2.14 MiB
+docMongoStream  1000.00 KiB
+generic          144.02 MiB
+good_ids          18.36 MiB
+ind_1             73.24 MiB
+newDB             40.00 KiB
+rental           638.08 MiB
+sea_1            828.00 KiB
+sea_2            928.00 KiB
+[direct: mongos] ind_1> use newDB
+switched to db newDB
+[direct: mongos] newDB> db.test.find()
+[
+  { _id: ObjectId('6936e457f345f4ceef5a6469'), record: 3 },
+  { _id: ObjectId('6936e457f345f4ceef5a6467'), record: 1 },
+  { _id: ObjectId('6936e457f345f4ceef5a6468'), record: 2 }
+]
+[direct: mongos] newDB>
+```
+
+The observed retrieval order on the destination is expected behavior and is not a problem for data consistency.
+The data is consistent and complete, but the default retrieval method in MongoDB does not guarantee the order of results unless you explicitly request a sort.
+To see the documents on the destination in the order they were logically created (based on their _id), you must explicitly add a sort to your query:
+
+```bash
+[direct: mongos] newDB> db.test.find().sort({_id: 1})
+[
+  { _id: ObjectId('6936e457f345f4ceef5a6467'), record: 1 },
+  { _id: ObjectId('6936e457f345f4ceef5a6468'), record: 2 },
+  { _id: ObjectId('6936e457f345f4ceef5a6469'), record: 3 }
+]
+```
