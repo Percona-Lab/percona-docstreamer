@@ -184,6 +184,24 @@ This ensures legitimate mismatches are not confused with race conditions.
 ### Limitation
 Indexes created on the source **after** migration starts (during CDC) are **not** auto-copied and must be applied manually.
 
+---
+
+## Q: What happens if the source environment is a Sharded Amazon DocumentDB cluster? Will the tool work?
+**A:** docMongoStream is designed to work with sharded source environments, as long as the connection details point to the cluster's router/endpoint (equivalent to a mongos instance in a MongoDB sharded cluster).
+
+- Full Load: The initial data copy phase should work correctly. docMongoStream connects to the cluster endpoint and issues standard find commands to discover and copy data. The router is responsible for distributing these queries across all shards and aggregating the results for a complete snapshot.
+
+- CDC (Real-Time Replication): The continuous replication phase relies on the DocumentDB cluster supporting cluster-wide change streams. docMongoStream explicitly uses and checks for this capability by running the watch operation against the main client, which is intended to capture changes across all databases and collections.
+
+### Caveats and Current Limitations Regarding Sharding
+
+While the architecture supports sharding, there are important caveats, particularly with Amazon DocumentDB:
+
+- Reliance on Cluster-Wide Change Streams: The entire CDC pipeline is dependent on the source cluster endpoint providing a single, comprehensive cluster-wide change stream. If the DocumentDB sharding implementation does not fully support a robust cluster-wide stream, the CDC replication may be incomplete or fail.
+
+- Target Sharding Complexity: If your target self-managed MongoDB instance is also sharded, DDL operations (like Drop or Rename) are handled by running commands against the target database. These operations can require specific administrative commands or special handling in a sharded MongoDB environment, which may not be fully optimized in the current DDL handler. We recommend not to run any DDL operations while the migration is on going to avoid issues.
+
+- DocumentDB Sharding is a Planned Enhancement: While the core functionality is designed for sharding, fully testing and guaranteeing compatibility across all edge cases of DocumentDB's sharded architecture is a planned feature. For maximum safety, large-scale sharded DocumentDB migrations should be considered experimental until the dedicated Support for Sharded DocumentDB clusters enhancement is released.
 
 ---
 
