@@ -125,6 +125,36 @@ The following index types are not migrated during the Full Sync and must be crea
 
 ## Installing docMongoStream
 
+We recommend you have a dedicated server to run docMongoStream. 
+
+### Host Sizing Recommendations
+
+The memory requirements for the host depend directly on your configuration settings in `config.yaml`, specifically the number of workers and the batch size. 
+
+***Memory (RAM) Calculation:*** The application uses an internal buffer to hold data before writing it to the destination. You can estimate the minimum RAM required using this formula:
+
+Required RAM = (NumInsertWorkers * 2) * InsertBatchBytes + Overhead
+
+- NumInsertWorkers: Default is 8
+- InsertBatchBytes: Default is 48 MB
+
+Default Usage: $(8 \times 2) \times 48\text{MB} \approx 768\text{MB}$ of raw data in the write queue
+
+Minimal Recommended Sizing Per Workload Type
+
+| Workload | Configuration | Specs |
+| :--- | :--- | :--- |
+| Small | Default settings (8 workers, 48MB batches) | 2 vCPU / 2 GB RAM  ***(Sufficient for the ~768MB buffer + OS overhead)*** |
+| Medium | Default settings (Safe buffer) | 2-4 vCPU / 4 GB RAM  ***(Provides headroom for garbage collection and read buffers)*** |
+| Large | Increased concurrency (e.g., 16+ workers) | 4-8 vCPU / 8-16 GB RAM  ***(Required if you increase num_insert_workers or insert_batch_bytes)*** |
+
+How to Reduce Memory Usage:
+
+If your host is running out of memory, you can lower the RAM requirement by modifying `config.yaml`:
+
+- Reduce `cloner.insert_batch_bytes`: Lowering this to 16MB significantly drops memory usage.
+- Reduce `cloner.num_insert_workers`: Lowering this to 4 reduces the size of the internal queue.
+
 ### The easy way
 
 All you need to do is follow 3 steps:

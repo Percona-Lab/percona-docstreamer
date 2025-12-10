@@ -1,5 +1,17 @@
 # Frequently Asked Questions
 
+## Q: Where is data stored during the Full Load sync? Will this cause Out-Of-Memory (OOM) errors on my Source or Destination database?
+**A:** No, docMongoStream is designed to minimize memory pressure on your Source and Destination databases.
+
+Where Data Lives: The data from batches is stored exclusively in the RAM of the machine running docMongoStream. It acts as a streaming middleman, holding data in memory only long enough to transfer it from Source to Destination.
+
+Source Database Impact: The impact is minimal. docMongoStream uses "cursors" to stream documents one by one and uses efficient range queries (based on _id) to avoid loading large datasets into the Source's memory.
+
+Destination Database Impact: The impact is standard for write operations. Data is sent in bulk batches (default ~48MB, this number can change depending on your settings). The destination database processes these writes normally and does not need to cache the entire migration in RAM.
+
+OOM Risk: The risk of running out of memory lies with the host running docMongoStream, not your databases. If that machine is undersized, docMongoStream may crash, but your databases will remain safe.
+
+
 ## Q: What happens if I run a new migration (Full Sync) into a destination where the Database and Collection names already exist?
 **A:** If you perform a Full Sync into a cluster that already contains data with matching Database and Collection names, docMongoStream resolves conflicts based on the unique _id of the documents:
   1. Non-Matching IDs: If the records in the source have completely different _ids than those in the destination, the destination records remain unaffected. The new records from the source are simply inserted (appended) into the collection.
@@ -20,19 +32,19 @@
 ### Detailed Recovery Workflow
 
 #### **The "Anchor" Checkpoint**
-- Before copying any data, the tool saves an **Anchor Timestamp** (**T₀**) to the target database.
-- If the tool crashes at 50% completion, this Anchor remains in the database, preserving the original start time of the migration project.
+- Before copying any data, docMongoStream saves an **Anchor Timestamp** (**T₀**) to the target database.
+- If docMongoStream crashes at 50% completion, this Anchor remains in the database, preserving the original start time of the migration project.
 
 #### **Smart Resume Logic**
-- **On Restart:** The tool detects the Anchor and recognizes a *Partial Full Load*.
+- **On Restart:** docMongoStream detects the Anchor and recognizes a *Partial Full Load*.
 - **Skipping Completed Work:** It scans the checkpoints to determine which collections finished successfully.
 - **Resuming Work:** It launches workers only for the remaining (incomplete) collections.
 
 #### **Consistency**
-By reusing the original Anchor **T₀** instead of capturing a new timestamp, the tool ensures that when the CDC phase starts, it will “rewind” back to the very beginning of the project — capturing any updates that occurred on already-finished collections while the tool was down.
+By reusing the original Anchor **T₀** instead of capturing a new timestamp, docMongoStream ensures that when the CDC phase starts, it will “rewind” back to the very beginning of the project — capturing any updates that occurred on already-finished collections while docMongoStream was down.
 
 #### **How Idempotency Handles Interrupted Collections**
-- For the collection being copied when the crash occurred, the tool restarts that collection from the **beginning**.
+- For the collection being copied when the crash occurred, docMongoStream restarts that collection from the **beginning**.
 - **No duplicates:** Because workers use Upserts (`ReplaceOne` with `upsert: true`), re-copying simply overwrites documents with identical data. No duplicate errors or cleanup required.
 
 ---
@@ -40,7 +52,7 @@ By reusing the original Anchor **T₀** instead of capturing a new timestamp, th
 ## Q: How does the "Resumable Full Load" work?
 **A:**
 - If docMongoStream stops during copying, simply run `start` again.
-- The tool detects the existing Anchor Timestamp.
+- docMongoStream detects the existing Anchor Timestamp.
 - It scans checkpoints to determine which collections completed.
 - It skips completed collections and launches workers only for pending ones.
 - After all collections finish, it proceeds to CDC using the original **T₀**.
@@ -77,7 +89,7 @@ Set `change_stream_log_retention_duration` to **7 days or longer** for large mig
 ---
 
 ## Q: Does resuming create duplicate data?
-**A:** No. The tool uses **Idempotent Writes (Upserts)**.
+**A:** No. docMongoStream uses **Idempotent Writes (Upserts)**.
 
 - Completed collections are skipped entirely.
 - If a worker crashed mid-collection, that collection restarts.
@@ -85,13 +97,13 @@ Set `change_stream_log_retention_duration` to **7 days or longer** for large mig
 
 ---
 
-## Q: Why doesn't the tool use MongoDB Transactions?
+## Q: Why doesn't docMongoStream use MongoDB Transactions?
 **A:** docMongoStream is built for **high-throughput eventual consistency** using **Idempotent Writes**, not strict transactional atomicity.
 
 ### Key Points
 
 #### **Idempotency > Rollbacks**
-- Instead of rollback logic, the tool simply reprocesses batches after a crash.
+- Instead of rollback logic, docMongoStream simply reprocesses batches after a crash.
 - Upserts ensure re-copying data overwrites identical documents without errors.
 
 #### **Full Load Phase**
@@ -106,15 +118,15 @@ Set `change_stream_log_retention_duration` to **7 days or longer** for large mig
 ### Worker Failure Example
 1. Worker copies 10,000 docs → crashes.
 2. Migration halts.
-3. You restart the tool.
+3. You restart docMongoStream.
 4. It restarts the collection from the beginning.
 5. Upserts overwrite identical docs → no duplicates.
 
-This design makes the tool **crash-safe**.
+This design makes docMongoStream **crash-safe**.
 
 ---
 
-## Q: How does the tool handle `_id` fields with mixed data types?
+## Q: How does docMongoStream handle `_id` fields with mixed data types?
 **A:** docMongoStream auto-detects mixed `_id` types and switches to **Linear Scan Mode** to guarantee consistency.
 
 ### Technical Breakdown
@@ -123,7 +135,7 @@ This design makes the tool **crash-safe**.
 Databases like DocumentDB may produce unstable sorting for mixed `_id` types without secondary indexes, causing parallel range queries to skip documents.
 
 #### Automatic Detection
-During Discovery, the tool:
+During Discovery, docMongoStream:
 - Samples start/end/random documents
 - Checks `_id` types
 - Runs test queries
@@ -176,7 +188,7 @@ If unsafe → linear scan is enforced.
 **A:** To avoid false positives caused by CDC updates during validation.
 
 ### How It Works
-- The tool tracks “in-flight” CDC writes.
+- docMongoStream tracks “in-flight” CDC writes.
 - If validator reads a doc currently being updated, it defers the check.
 - It retries after `retry_interval_ms`.
 
@@ -200,7 +212,7 @@ Indexes created on the source **after** migration starts (during CDC) are **not*
 
 ---
 
-## Q: What happens if the source environment is a Sharded Amazon DocumentDB cluster? Will the tool work?
+## Q: What happens if the source environment is a Sharded Amazon DocumentDB cluster? Will docMongoStream work?
 **A:** docMongoStream is designed to work with sharded source environments, as long as the connection details point to the cluster's router/endpoint (equivalent to a mongos instance in a MongoDB sharded cluster).
 
 - Full Load: The initial data copy phase should work correctly. docMongoStream connects to the cluster endpoint and issues standard find commands to discover and copy data. The router is responsible for distributing these queries across all shards and aggregating the results for a complete snapshot.
