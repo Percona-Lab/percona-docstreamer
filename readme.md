@@ -805,6 +805,8 @@ docMongoStream uses dedicated worker pools for both migration phases, eliminatin
 
 ***Total Threads = migration.max_concurrent_workers * cloner.num_read_workers + cloner.num_insert_workers***
 
+Synchronization speed tests show that reads are typically faster than writes. A read-to-write worker ratio of approximately 1:8 has proven to be the most effective. Depending on your available resources, you may find it beneficial to experiment with increasing the number of write workers accordingly based on that ratio.
+
 Lets take our default values set in [config.yaml](./config.yaml) 
 
 - migration.max_concurrent_workers: 2
