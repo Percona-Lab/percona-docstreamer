@@ -70,7 +70,21 @@ db.adminCommand({modifyChangeStreams: 1, database: "percona_db_1", collection: "
 db.adminCommand({modifyChangeStreams: 1, database: "percona_db_1", collection: "test_3", enable: true});
 ```
 
-## Limitations & Important Notes
+## Important Notes & Limitations 
+
+### Best Practices & Safety Precautions
+
+To ensure data integrity and prevent accidental data loss during migration, we recommend following these guidelines before initiating a docMongoStream process.
+
+ - Backup Your Destination ***(if the destination environment contains data)*** Because docMongoStream will overwrite documents with matching _ids, always create a backup of your destination database before running a Full Sync. This ensures you can roll back if valid data is accidentally overwritten.
+
+ - Audit Existing Collections: ***(if the destination environment contains data)*** Check your destination database to see if collections with the same names as your source already exist. If they do, verify if the data is intended to be merged. If not, consider renaming the source or destination collection.
+
+- Verify Connection Strings: Double-check your SOURCE and DESTINATION URIs. A common mistake is pointing the destination to a production environment instead of a staging environment, which can lead to unintended data commingling.
+
+- Test with a Staging Run: If possible, perform a dry run or a migration into a temporary empty cluster/database first. This allows you to verify that the data maps correctly and the volume is as expected without risking your main data store.
+
+**CRITICAL WARNING** regarding Data Overwrites: Please be aware that if a document in your Source has the same _id as a document in your Destination, the Destination document will be overwritten immediately. This action is irreversible once the sync is performed.
 
 ### Sharding support not tested
 
@@ -84,13 +98,30 @@ Symptom: If the migration falls too far behind (e.g., after being stopped for a 
 
 Behavior: docMongoStream is designed to be resilient and will attempt to retry and resume the stream. However, persistent rate-limiting from the DocumentDB side may require intervention (e.g., scaling your DocumentDB instance or running the migration during off-peak hours).
 
-### DDL Operation Support
+### DDL Operation Support During CDC Stage
 
-docMongoStream has support for replicating most DDL operations. 
+docMongoStream has support for replicating most DDL operations during the CDC stage (after the full sync has completed).
 
 Supported: drop (collection), dropDatabase, rename (collection), create (collection). 
 
-NOT Supported: createIndexes, dropIndexes. These operations will be detected and logged, but skipped. You must manually recreate or drop indexes on the target cluster.
+**NOT Supported**: createIndexes, dropIndexes. These operations will be skipped. You must manually recreate or drop indexes on the target cluster.
+
+### Supported Index Types
+
+docMongoStream automatically handles the creation of indexes during the Full Sync stage to ensure your destination performance matches the source. However, there are specific limitations regarding index types.
+
+Currently Supported:
+
+Most standard MongoDB index types (e.g., Single Field, Compound, Multikey, Geospatial).
+
+Not Currently Supported: 
+
+The following index types are not migrated during the Full Sync and must be created manually on the destination if required:
+
+ - Text Indexes
+ - Partial Indexes
+
+***Note:*** We recommend reviewing your source indexes prior to migration. If your application relies heavily on text search or partial indexing, plan to run a post-migration script to reconstruct these specific indexes on the destination cluster.
 
 ## Installing docMongoStream
 

@@ -1,5 +1,19 @@
 # Frequently Asked Questions
 
+## Q: What happens if I run a new migration (Full Sync) into a destination where the Database and Collection names already exist?
+**A:** If you perform a Full Sync into a cluster that already contains data with matching Database and Collection names, docMongoStream resolves conflicts based on the unique _id of the documents:
+  1. Non-Matching IDs: If the records in the source have completely different _ids than those in the destination, the destination records remain unaffected. The new records from the source are simply inserted (appended) into the collection.
+  2. Matching IDs: If a record in the source shares the exact same _id as a record in the destination, the source data will overwrite the destination record.
+
+---
+
+## Q: What happens if the Database already exists at the destination, but the Collection being migrated is new?
+**A:** In this scenario, existing collections within the destination database remain untouched. The new collection from the source is fully copied to the destination database without affecting the integrity or availability of any other collections residing in that same database.
+
+***Note:*** This applies only when the collection names differ. If the collection names match, the merge/overwrite logic described in the previous question applies.
+
+---
+
 ## Q: What happens if the application crashes during the Full Load phase?
 **A:** If docMongoStream stops (crash, restart, power loss) during the Full Load, it resumes the migration from the point of the last completed collection. It does *not* start from scratch.
 
