@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Percona-Lab/docMongoStream/internal/config"
-	"github.com/Percona-Lab/docMongoStream/internal/logging"
+	"github.com/Percona-Lab/percona-docstreamer/internal/config"
+	"github.com/Percona-Lab/percona-docstreamer/internal/logging"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"

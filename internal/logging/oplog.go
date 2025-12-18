@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/Percona-Lab/docMongoStream/internal/config"
+	"github.com/Percona-Lab/percona-docstreamer/internal/config"
 	"github.com/rs/zerolog"
 )
 

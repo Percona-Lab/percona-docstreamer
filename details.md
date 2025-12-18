@@ -1,6 +1,6 @@
-## How docMongoStream Works
+## How Percona docStreamer Works
 
-docMongoStream supports syncing all data, including the following index types:
+docStreamer supports syncing all data, including the following index types:
 
 - single  
 - compound  
@@ -8,30 +8,30 @@ docMongoStream supports syncing all data, including the following index types:
 - sparse  
 - unique  
 
-docMongoStream operates in 4 distinct stages:
+docStreamer operates in 4 distinct stages:
 
 - Validation  
 - Discovery  
 - Full Data Load  
 - CDC (Continuous Sync)  
 
-In addition to the above, docMongoStream includes an Event-Driven Validation Engine. Unlike traditional migration tools that just "copy and hope," our tool verifies data integrity in real-time as changes are applied.
+In addition to the above, docStreamer includes an Event-Driven Validation Engine. Unlike traditional migration tools that just "copy and hope," our tool verifies data integrity in real-time as changes are applied.
 
 ### 1. Validation
 
-When you run `./docMongoStream start`, docMongoStream loads the config.yaml file, prompts for credentials, and connects to both the source DocumentDB and the target MongoDB to verify authentication and connectivity. If migration.destroy is set to true, it will prompt you for confirmation before proceeding.
+When you run `./docStreamer start`, docStreamer loads the config.yaml file, prompts for credentials, and connects to both the source DocumentDB and the target MongoDB to verify authentication and connectivity. If migration.destroy is set to true, it will prompt you for confirmation before proceeding.
 
-docMongoStream performs a critical check to ensure the DocumentDB Change Stream is enabled (modifyChangeStreams: 1). If not, it provides the specific command required to enable it. It also checks the target database for an existing CDC checkpoint. If no checkpoint is found, it proceeds to the "Discovery" phase.
+docStreamer performs a critical check to ensure the DocumentDB Change Stream is enabled (modifyChangeStreams: 1). If not, it provides the specific command required to enable it. It also checks the target database for an existing CDC checkpoint. If no checkpoint is found, it proceeds to the "Discovery" phase.
 
 ### 2. Discovery
 
-In this stage, docMongoStream scans the source database to identify all valid databases and collections that match your configuration (filtering out system collections or those explicitly excluded). It gathers metadata, such as document counts and estimated sizes, to prepare for the Full Load.
+In this stage, docStreamer scans the source database to identify all valid databases and collections that match your configuration (filtering out system collections or those explicitly excluded). It gathers metadata, such as document counts and estimated sizes, to prepare for the Full Load.
 
 ### 3. Full Data Load
 
 This is the initial snapshot stage.
 
-**Global Time Capture ($\mathbf{T_0}$):** Before Discovery begins, docMongoStream captures the source cluster's current Cluster Time. This timestamp ($\mathbf{T_0}$) becomes the guaranteed starting point for the CDC phase, ensuring strictly zero data loss.
+**Global Time Capture ($\mathbf{T_0}$):** Before Discovery begins, docStreamer captures the source cluster's current Cluster Time. This timestamp ($\mathbf{T_0}$) becomes the guaranteed starting point for the CDC phase, ensuring strictly zero data loss.
 
 **Parallel Execution:** A collection-level worker pool (configured via `migration.max_concurrent_workers`) orchestrates the migration. Inside each collection, data is processed concurrently by dedicated read and insert workers (`cloner.num_read_workers` and `cloner.num_insert_workers`) to maximize throughput.
 
@@ -51,17 +51,17 @@ This phase starts immediately after the Full Load completes (or on startup if a 
 
 ### 5. Continuous Data Validation
 
-CDC is guaranteed to sync the documents, however, docMongoStream provides an additional layer of validation. The data validation process in docMongoStream is event-driven. Each time a batch of records is written to the destination through CDC, the corresponding document IDs are immediately queued for validation. This process becomes active only after the Full Data Load has completed and CDC is running. To maintain performance while still providing this valuable functionality, the application stores counters (for statistics) and failure records (for debugging).
+CDC is guaranteed to sync the documents, however, docStreamer provides an additional layer of validation. The data validation process in docStreamer is event-driven. Each time a batch of records is written to the destination through CDC, the corresponding document IDs are immediately queued for validation. This process becomes active only after the Full Data Load has completed and CDC is running. To maintain performance while still providing this valuable functionality, the application stores counters (for statistics) and failure records (for debugging).
 
-docMongoStream also implements an auto-healing capability. If a record fails validation due to a mismatch but is later updated by the source application, docMongoStream automatically removes the associated failure entry because the previous state is no longer relevant. While the validation process never modifies data, it allows you to confirm not only that data has been synchronized, but also that records continue to update correctly as your application remains active prior to cutover. This feature provides peace of mind and ensures that the source and destination datasets are an exact match before the final cutover.
+docStreamer also implements an auto-healing capability. If a record fails validation due to a mismatch but is later updated by the source application, docStreamer automatically removes the associated failure entry because the previous state is no longer relevant. While the validation process never modifies data, it allows you to confirm not only that data has been synchronized, but also that records continue to update correctly as your application remains active prior to cutover. This feature provides peace of mind and ensures that the source and destination datasets are an exact match before the final cutover.
 
 Please keep in mind that in busy systems it is perfectly normal for some records to be temporarily flagged as invalid until CDC has applied the latest changes. This is expected behavior, particularly in heavily used environments where frequent updates—often to the same records—are common. 
 
 #### Self-Healing & Auto-Retry
 
-docMongoStream includes active self-healing mechanisms to ensure statistics match reality:
+docStreamer includes active self-healing mechanisms to ensure statistics match reality:
 
-* Startup Reconciliation: On every process start, docMongoStream automatically scans the validation collections to fix any drift in statistics caused by previous crashes or race conditions.
+* Startup Reconciliation: On every process start, docStreamer automatically scans the validation collections to fix any drift in statistics caused by previous crashes or race conditions.
 * Idle Watchdog: A background process monitors the replication lag. When the system is idle (Lag $\approx$ 0s), it automatically re-queues known validation failures for a check. This clears out "false positives" that occurred because data was being updated during the initial validation check.
 
 #### Status
@@ -69,7 +69,7 @@ docMongoStream includes active self-healing mechanisms to ensure statistics matc
 The status api provides the current validation status. You can see the live validation statistics by running the status command. Look for the validation block:
 
 ```bash
-./docMongoStream status
+./docStreamer status
 ```
 
 Output Example (Healthy) -- this is just the section pertinent to the validation:
@@ -88,7 +88,7 @@ Output Example (Healthy) -- this is just the section pertinent to the validation
 
 Output Example (Systemic Failure with Cap Reached):
 
-If docMongoStream detects too many errors, it stops logging individual details to protect performance, but continues counting the total errors.
+If docStreamer detects too many errors, it stops logging individual details to protect performance, but continues counting the total errors.
 
 ```bash
 ...
@@ -107,7 +107,7 @@ If docMongoStream detects too many errors, it stops logging individual details t
 
 #### Dedicated Validation API
 
-docMongoStream also exposes the validator via its API (default port 8080) to interact with the validator manually. You can use the API to perform the following actions:
+docStreamer also exposes the validator via its API (default port 8080) to interact with the validator manually. You can use the API to perform the following actions:
 
 1. Check Specific Records
 
@@ -188,19 +188,19 @@ curl -X POST http://localhost:8080/validate/reset?mode=erase
 
 ## Resuming & Checkpointing
 
-State is managed entirely within the target MongoDB cluster using specific documents in the `docMongoStream.checkpoints` collection. docMongoStream uses a smart resume strategy to handle crashes at any stage.
+State is managed entirely within the target MongoDB cluster using specific documents in the `docStreamer.checkpoints` collection. docStreamer uses a smart resume strategy to handle crashes at any stage.
 
 1. The Anchor Checkpoint (`migration_anchor_timestamp`)
   * Purpose: Saved immediately before the first Full Load attempt begins. It locks in the Global Start Time ($\mathbf{T_0}$).
-  * Behavior: If docMongoStream crashes during the Full Load, this document remains. On restart, docMongoStream finds it, recognizes a "Partial Full Load," loads the list of already-completed collections, and resumes the migration for the remaining collections using this original timestamp.
+  * Behavior: If docStreamer crashes during the Full Load, this document remains. On restart, docStreamer finds it, recognizes a "Partial Full Load," loads the list of already-completed collections, and resumes the migration for the remaining collections using this original timestamp.
   
 2. The Global Checkpoint (`cdc_resume_timestamp`)
   * Purpose: Marks the successful completion of the entire Full Load phase or tracks progress during CDC.
-  * Behavior: Once the Full Load finishes for all collections, the Anchor is deleted and replaced by this Global Checkpoint. On restart, if this exists, docMongoStream skips the Full Load entirely and starts CDC.
+  * Behavior: Once the Full Load finishes for all collections, the Anchor is deleted and replaced by this Global Checkpoint. On restart, if this exists, docStreamer skips the Full Load entirely and starts CDC.
   
 ### Resume Logic Summary
 
-docMongoStream determines the start state based on which checkpoints exist in the target database:
+docStreamer determines the start state based on which checkpoints exist in the target database:
 
 * **Scenario A (Global Checkpoint exists):**
     * **State:** Full Load is 100% complete.
@@ -216,7 +216,7 @@ docMongoStream determines the start state based on which checkpoints exist in th
 
 ## Data Migration Strategy
 
-docMongoStream uses a mandatory two-phase approach—Full Load followed by Change Data Capture (CDC)—to achieve a non-blocking, consistent migration from Amazon DocumentDB.
+docStreamer uses a mandatory two-phase approach—Full Load followed by Change Data Capture (CDC)—to achieve a non-blocking, consistent migration from Amazon DocumentDB.
 
 ### Phase 1: Full Load (Snapshot)
 
@@ -228,11 +228,11 @@ Because the source is live, data on the destination will be logically inconsiste
 
 #### The "Live Tailing" 
 
-Standard segmentation logic often misses documents inserted "at the end" of a collection during a long-running copy. docMongoStream uses dynamic segmentation where the final query for every collection is open-ended (`_id >= Last_Min`). This guarantees that we capture every document present at the moment the worker finishes.
+Standard segmentation logic often misses documents inserted "at the end" of a collection during a long-running copy. docStreamer uses dynamic segmentation where the final query for every collection is open-ended (`_id >= Last_Min`). This guarantees that we capture every document present at the moment the worker finishes.
 
 #### Idempotent Writes (Upserts)
 
-To prevent fatal errors during the transition to CDC, all writes in docMongoStream are Idempotent.
+To prevent fatal errors during the transition to CDC, all writes in docStreamer are Idempotent.
 
 - **Operation:** ReplaceOne with Upsert: true.  
 - **Benefit:**  
@@ -245,11 +245,11 @@ The CDC phase serves as the Source of Truth for restoring consistency. It replay
 
 #### Global Time Capture ($\mathbf{T_0}$) & Anchor
 
-Before Discovery begins, docMongoStream captures the source cluster's current Cluster Time. This timestamp ($\mathbf{T_0}$) is immediately persisted to the target database as an "Anchor. This guarantees that if the Full Load process crashes and restarts multiple times, the starting point for the eventual CDC phase remains fixed at the very beginning of the migration. This ensures strictly zero data loss, even if the Full Load takes days to complete across multiple restarts.
+Before Discovery begins, docStreamer captures the source cluster's current Cluster Time. This timestamp ($\mathbf{T_0}$) is immediately persisted to the target database as an "Anchor. This guarantees that if the Full Load process crashes and restarts multiple times, the starting point for the eventual CDC phase remains fixed at the very beginning of the migration. This ensures strictly zero data loss, even if the Full Load takes days to complete across multiple restarts.
 
 #### Chronological Correction
 
-DocumentDB Change Streams deliver operations in strict chronological order. By replaying this stream from $\mathbf{T_0}$, docMongoStream corrects any inconsistencies left by the parallel Full Load.
+DocumentDB Change Streams deliver operations in strict chronological order. By replaying this stream from $\mathbf{T_0}$, docStreamer corrects any inconsistencies left by the parallel Full Load.
 
 #### Example: Out-of-Order Writes during Full Load
 
@@ -271,7 +271,7 @@ The transition to CDC requires a single, cluster-wide moment in time—the Check
 2. **Anchor Persistence:**  
     This timestamp ($\mathbf{T_0}$) is immediately saved to the `migration_anchor_timestamp` checkpoint in the target database. It serves as the fixed reference point for the duration of the Full Load.
     - If the load succeeds: The Anchor is promoted to the permanent `cdc_resume_timestamp` checkpoint.
-    - If the load fails: The Anchor remains in the database, allowing docMongoStream to find it on restart and resume exactly where it left off (using the original time) instead of starting over.
+    - If the load fails: The Anchor remains in the database, allowing docStreamer to find it on restart and resume exactly where it left off (using the original time) instead of starting over.
 
 2. **Tailing Start:**  
     When the CDC phase begins (after the Full Load completes), it opens the Change Stream starting exactly at $\mathbf{T_0}$.
@@ -336,16 +336,16 @@ Regardless of the state the Full Load left behind, the CDC process replays histo
 
 ## Internal Workflow
 
-Here is a more detailed but simple explanation of the inner workings of docMongoStream for each of the 2 stages (Full Load and CDC).
+Here is a more detailed but simple explanation of the inner workings of docStreamer for each of the 2 stages (Full Load and CDC).
 
 ### Full Sync (Load)
 
-Think of the Full Sync as a massive "Divide and Conquer" operation. Instead of trying to read the entire database at once (which would be slow and memory-heavy), docMongoStream splits the work into tiny, manageable chunks and processes them in a pipeline.
+Think of the Full Sync as a massive "Divide and Conquer" operation. Instead of trying to read the entire database at once (which would be slow and memory-heavy), docStreamer splits the work into tiny, manageable chunks and processes them in a pipeline.
 
 1. "Divide and Conquer" (Segmentation)\
-  Before copying any data, docMongoStream looks at the collection to figure out how to split it up:
-    - Find the Boundaries: docMongoStream asks the source for the very first _id (Minimum) and the very last _id (Maximum) currently in the collection.
-    - Create Segments : docMongoStream doesn't list all documents. Instead, it calculates logical ranges of _ids. For example, if you have 1 million documents and `cloner.segment_size_docs` is 10,000, it logically creates 100 "tickets" (segments).
+  Before copying any data, docStreamer looks at the collection to figure out how to split it up:
+    - Find the Boundaries: docStreamer asks the source for the very first _id (Minimum) and the very last _id (Maximum) currently in the collection.
+    - Create Segments : docStreamer doesn't list all documents. Instead, it calculates logical ranges of _ids. For example, if you have 1 million documents and `cloner.segment_size_docs` is 10,000, it logically creates 100 "tickets" (segments).
 
 2. The "Find" Logic (Read Workers)
   Several Read Workers run in parallel, grabbing those "tickets" and querying the source.
@@ -371,7 +371,7 @@ Think of the Full Sync as a massive "Divide and Conquer" operation. Instead of t
 
 ### CDC
 
-Think of CDC as "Live Tailing." Instead of reading static files, the docMongoStream subscribes to a live news feed of every single action happening on the DocumentDB cluster and replays it on the destination.
+Think of CDC as "Live Tailing." Instead of reading static files, the docStreamer subscribes to a live news feed of every single action happening on the DocumentDB cluster and replays it on the destination.
 
 1. The Starting Line "Time Zero" ($T_0$)\
   The most critical part of CDC is knowing where to start.
@@ -405,10 +405,10 @@ Think of CDC as "Live Tailing." Instead of reading static files, the docMongoStr
     - Translation (Idempotency): The worker translates operations (Insert -> Replace/Upsert) to handle the overlap with the Full Load phase safely.
           
 5. The Safety Net (Checkpoints)\
-  While all this is happening, the docMongoStream is constantly saving its place.
+  While all this is happening, the docStreamer is constantly saving its place.
     - Tracking
-      - Every time a batch is successfully applied, docMongoStream updates its internal tracker.
+      - Every time a batch is successfully applied, docStreamer updates its internal tracker.
     - Saving 
-      - It periodically writes the timestamp of the last successful event to the `docMongoStream.checkpoints` collection in MongoDB.
+      - It periodically writes the timestamp of the last successful event to the `docStreamer.checkpoints` collection in MongoDB.
     - Crash Recovery 
-      - If the server crashes or docMongoStream is stopped, docMongoStream restarts, reads that timestamp, and resumes the change stream from the exact millisecond it left off.
+      - If the server crashes or docStreamer is stopped, docStreamer restarts, reads that timestamp, and resumes the change stream from the exact millisecond it left off.

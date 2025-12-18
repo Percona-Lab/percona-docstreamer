@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/Percona-Lab/docMongoStream/internal/logging"
+	"github.com/Percona-Lab/percona-docstreamer/internal/logging"
 )
 
 // Server wraps a standard http.Server to provide a clean Start/Stop interface

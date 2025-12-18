@@ -1,6 +1,6 @@
-# docMongoStream API Reference
+# docStreamer API Reference
 
-The **docMongoStream API** provides endpoints for monitoring the migration status and managing on-demand data validation.  
+The **docStreamer API** provides endpoints for monitoring the migration status and managing on-demand data validation.  
 All endpoints are hosted by the internal API server (default: **port 8080**, configurable via `config.yaml` or environment variables).
 
 ## 1. Status and Monitoring Endpoints

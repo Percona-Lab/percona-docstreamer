@@ -102,7 +102,7 @@ var Cfg *Config
 func LoadConfig() {
 	// --- 1. Set Defaults ---
 	viper.SetDefault("logging.level", "info")
-	viper.SetDefault("logging.file_path", "logs/docMongoStream.log")
+	viper.SetDefault("logging.file_path", "logs/docStreamer.log")
 	viper.SetDefault("logging.ops_log_path", "logs/cdc.log")
 	viper.SetDefault("logging.full_load_log_path", "logs/full_load.log")
 
@@ -122,14 +122,14 @@ func LoadConfig() {
 	viper.SetDefault("migration.exclude_dbs", []string{"admin", "local", "config"})
 	viper.SetDefault("migration.exclude_collections", []string{})
 	viper.SetDefault("migration.max_concurrent_workers", 4)
-	viper.SetDefault("migration.metadata_db", "docMongoStream")
+	viper.SetDefault("migration.metadata_db", "docStreamer")
 	viper.SetDefault("migration.checkpoint_collection", "checkpoints")
 	viper.SetDefault("migration.checkpoint_doc_id", "cdc_resume_timestamp")
 	viper.SetDefault("migration.status_collection", "status")
 	viper.SetDefault("migration.status_doc_id", "migration_status")
 	viper.SetDefault("migration.validation_stats_collection", "validation_stats")
 	viper.SetDefault("migration.validation_failures_collection", "validation_failures")
-	viper.SetDefault("migration.pid_file_path", "./docMongoStream.pid")
+	viper.SetDefault("migration.pid_file_path", "./docStreamer.pid")
 	viper.SetDefault("migration.destroy", false)
 	viper.SetDefault("migration.dry_run", false)
 	viper.SetDefault("migration.env_prefix", "MIGRATION")
@@ -159,8 +159,8 @@ func LoadConfig() {
 	viper.SetConfigName("config")
 	viper.SetConfigType("yaml")
 	viper.AddConfigPath(".")
-	viper.AddConfigPath("/etc/docMongoStream")
-	viper.AddConfigPath("$HOME/.docMongoStream")
+	viper.AddConfigPath("/etc/docStreamer")
+	viper.AddConfigPath("$HOME/.docStreamer")
 
 	if err := viper.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); ok {

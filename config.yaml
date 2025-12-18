@@ -1,5 +1,5 @@
 # -----------------------------------------------
-# docMongoStream Configuration File
+# docStreamer Configuration File
 # -----------------------------------------------
 # This file is watched by the application at runtime.
 # Changes will be logged, and new settings will be
@@ -18,7 +18,7 @@ logging:
  
   # Path to the log file.
   # The directory will be created if it doesn't exist.
-  file_path: "logs/docMongoStream.log"
+  file_path: "logs/docStreamer.log"
  
   # Path to CDC ops log
   ops_log_path: "logs/cdc.log"
@@ -53,7 +53,7 @@ mongo:
 migration:
   # Prefix for environment variables (e.g., MIGRATION_DOCDB_USER)
   env_prefix: "MIGRATION"
-  pid_file_path: "docMongoStream.pid"
+  pid_file_path: "docStreamer.pid"
   # Port for the HTTP /status endpoint
   status_http_port: "8080"
   network_compressors: "zlib,snappy"
@@ -70,12 +70,12 @@ migration:
  
   # max_concurrent_workers: This is the max number of collections to copy at the same time
   # Controls how many collections are migrated simultaneously during the full load stage
-  # Example: If you have 50 collections and set this to 2, docMongoStream will migrate 2 collections at a time.
+  # Example: If you have 50 collections and set this to 2, docStreamer will migrate 2 collections at a time.
   # As soon as one finishes, the next one starts.
   max_concurrent_workers: 2
  
   # Database and collections to keep track of the migration
-  metadata_db: "docMongoStream"
+  metadata_db: "docStreamer"
   checkpoint_collection: "checkpoints"
   checkpoint_doc_id: "cdc_resume_timestamp"
   status_collection: "status"

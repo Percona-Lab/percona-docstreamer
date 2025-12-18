@@ -1,15 +1,15 @@
-# docMongoStream: Migration & Sync Tool
+# Percona docStreamer: Migration & Sync Tool
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-________            ______  ___                                ____________                               
-___  __ \______________   |/  /___________________ ______      __  ___/_  /__________________ _______ ___ 
-__  / / /  __ \  ___/_  /|_/ /_  __ \_  __ \_  __ `/  __ \     _____ \_  __/_  ___/  _ \  __ `/_  __ `__ \
-_  /_/ // /_/ / /__ _  /  / / / /_/ /  / / /  /_/ // /_/ /     ____/ // /_ _  /   /  __/ /_/ /_  / / / / /
-/_____/ \____/\___/ /_/  /_/  \____//_/ /_/_\__, / \____/      /____/ \__/ /_/    \___/\__,_/ /_/ /_/ /_/ 
-                                           /____/      
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ 
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+_________           ____________                                           
+______  ╱_____________  ___╱_  ╱__________________ _______ ________________
+_  __  ╱_  __ ╲  ___╱____ ╲_  __╱_  ___╱  _ ╲  __ `╱_  __ `__ ╲  _ ╲_  ___╱
+╱ ╱_╱ ╱ ╱ ╱_╱ ╱ ╱__ ____╱ ╱╱ ╱_ _  ╱   ╱  __╱ ╱_╱ ╱_  ╱ ╱ ╱ ╱ ╱  __╱  ╱    
+╲__,_╱  ╲____╱╲___╱ ╱____╱ ╲__╱ ╱_╱    ╲___╱╲__,_╱ ╱_╱ ╱_╱ ╱_╱╲___╱╱_╱     
+                                                                           
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-docMongoStream automates the complete, end-to-end migration from an Amazon DocumentDB cluster to any self-managed MongoDB instance. It is a high-performance tool written in Go for performing a full data load and continuous data capture (CDC) migrations. It provides a resilient, two-phase migration process:
+Percona docStreamer automates the complete, end-to-end migration from an Amazon DocumentDB cluster to any self-managed MongoDB instance. It is a high-performance tool written in Go for performing a full data load and continuous data capture (CDC) migrations. It provides a resilient, two-phase migration process:
 
 * Full Sync: A parallelized, high-speed copy of all existing data from source collections.
 * Continuous Sync (CDC): Opens a change stream on the source DocumentDB to capture all inserts, updates, deletes and DDLs (with a few exceptions), applying them in batches to the target MongoDB for real-time synchronization.
@@ -39,7 +39,7 @@ You MUST enable change streams on your source DocumentDB cluster, change streams
 | Database | Action Required | Command (Mongo Shell) |
 | :--- | :--- | :--- |
 | **DocumentDB (Source)** | **A. Download CA Certificate** | Go to your AWS account and download the CA Cert |
-| **Source and Target** | **B. Ensure both are running and you are able to connect** | Ensure the service is active and listening on the configured IP/port. Make sure any firewall rules have also been configured accordingly and you are able to connect to both clusters from the host running docMongoStream |
+| **Source and Target** | **B. Ensure both are running and you are able to connect** | Ensure the service is active and listening on the configured IP/port. Make sure any firewall rules have also been configured accordingly and you are able to connect to both clusters from the host running docStreamer |
 | **DocumentDB (Source)** | **C. ENABLE CHANGE STREAMS IN DOCUMENTDB** | This might need to be done for each collection depending on your use case. |
 
 You can obtain the DocumentDB AWS CA cert for your cluster by going to the AWS console and browsing to DocumentDB --> Clusters --> <cluster_name_here> and then click on the `Connectivity & Security` tab (sample screenshot below). This is also where you need to gather your DocumentDB URI, in order to configure it in the `config.yaml`.
@@ -48,7 +48,7 @@ You can obtain the DocumentDB AWS CA cert for your cluster by going to the AWS c
 
 #### How to enable change streams in DocumentDB
 
-docMongoStream was designed to run these checks for you automatically, but it does not make these changes for you. 
+Percona docStreamer was designed to run these checks for you automatically, but it does not make these changes for you. 
 DocumentDB requires change streams to be explicitly enabled. Once you have modified the parameter groups accordingly you can then proceed to enabling the Cluster Stream. Connect to your DocumentDB cluster via a mongo shell and run the command below to enable the cluster-wide stream in your DocumentDB cluster:
 
 ```bash
@@ -74,9 +74,9 @@ db.adminCommand({modifyChangeStreams: 1, database: "percona_db_1", collection: "
 
 ### Best Practices & Safety Precautions
 
-To ensure data integrity and prevent accidental data loss during migration, we recommend following these guidelines before initiating a docMongoStream process.
+To ensure data integrity and prevent accidental data loss during migration, we recommend following these guidelines before initiating a docStreamer process.
 
- - Backup Your Destination ***(if the destination environment contains data)*** Because docMongoStream will overwrite documents with matching _ids, always create a backup of your destination database before running a Full Sync. This ensures you can roll back if valid data is accidentally overwritten.
+ - Backup Your Destination ***(if the destination environment contains data)*** Because Percona docStreamer will overwrite documents with matching _ids, always create a backup of your destination database before running a Full Sync. This ensures you can roll back if valid data is accidentally overwritten.
 
  - Audit Existing Collections: ***(if the destination environment contains data)*** Check your destination database to see if collections with the same names as your source already exist. If they do, verify if the data is intended to be merged. If not, consider renaming the source or destination collection.
 
@@ -94,13 +94,13 @@ Migration from DocumentDB sharded clusters has not been tested and therefore the
 
 AWS DocumentDB enforces service quotas, including limits on the number of cursors and the rate of getMore operations, which are fundamental to how change streams work.
 
-Symptom: If the migration falls too far behind (e.g., after being stopped for a long time) or if there is a massive burst of write activity, the docMongoStream tool may hit these rate limits. This can cause the change stream to fail or be terminated by AWS.
+Symptom: If the migration falls too far behind (e.g., after being stopped for a long time) or if there is a massive burst of write activity, docStreamer may hit these rate limits. This can cause the change stream to fail or be terminated by AWS.
 
-Behavior: docMongoStream is designed to be resilient and will attempt to retry and resume the stream. However, persistent rate-limiting from the DocumentDB side may require intervention (e.g., scaling your DocumentDB instance or running the migration during off-peak hours).
+Behavior: Percona docStreamer is designed to be resilient and will attempt to retry and resume the stream. However, persistent rate-limiting from the DocumentDB side may require intervention (e.g., scaling your DocumentDB instance or running the migration during off-peak hours).
 
 ### DDL Operation Support During CDC Stage
 
-docMongoStream has support for replicating most DDL operations during the CDC stage (after the full sync has completed).
+Percona docStreamer has support for replicating most DDL operations during the CDC stage (after the full sync has completed).
 
 Supported: drop (collection), dropDatabase, rename (collection), create (collection). 
 
@@ -108,7 +108,7 @@ Supported: drop (collection), dropDatabase, rename (collection), create (collect
 
 ### Supported Index Types
 
-docMongoStream automatically handles the creation of indexes during the Full Sync stage to ensure your destination performance matches the source. However, there are specific limitations regarding index types.
+Percona docStreamer automatically handles the creation of indexes during the Full Sync stage to ensure your destination performance matches the source. However, there are specific limitations regarding index types.
 
 Currently Supported:
 
@@ -123,9 +123,9 @@ The following index types are not migrated during the Full Sync and must be crea
 
 ***Note:*** We recommend reviewing your source indexes prior to migration. If your application relies heavily on text search or partial indexing, plan to run a post-migration script to reconstruct these specific indexes on the destination cluster.
 
-## Installing docMongoStream
+## Installing Percona docStreamer
 
-We recommend you have a dedicated server to run docMongoStream. 
+We recommend you have a dedicated server to run Percona docStreamer. 
 
 ### Host Sizing Recommendations
 
@@ -165,7 +165,7 @@ All you need to do is follow 3 steps:
 
 ### The hard way
 
-You might want to compile docMongoStream for a different architecture (not tested) other than linux, so in order to do that you will just need to follow a few steps:
+You might want to compile Percona docStreamer for a different architecture (not tested) other than linux, so in order to do that you will just need to follow a few steps:
 
 1. Clone this repo
 2. Make whatever changes to the application you want (not required)
@@ -174,12 +174,12 @@ You might want to compile docMongoStream for a different architecture (not teste
 Build for linux
 
 ```bash
-GOOS=linux GOARCH=amd64 go build -o ./bin/docMongoStream ./cmd/docMongoStream/
+GOOS=linux GOARCH=amd64 go build -o ./bin/docStreamer ./cmd/docStreamer/
 ```
 
 Build for your current OS and Architecture
 ```bash
-go build -o ./bin/docMongoStream ./cmd/docMongoStream/
+go build -o ./bin/docStreamer ./cmd/docStreamer/
 ```
 
 ## Configure Users
@@ -206,7 +206,7 @@ db.getSiblingDB('admin').createUser({
   });
 ```  
 
-## Configuring docMongoStream
+## Configuring Percona docStreamer
 
 The application is configured via the [config.yaml](./config.yaml) file in the application's root directory. You will need to at the very least edit the source and destination parameters. 
 
@@ -229,7 +229,7 @@ mongo:
   extra_params: ""
 ```  
 
-docMongoStream configuration options are self explanatory and documented within the configuration file itself. The only parameters you have to pass to the application at runtime are the usernames for the source and destination environments, the passwords for each are interactive and you will be prompted for it accordingly. You can also configure environment variables so you don't have to type them if you prefer, the choice is yours.
+Percona docStreamer configuration options are self explanatory and documented within the configuration file itself. The only parameters you have to pass to the application at runtime are the usernames for the source and destination environments, the passwords for each are interactive and you will be prompted for it accordingly. You can also configure environment variables so you don't have to type them if you prefer, the choice is yours.
 
 ### Credentials
 
@@ -251,12 +251,12 @@ Credentials for the source and target databases are required. They can be provid
     * If passwords (`MIGRATION_DOCDB_PASS`, `MIGRATION_MONGO_PASS`) are not set as environment variables, the start command will securely prompt you to enter them. This is the recommended approach. You can not provide passwords as command line arguments for security purposes.
 
 ```bash
-./docMongoStream help
-docMongoStream is a tool for performing a full load and continuous data
+./docStreamer help
+docStreamer is a tool for performing a full load and continuous data
 capture (CDC) migration from AWS DocumentDB to MongoDB.
 
 Usage:
-  docMongoStream [command]
+  docStreamer [command]
 
 Available Commands:
   help        Help about any command
@@ -267,15 +267,15 @@ Available Commands:
 
 Flags:
       --docdb-user string   Source DocumentDB Username
-  -h, --help                help for docMongoStream
+  -h, --help                help for docStreamer
       --mongo-user string   Target MongoDB Username
 
-Use "docMongoStream [command] --help" for more information about a command.
+Use "docStreamer [command] --help" for more information about a command.
 ```
 
 ### Customization
 
-docMongoStream can fully synchronize the source and destination clusters, and it also allows you to configure some aspects of the migration through its config.yaml file.
+Percona docStreamer can fully synchronize the source and destination clusters, and it also allows you to configure some aspects of the migration through its config.yaml file.
 
 1. Exclude databases
 
@@ -328,256 +328,222 @@ dry_run: False
 
 You can modify any configuration through the [config.yaml](./config.yaml) file, including log locations and performance-related parameters. All options are clearly documented, and you are free to adjust them as needed.
 
-## How to Use docMongoStream
+## How to Use Percona docStreamer
 
-docMongoStream runs as a background process that is controlled through a small set of simple commands, making its operation straightforward. After updating the configuration file to match your environment, you can execute the appropriate commands for each specific use case as shown below.
+Percona docStreamer runs as a background process that is controlled through a small set of simple commands, making its operation straightforward. After updating the configuration file to match your environment, you can execute the appropriate commands for each specific use case as shown below.
 
 In general, the data-migration workflow from source to destination follows these steps:
 
-1. Configure docMongoStream as explained above
-2. Run `docMongoStream start`
-3. When ready to cutover, run `docMongoStream stop`
+1. Configure Percona docStreamer as explained above
+2. Run `docStreamer start`
+3. When ready to cutover, run `docStreamer stop`
 
 ### Start
 
-The start command can be used to start a brand new migration and to resume a migration that has been stopped. docMongoStream will check if a full migration has already completed and it will resume from the last checkpoint.  
+The start command can be used to start a brand new migration and to resume a migration that has been stopped. Percona docStreamer will check if a full migration has already completed and it will resume from the last checkpoint.  
 
 ```bash
-./docMongoStream start --docdb-user=your_docdb_user --mongo-user=your_mongo_user
+./docStreamer start --docdb-user=your_docdb_user --mongo-user=your_mongo_user
 ```
 <details>
 <summary>Sample output:</summary>
 
 ```bash
-2025/11/20 19:14:44
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-________            ______  ___                                ____________
-___  __ \______________   |/  /___________________ ______      __  ___/_  /__________________ _______ ___
-__  / / /  __ \  ___/_  /|_/ /_  __ \_  __ \_  __ `/  __ \     _____ \_  __/_  ___/  _ \  __ `/_  __ `__ \
-_  /_/ // /_/ / /__ _  /  / / / /_/ /  / / /  /_/ // /_/ /     ____/ // /_ _  /   /  __/ /_/ /_  / / / / /
-/_____/ \____/\___/ /_/  /_/  \____//_/ /_/\__, / \____/      /____/ \__/ /_/    \___/\__,_/ /_/ /_/ /_/
-                                           /____/
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+2025/12/18 11:08:43
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+_________           ____________
+______  /_____________  ___/_  /__________________ _______ ________________
+_  __  /_  __ \  ___/____ \_  __/_  ___/  _ \  __ `/_  __ `__ \  _ \_  ___/
+/ /_/ / / /_/ / /__ ____/ // /_ _  /   /  __/ /_/ /_  / / / / /  __/  /
+\__,_/  \____/\___/ /____/ \__/ /_/    \___/\__,_/ /_/ /_/ /_/\___//_/
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-2025/11/20 19:14:44 --- docMongoStream Application Start ---
-2025/11/20 19:14:44
+2025/12/18 11:08:43
 --- Phase 1: VALIDATION ---
-2025/11/20 19:14:44 [TASK] Connecting to source DocumentDB...
-2025/11/20 19:14:44 [TASK] Connecting to target MongoDB...
-2025/11/20 19:14:45 [OK]   Connections successful.
-2025/11/20 19:14:45 [TASK] Validating DocumentDB Change Stream configuration...
-2025/11/20 19:14:45 [INFO] [VALIDATE] Running $listChangeStreams on admin DB...
-2025/11/20 19:14:45 [INFO] [VALIDATE] Found 15 enabled change streams:
-2025/11/20 19:14:45 [INFO] [VALIDATE]   - my_awesome_app.*
-2025/11/20 19:14:45 [INFO] [VALIDATE]   - my_awesome_app.users
-2025/11/20 19:14:45 [INFO] [VALIDATE]   - percona_db_1.test_1
-2025/11/20 19:14:45 [INFO] [VALIDATE]   - percona_db_1.test_5
-2025/11/20 19:14:45 [INFO] [VALIDATE]   - percona_db_1.test_2
-2025/11/20 19:14:45 [INFO] [VALIDATE]   - percona_db_1.test_3
-2025/11/20 19:14:45 [INFO] [VALIDATE]   - percona_db_1.test_4
-2025/11/20 19:14:45 [INFO] [VALIDATE]   - percona_db_2.test_1
-2025/11/20 19:14:45 [INFO] [VALIDATE]   - percona_db_2.test_2
-2025/11/20 19:14:45 [INFO] [VALIDATE]   - percona_db_2.test_3
-2025/11/20 19:14:45 [INFO] [VALIDATE]   - percona_db_2.test_4
-2025/11/20 19:14:45 [INFO] [VALIDATE]   - percona_db_2.test_5
-2025/11/20 19:14:45 [INFO] [VALIDATE]   - tobeignored.skipme_1
-2025/11/20 19:14:45 [INFO] [VALIDATE]   - alpha.test_1
-2025/11/20 19:14:45 [INFO] [VALIDATE]   - CLUSTER_WIDE (*.*)
-2025/11/20 19:14:45 [OK]   DocumentDB Change Stream configuration is valid.
-2025/11/20 19:14:45
+2025/12/18 11:08:43 [TASK] Connecting to source DocumentDB...
+2025/12/18 11:08:44 [TASK] Connecting to target MongoDB...
+2025/12/18 11:08:44 [OK]   Connections successful.
+2025/12/18 11:08:44 [TASK] Validating DocumentDB Change Stream configuration...
+2025/12/18 11:08:44 [INFO] [VALIDATE] Running $listChangeStreams on admin DB...
+2025/12/18 11:08:44 [INFO] [VALIDATE] Found 15 enabled change streams:
+2025/12/18 11:08:44 [INFO] [VALIDATE]   - my_awesome_app.*
+2025/12/18 11:08:44 [INFO] [VALIDATE]   - my_awesome_app.users
+2025/12/18 11:08:44 [INFO] [VALIDATE]   - percona_db_1.test_1
+2025/12/18 11:08:44 [INFO] [VALIDATE]   - percona_db_1.test_5
+2025/12/18 11:08:44 [INFO] [VALIDATE]   - percona_db_1.test_2
+2025/12/18 11:08:44 [INFO] [VALIDATE]   - percona_db_1.test_3
+2025/12/18 11:08:44 [INFO] [VALIDATE]   - percona_db_1.test_4
+2025/12/18 11:08:44 [INFO] [VALIDATE]   - percona_db_2.test_1
+2025/12/18 11:08:44 [INFO] [VALIDATE]   - percona_db_2.test_2
+2025/12/18 11:08:44 [INFO] [VALIDATE]   - percona_db_2.test_3
+2025/12/18 11:08:44 [INFO] [VALIDATE]   - percona_db_2.test_4
+2025/12/18 11:08:44 [INFO] [VALIDATE]   - percona_db_2.test_5
+2025/12/18 11:08:44 [INFO] [VALIDATE]   - tobeignored.skipme_1
+2025/12/18 11:08:44 [INFO] [VALIDATE]   - alpha.test_1
+2025/12/18 11:08:44 [INFO] [VALIDATE]   - CLUSTER_WIDE (*.*)
+2025/12/18 11:08:44 [OK]   DocumentDB Change Stream configuration is valid.
+2025/12/18 11:08:44
 --- Phase 2: LAUNCHING BACKGROUND PROCESS ---
-2025/11/20 19:14:45 [OK]   Application started in background with PID: 1841063
-2025/11/20 19:14:45 [INFO] Writing PID 1841063 to ./docMongoStream.pid
-2025/11/20 19:14:45 [INFO] Status manager initialized (collection: docMongoStream.status)
-2025/11/20 19:14:45 [INFO] [STATUS] State changed to: connecting (Connections established. Pinging...)
-2025/11/20 19:14:45 [INFO] Starting status HTTP server on :8080/status
-2025/11/20 19:14:46 [INFO] Checkpoint manager initialized (collection: docMongoStream.checkpoints)
-2025/11/20 19:14:46 [INFO] [CDC cdc_resume_timestamp] Found resume timestamp: {1763682329 1002}
-2025/11/20 19:14:46
---- Phase 1: DISCOVERY (SKIPPED) ---
-2025/11/20 19:14:46
---- Phase 2: FULL DATA LOAD (SKIPPED) ---
-2025/11/20 19:14:46 [INFO] Resuming CDC from global checkpoint: {1763682329 1002}
-2025/11/20 19:14:46
---- Phase 3: CONTINUOUS SYNC (CDC) ---
-2025/11/20 19:14:46 [INFO] [STATUS] State changed to: running (Change Data Capture)
-2025/11/20 19:14:46 [INFO] [CDC cdc_resume_timestamp] Found resume timestamp: {1763682329 1002}
-2025/11/20 17:59:58 [TASK] [lws_1.test_4] Processed batch: 1000 inserted, 0 replaced. (310 kB) in 563.608945ms
-2025/11/20 19:14:46 [INFO] [CDC] Resuming event count from 440000
-2025/11/20 19:14:46 [INFO] Starting cluster-wide CDC... Resuming from checkpoint: {1763682329 1002}
-2025/11/20 19:14:46 [INFO] [CDC] Starting 4 concurrent write workers...
-2025/11/20 19:14:46 [TASK] [CDC] Starting cluster-wide change stream watcher...
+2025/12/18 11:08:44 [OK]   Application started in background with PID: 2987556
+2025/12/18 11:08:44 [INFO] Writing PID 2987556 to docStreamer.pid
+2025/12/18 11:08:44 [INFO] Checkpoint manager initialized (collection: docStreamer.checkpoints)
+2025/12/18 11:08:44 [INFO] [CDC cdc_resume_timestamp] No resume timestamp found in checkpoint database.
+2025/12/18 11:08:44 [INFO] No valid global checkpoint or anchor found. Starting fresh.
+2025/12/18 11:08:44 [INFO] Cleaning up stale metadata (Status, Checkpoints, Validation)...
+2025/12/18 11:08:44 [OK]   Metadata cleanup complete.
+2025/12/18 11:08:44 [INFO] Status manager initialized (collection: docStreamer.status)
+2025/12/18 11:08:44 [INFO] [VAL] Starting 4 parallel CDC validation workers...
+2025/12/18 11:08:44 [INFO] [STATUS] State changed to: connecting (Connections established. Pinging...)
+2025/12/18 11:08:44 [INFO] API Server starting on port 8080...
+2025/12/18 11:08:45 [INFO] Captured global T0 (Pre-Discovery): {1766074125 3}
+2025/12/18 11:08:45
+--- Phase 3: DISCOVERY ---
+2025/12/18 11:08:45 [INFO] [STATUS] State changed to: discovering (Discovering collections to migrate...)
+2025/12/18 11:08:45 [TASK] Discovering databases and collections...
+2025/12/18 11:08:45 [TASK] Scanning DB: ind_1
+2025/12/18 11:08:46 [WARN] Skipping text index 'description_text' on ind_1.users_1
+2025/12/18 11:08:46 [WARN] Skipping partial index 'department_1' on ind_1.users_1
+2025/12/18 11:08:53 [INFO] - Found: ind_1.users_1 (84000 documents, 4 indexes) [Range Scan]
+2025/12/18 11:08:53 [WARN] Skipping text index 'description_text' on ind_1.users_2
+2025/12/18 11:08:53 [WARN] Skipping partial index 'department_1' on ind_1.users_2
+2025/12/18 11:08:57 [INFO] - Found: ind_1.users_2 (72000 documents, 4 indexes) [Range Scan]
+2025/12/18 11:08:57 [WARN] Skipping text index 'description_text' on ind_1.users_3
+2025/12/18 11:08:57 [WARN] Skipping partial index 'department_1' on ind_1.users_3
+2025/12/18 11:09:01 [INFO] - Found: ind_1.users_3 (72000 documents, 4 indexes) [Range Scan]
+2025/12/18 11:09:01 [TASK] Scanning DB: ind_2
+2025/12/18 11:09:03 [WARN] Skipping text index 'description_text' on ind_2.users_1
+2025/12/18 11:09:03 [WARN] Skipping partial index 'department_1' on ind_2.users_1
+2025/12/18 11:09:07 [INFO] - Found: ind_2.users_1 (72000 documents, 4 indexes) [Range Scan]
+2025/12/18 11:09:07 [WARN] Skipping text index 'description_text' on ind_2.users_2
+2025/12/18 11:09:07 [WARN] Skipping partial index 'department_1' on ind_2.users_2
+2025/12/18 11:09:11 [INFO] - Found: ind_2.users_2 (69000 documents, 4 indexes) [Range Scan]
+2025/12/18 11:09:11 [WARN] Skipping text index 'description_text' on ind_2.users_3
+2025/12/18 11:09:11 [WARN] Skipping partial index 'department_1' on ind_2.users_3
+2025/12/18 11:09:14 [INFO] - Found: ind_2.users_3 (69000 documents, 4 indexes) [Range Scan]
+2025/12/18 11:09:14 [TASK] Scanning DB: ind_3
+2025/12/18 11:09:15 [WARN] Skipping text index 'description_text' on ind_3.users_1
+2025/12/18 11:09:15 [WARN] Skipping partial index 'department_1' on ind_3.users_1
+2025/12/18 11:09:17 [INFO] - Found: ind_3.users_1 (66000 documents, 4 indexes) [Range Scan]
+2025/12/18 11:09:18 [WARN] Skipping text index 'description_text' on ind_3.users_2
+2025/12/18 11:09:18 [WARN] Skipping partial index 'department_1' on ind_3.users_2
+2025/12/18 11:09:20 [INFO] - Found: ind_3.users_2 (63000 documents, 4 indexes) [Range Scan]
+2025/12/18 11:09:21 [WARN] Skipping text index 'description_text' on ind_3.users_3
+2025/12/18 11:09:21 [WARN] Skipping partial index 'department_1' on ind_3.users_3
+2025/12/18 11:09:23 [INFO] - Found: ind_3.users_3 (63000 documents, 4 indexes) [Range Scan]
+2025/12/18 11:09:23 [TASK] Scanning DB: custom_ids
+2025/12/18 11:09:29 [WARN] [custom_ids.capped_coll] Strategy Override: Mixed Types detected in samples (128-bit decimal vs string). Switching to Linear Scan.
+2025/12/18 11:09:29 [INFO] - Found: custom_ids.capped_coll (41239 documents, 0 indexes) [LINEAR SCAN (Safety Override)]
+2025/12/18 11:09:34 [WARN] [custom_ids.regular_coll] Strategy Override: Mixed Types detected in samples (128-bit decimal vs string). Switching to Linear Scan.
+2025/12/18 11:09:34 [INFO] - Found: custom_ids.regular_coll (43484 documents, 0 indexes) [LINEAR SCAN (Safety Override)]
+2025/12/18 11:09:39 [WARN] [custom_ids.regular_coll2] Strategy Override: Mixed Types detected in samples (128-bit decimal vs string). Switching to Linear Scan.
+2025/12/18 11:09:39 [INFO] - Found: custom_ids.regular_coll2 (41622 documents, 0 indexes) [LINEAR SCAN (Safety Override)]
+2025/12/18 11:09:39 [TASK] Scanning DB: docflights
+2025/12/18 11:09:44 [INFO] - Found: docflights.delta (154610 documents, 4 indexes) [Range Scan]
+2025/12/18 11:09:44 [TASK] Scanning DB: sea_1
+2025/12/18 11:09:45 [WARN] Skipping text index 'description_text' on sea_1.users_1
+2025/12/18 11:09:45 [WARN] Skipping partial index 'department_1' on sea_1.users_1
+2025/12/18 11:09:45 [INFO] - Found: sea_1.users_1 (3 documents, 4 indexes) [Range Scan]
+2025/12/18 11:09:45 [WARN] Skipping text index 'description_text' on sea_1.users_2
+2025/12/18 11:09:45 [WARN] Skipping partial index 'department_1' on sea_1.users_2
+2025/12/18 11:09:45 [INFO] - Found: sea_1.users_2 (101 documents, 4 indexes) [Range Scan]
+2025/12/18 11:09:46 [WARN] Skipping text index 'description_text' on sea_1.users_3
+2025/12/18 11:09:46 [WARN] Skipping partial index 'department_1' on sea_1.users_3
+2025/12/18 11:09:46 [INFO] - Found: sea_1.users_3 (24 documents, 4 indexes) [Range Scan]
+2025/12/18 11:09:46 [TASK] Scanning DB: cvg_1
+2025/12/18 11:09:46 [WARN] Skipping text index 'description_text' on cvg_1.bingo_1
+2025/12/18 11:09:46 [WARN] Skipping partial index 'department_1' on cvg_1.bingo_1
+2025/12/18 11:09:51 [INFO] - Found: cvg_1.bingo_1 (3657 documents, 4 indexes) [Range Scan]
+2025/12/18 11:09:51 [WARN] Skipping text index 'description_text' on cvg_1.bingo_2
+2025/12/18 11:09:51 [WARN] Skipping partial index 'department_1' on cvg_1.bingo_2
+2025/12/18 11:09:56 [INFO] - Found: cvg_1.bingo_2 (3001 documents, 5 indexes) [Range Scan]
+2025/12/18 11:09:56 [WARN] Skipping text index 'description_text' on cvg_1.bingo_3
+2025/12/18 11:09:56 [WARN] Skipping partial index 'department_1' on cvg_1.bingo_3
+2025/12/18 11:10:00 [INFO] - Found: cvg_1.bingo_3 (3000 documents, 4 indexes) [Range Scan]
+2025/12/18 11:10:00 [OK]   Discovered 19 total collections to migrate.
+2025/12/18 11:10:00
+--- Phase 4: FULL DATA LOAD ---
+2025/12/18 11:10:00 [INFO] [STATUS] State changed to: running (Initial Sync (Full Load))
+2025/12/18 11:10:00 [TASK] Starting collection worker pool with 2 concurrent workers...
+2025/12/18 11:10:00 [TASK] [Worker 1] Starting full load for ind_1.users_2
+2025/12/18 11:10:00 [INFO] [ind_1.users_2] Source collection has 72000 documents.
+2025/12/18 11:10:00 [TASK] [Worker 0] Starting full load for ind_1.users_1
+2025/12/18 11:10:00 [INFO] [ind_1.users_1] Source collection has 84000 documents.
+2025/12/18 11:10:00 [INFO] [CDC cdc_resume_timestamp] No resume timestamp found in checkpoint database.
+2025/12/18 11:10:00 [INFO] [CDC cdc_resume_timestamp] No resume timestamp found in checkpoint database.
+2025/12/18 11:10:00 [TASK] [ind_1.users_1] Using local start time (T0): {1766074200 1}
+2025/12/18 11:10:00 [INFO] [ind_1.users_1] Creating target collection...
+2025/12/18 11:10:00 [INFO] [ind_1.users_1] Starting creation of 4 indexes...
+2025/12/18 11:10:01 [TASK] [ind_1.users_2] Using local start time (T0): {1766074200 2}
+2025/12/18 11:10:01 [INFO] [ind_1.users_2] Creating target collection...
+2025/12/18 11:10:01 [INFO] [ind_1.users_1] Submitted 4 indexes in 68.40749ms: [age_1 name_1_status_1 hobbies_1 email_1]
+2025/12/18 11:10:01 [TASK] [ind_1.users_1] Starting parallel data load...
+2025/12/18 11:10:01 [INFO] [users_1] Initializing Segmenter. Configured Segment Size: 10000
+2025/12/18 11:10:01 [TASK] [ind_1.users_1] Read Worker 0 started
+2025/12/18 11:10:01 [TASK] [ind_1.users_1] Read Worker 3 started
+2025/12/18 11:10:01 [TASK] [ind_1.users_1] Read Worker 1 started
+2025/12/18 11:10:01 [TASK] [ind_1.users_1] Read Worker 2 started
+2025/12/18 11:10:01 [INFO] [ind_1.users_2] Starting creation of 4 indexes...
+2025/12/18 11:10:01 [OK]   Application is healthy (State: running).
 ```
 </details>
 
 ### Stop
 
 ```bash
-./docMongoStream stop
+./docStreamer stop
 ```
-
-<details>
-<summary>Sample Output:</summary>
-
-```bash
-2025/11/20 21:55:16
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-________            ______  ___                                ____________
-___  __ \______________   |/  /___________________ ______      __  ___/_  /__________________ _______ ___
-__  / / /  __ \  ___/_  /|_/ /_  __ \_  __ \_  __ `/  __ \     _____ \_  __/_  ___/  _ \  __ `/_  __ `__ \
-_  /_/ // /_/ / /__ _  /  / / / /_/ /  / / /  /_/ // /_/ /     ____/ // /_ _  /   /  __/ /_/ /_  / / / / /
-/_____/ \____/\___/ /_/  /_/  \____//_/ /_/\__, / \____/      /____/ \__/ /_/    \___/\__,_/ /_/ /_/ /_/
-                                           /____/
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-2025/11/20 21:55:16
---- Phase X: STOPPING APPLICATION ---
-2025/11/20 21:55:16 [OK]   Stop signal sent.
-2025/11/20 21:55:16 [OK]   Stop signal sent.
-2025/11/20 21:55:16 [WARN] Received signal: terminated. Initiating graceful shutdown...
-2025/11/20 21:55:16 [INFO] !!! PLEASE WAIT: Flushing final CDC batches to destination...
-2025/11/20 21:55:16 [INFO] !!! DO NOT FORCE QUIT (Ctrl+C), or data may be lost.
-2025/11/20 21:55:16 [INFO] [STATUS] State changed to: stopping (Flushing pending events... Please wait.)
-2025/11/20 21:55:16 [INFO] [CDC] Processor shutting down. Flushing final batch...
-2025/11/20 21:55:16 [INFO] [Worker 1] Shutting down.
-2025/11/20 21:55:16 [INFO] [Worker 2] Shutting down.
-2025/11/20 21:55:16 [INFO] [Worker 3] Shutting down.
-2025/11/20 21:55:16 [INFO] [Worker 0] Shutting down.
-2025/11/20 21:55:16 [INFO] [CDC] Watcher stopped. Waiting for processor to finalize...
-2025/11/20 21:55:16 [INFO] [CDC cdc_resume_timestamp] Found resume timestamp: {1763682329 1002}
-2025/11/20 21:55:16 [INFO] [CDC] Processor finalized. Shutdown complete.
-2025/11/20 21:55:16 [INFO] CDC process stopped. Exiting.
-```
-
-</details>
 
 ### Restart
 
 You can use this command when you need to apply configuration changes and then restart the existing migration. This is particularly useful after making optimization adjustments to ensure the migration reloads and restarts with the updated settings.
 
 ```bash
-./docMongoStream restart
+./docStreamer restart
 ```
-
-<details>
-<summary>Sample output:</summary>
-
-```bash
-./docMongoStream restart
-2025/11/24 22:22:42
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-________            ______  ___                                ____________
-___  __ \______________   |/  /___________________ ______      __  ___/_  /__________________ _______ ___
-__  / / /  __ \  ___/_  /|_/ /_  __ \_  __ \_  __ `/  __ \     _____ \_  __/_  ___/  _ \  __ `/_  __ `__ \
-_  /_/ // /_/ / /__ _  /  / / / /_/ /  / / /  /_/ // /_/ /     ____/ // /_ _  /   /  __/ /_/ /_  / / / / /
-/_____/ \____/\___/ /_/  /_/  \____//_/ /_/\__, / \____/      /____/ \__/ /_/    \___/\__,_/ /_/ /_/ /_/
-                                           /____/
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-2025/11/24 22:22:42
---- Phase X: STOPPING FOR RESTART ---
-2025/11/24 22:22:42 [OK]   Stop signal sent.
-2025/11/24 22:22:42 [OK]   Stop signal sent.
-2025/11/24 22:22:42 [WARN] Received signal: terminated. Initiating graceful shutdown...
-2025/11/24 22:22:42 [INFO] !!! PLEASE WAIT: Flushing final CDC batches to destination...
-2025/11/24 22:22:42 [INFO] !!! DO NOT FORCE QUIT (Ctrl+C), or data may be lost.
-2025/11/24 22:22:42 [INFO] [STATUS] State changed to: stopping (Flushing pending events... Please wait.)
-2025/11/24 22:22:42 [INFO] Stopping API Server...
-2025/11/24 22:22:42 [INFO] [CDC] Watcher stopped. Waiting for processor to finalize...
-2025/11/24 22:22:42 [INFO] [CDC cdc_resume_timestamp] Found resume timestamp: {1764038958 3}
-2025/11/24 22:22:42 [INFO] [VAL] Shutting down validation workers...
-2025/11/24 22:22:42 [INFO] [VAL] Validation workers stopped.
-2025/11/24 22:22:42 [INFO] CDC process stopped. Exiting.
-2025/11/24 22:22:42 [OK]   Application stopped.
-2025/11/24 22:22:43
---- Phase 1: VALIDATION ---
-2025/11/24 22:22:43 [TASK] Connecting to source DocumentDB...
-2025/11/24 22:22:44 [TASK] Connecting to target MongoDB...
-2025/11/24 22:22:44 [OK]   Connections successful.
-2025/11/24 22:22:44 [TASK] Validating DocumentDB Change Stream configuration...
-2025/11/24 22:22:44 [INFO] [VALIDATE] Running $listChangeStreams on admin DB...
-2025/11/24 22:22:44 [INFO] [VALIDATE] Found 15 enabled change streams:
-2025/11/24 22:22:44 [INFO] [VALIDATE]   - my_awesome_app.*
-2025/11/24 22:22:44 [INFO] [VALIDATE]   - my_awesome_app.users
-2025/11/24 22:22:44 [INFO] [VALIDATE]   - percona_db_1.test_1
-2025/11/24 22:22:44 [INFO] [VALIDATE]   - percona_db_1.test_5
-2025/11/24 22:22:44 [INFO] [VALIDATE]   - percona_db_1.test_2
-2025/11/24 22:22:44 [INFO] [VALIDATE]   - percona_db_1.test_3
-2025/11/24 22:22:44 [INFO] [VALIDATE]   - percona_db_1.test_4
-2025/11/24 22:22:44 [INFO] [VALIDATE]   - percona_db_2.test_1
-2025/11/24 22:22:44 [INFO] [VALIDATE]   - percona_db_2.test_2
-2025/11/24 22:22:44 [INFO] [VALIDATE]   - percona_db_2.test_3
-2025/11/24 22:22:44 [INFO] [VALIDATE]   - percona_db_2.test_4
-2025/11/24 22:22:44 [INFO] [VALIDATE]   - percona_db_2.test_5
-2025/11/24 22:22:44 [INFO] [VALIDATE]   - tobeignored.skipme_1
-2025/11/24 22:22:44 [INFO] [VALIDATE]   - alpha.test_1
-2025/11/24 22:22:44 [INFO] [VALIDATE]   - CLUSTER_WIDE (*.*)
-2025/11/24 22:22:44 [OK]   DocumentDB Change Stream configuration is valid.
-2025/11/24 22:22:44
---- Phase 2: LAUNCHING BACKGROUND PROCESS ---
-2025/11/24 22:22:44 [OK]   Application started in background with PID: 1663258
-2025/11/24 22:22:44 [INFO] Writing PID 1663258 to docMongoStream.pid
-2025/11/24 22:22:44 [INFO] Status manager initialized (collection: docMongoStream.status)
-2025/11/24 22:22:44 [INFO] [VAL] Starting 4 parallel CDC validation workers...
-2025/11/24 22:22:44 [INFO] Checkpoint manager initialized (collection: docMongoStream.checkpoints)
-2025/11/24 22:22:44 [INFO] [STATUS] State changed to: connecting (Connections established. Pinging...)
-2025/11/24 22:22:44 [INFO] API Server starting on port 8080...
-2025/11/24 22:22:45 [INFO] [CDC cdc_resume_timestamp] Found resume timestamp: {1764038958 3}
-2025/11/24 22:22:45
---- Phase 1: DISCOVERY (SKIPPED) ---
-2025/11/24 22:22:45
---- Phase 2: FULL DATA LOAD (SKIPPED) ---
-2025/11/24 22:22:45
---- Phase 3: CONTINUOUS SYNC (CDC) ---
-2025/11/24 22:22:45 [INFO] [STATUS] State changed to: running (Change Data Capture)
-2025/11/24 22:22:45 [INFO] [CDC cdc_resume_timestamp] Found resume timestamp: {1764038958 3}
-2025/11/24 22:22:45 [INFO] [CDC cdc_resume_timestamp] Loaded checkpoint. Resuming from {1764038958 3}
-2025/11/24 22:22:45 [INFO] [CDC] Resuming event count from 1817845
-2025/11/24 22:22:45 [INFO] Starting cluster-wide CDC... Resuming from checkpoint: {1764038958 3}
-2025/11/24 22:22:45 [INFO] [CDC] Starting 4 partition-aware write workers...
-2025/11/24 22:22:45 [OK]   Application is healthy (State: running).
-```
-</details>
 
 ### Status
 
 ```bash
-./docMongoStream status
+./docStreamer status
 ```
 
 <details>
 <summary>Sample output:</summary>
 
 ```bash
---- docMongoStream Status (Live) ---
-PID: 1318823 (Querying http://localhost:8080/status)
+--- docStreamer Status (Live) ---
+PID: 2987556 (Querying http://localhost:8080/status)
 {
     "ok": true,
     "state": "running",
     "info": "Change Data Capture",
-    "timeSinceLastEventSeconds": 27.660679778,
-    "cdcLagSeconds": 27.364062096,
-    "totalEventsApplied": 99192,
+    "timeSinceLastEventSeconds": 103.757565546,
+    "cdcLagSeconds": 0,
+    "totalEventsApplied": 7330,
     "validation": {
-        "totalChecked": 55643,
-        "validCount": 55643,
+        "totalChecked": 7314,
+        "validCount": 7314,
         "mismatchCount": 0,
         "syncPercent": 100,
-        "lastValidatedAt": "2025-11-24T19:31:45Z"
+        "lastValidatedAt": "2025-12-18T16:19:14Z"
     },
     "lastSourceEventTime": {
-        "ts": "1764012678.22",
-        "isoDate": "2025-11-24T19:31:18Z"
+        "ts": "1766074752.79",
+        "isoDate": "2025-12-18T16:19:12Z"
     },
-    "lastBatchAppliedAt": "2025-11-24T19:31:45Z",
+    "lastAppliedEventTime": {
+        "ts": "1766074752.79",
+        "isoDate": "2025-12-18T16:19:12Z"
+    },
+    "lastBatchAppliedAt": "2025-12-18T16:19:13Z",
     "initialSync": {
         "completed": true,
-        "completionLagSeconds": 5,
+        "completionLagSeconds": 150,
         "cloneCompleted": true,
-        "estimatedCloneSizeBytes": 2216505,
-        "clonedSizeBytes": 2216505,
-        "estimatedCloneSizeHuman": "2.1 MB",
-        "clonedSizeHuman": "2.1 MB"
+        "estimatedCloneSizeBytes": 1843039739,
+        "clonedSizeBytes": 1843039739,
+        "estimatedCloneSizeHuman": "2 GB",
+        "clonedSizeHuman": "2 GB"
     }
 }
 ```
@@ -597,7 +563,7 @@ The status command provides real-time metrics on the health and progress of your
     * discovering: Scanning the Source database to identify databases and collections to migrate.
     * copying: Synonymous with running during the Full Load phase.
     * running: The main active state. Used for both the Initial Sync (Full Load) and the Continuous Sync (CDC) phases.
-    * destroying: Only seen if the --destroy flag is used. docMongoStream is actively dropping target databases before starting.
+    * destroying: Only seen if the --destroy flag is used. Percona docStreamer is actively dropping target databases before starting.
     * complete: The process has finished its work (only occurs if there were no collections to migrate).
     * error: A fatal error occurred.
 
@@ -621,7 +587,7 @@ The status command provides real-time metrics on the health and progress of your
 
 * cdcLagSeconds (Replication Latency):
     * Meaning: The time difference (latency) between when an event occurred on the Source and when it was successfully applied to the Target.
-    * Interpretation: This is your true "lag." It should stay close to 0 (typically < 2 seconds). If this number spikes, it means docMongoStream cannot keep up with the volume of changes. If no events are being applied and state is running, it usually means your source database is idle.
+    * Interpretation: This is your true "lag." It should stay close to 0 (typically < 2 seconds). If this number spikes, it means docStreamer cannot keep up with the volume of changes. If no events are being applied and state is running, it usually means your source database is idle.
 
 * validation: Tracks the number of documents that are a perfect match between Source and Destination
     * totalChecked: This is the number of total CDC events checked
@@ -636,22 +602,22 @@ The status command provides real-time metrics on the health and progress of your
     * ts: Internal MongoDB Timestamp format.
     * isoDate: Human-readable UTC time of the event.
 
-* lastBatchAppliedAt: The local wall-clock time when docMongoStream last successfully wrote a batch of data to the Destination MongoDB.
+* lastBatchAppliedAt: The local wall-clock time when docStreamer last successfully wrote a batch of data to the Destination MongoDB.
 
-* initialSync: Statistics regarding the Full Load phase. Once the Full load is complete and docMongoStream switches to CDC these numbers will remain static.
+* initialSync: Statistics regarding the Full Load phase. Once the Full load is complete and docStreamer switches to CDC these numbers will remain static.
     * completed: true if the snapshot phase is finished.
     * completionLagSeconds: How far behind real-time the migration was at the exact moment the Full Load finished.
     * clonedSizeHuman: Total volume of data copied during the Full load phase.
 
 ### API
 
-docMongoStream also has an API that allows you to perform certain status and validation tasks, please see our [api documentation](./api.md) for more details and use case.
+Percona docStreamer also has an API that allows you to perform certain status and validation tasks, please see our [api documentation](./api.md) for more details and use case.
 
 ### Logs
 
-docMongoStream generates three separate logs, each of the logs location and name can be configured via [config.yaml](./config.yaml):
+Percona docStreamer generates three separate logs, each of the logs location and name can be configured via [config.yaml](./config.yaml):
 
-1. Application Log (`logs/docMongoStream.log`): Tracks the overall application status and any errors encountered.
+1. Application Log (`logs/docStreamer.log`): Tracks the overall application status and any errors encountered.
 2. Full Load Log (`logs/full_load.log`): Dedicated to the initial full synchronization process. This log, together with the status endpoint, helps you monitor the progress of the initial sync.
 3. CDC Log (`logs/cdc.log`): Dedicated to Change Data Capture (CDC) operations. These operations begin only after the full sync is complete, so this log will remain empty until that point. Use it, along with the status endpoint, to track CDC progress.
 
@@ -660,16 +626,14 @@ docMongoStream generates three separate logs, each of the logs location and name
 
 ```bash
 2025/11/17 16:13:33
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-________            ______  ___                                ____________
-___  __ \______________   |/  /___________________ ______      __  ___/_  /__________________ _______ ___
-__  / / /  __ \  ___/_  /|_/ /_  __ \_  __ \_  __ `/  __ \     _____ \_  __/_  ___/  _ \  __ `/_  __ `__ \
-_  /_/ // /_/ / /__ _  /  / / / /_/ /  / / /  /_/ // /_/ /     ____/ // /_ _  /   /  __/ /_/ /_  / / / / /
-/_____/ \____/\___/ /_/  /_/  \____//_/ /_/\__, / \____/      /____/ \__/ /_/    \___/\__,_/ /_/ /_/ /_/
-                                           /____/
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+_________           ____________
+______  /_____________  ___/_  /__________________ _______ ________________
+_  __  /_  __ \  ___/____ \_  __/_  ___/  _ \  __ `/_  __ `__ \  _ \_  ___/
+/ /_/ / / /_/ / /__ ____/ // /_ _  /   /  __/ /_/ /_  / / / / /  __/  /
+\__,_/  \____/\___/ /____/ \__/ /_/    \___/\__,_/ /_/ /_/ /_/\___//_/
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-2025/11/17 16:13:33 --- docMongoStream Application Start ---
 2025/11/17 16:13:33
 --- Phase 1: VALIDATION ---
 2025/11/17 16:13:41 [TASK] Connecting to source DocumentDB...
@@ -697,14 +661,14 @@ _  /_/ // /_/ / /__ _  /  / / / /_/ /  / / /  /_/ // /_/ /     ____/ // /_ _  / 
 2025/11/17 16:13:42
 --- Phase 2: LAUNCHING BACKGROUND PROCESS ---
 2025/11/17 16:13:42 [OK]   Application started in background with PID: 3024785
-2025/11/17 16:13:42 [INFO] Logs are being written to: logs/docMongoStream.log
-2025/11/17 16:13:42 [INFO] To stop the application, run: /home/daniel.almeida/docMongoStream stop
-2025/11/17 16:13:42 [INFO] To check status, run: /home/daniel.almeida/docMongoStream status (or GET http://localhost:8080/status)
-2025/11/17 16:13:42 [INFO] Writing PID 3024785 to ./docMongoStream.pid
-2025/11/17 16:13:42 [INFO] Status manager initialized (collection: docMongoStream.status)
+2025/11/17 16:13:42 [INFO] Logs are being written to: logs/docStreamer.log
+2025/11/17 16:13:42 [INFO] To stop the application, run: /home/daniel.almeida/docStreamer stop
+2025/11/17 16:13:42 [INFO] To check status, run: /home/daniel.almeida/docStreamer status (or GET http://localhost:8080/status)
+2025/11/17 16:13:42 [INFO] Writing PID 3024785 to ./docStreamer.pid
+2025/11/17 16:13:42 [INFO] Status manager initialized (collection: docStreamer.status)
 2025/11/17 16:13:42 [INFO] [STATUS] State changed to: connecting (Connections established. Pinging...)
 2025/11/17 16:13:42 [INFO] Starting status HTTP server on :8080/status
-2025/11/17 16:13:43 [INFO] Checkpoint manager initialized (collection: docMongoStream.checkpoints)
+2025/11/17 16:13:43 [INFO] Checkpoint manager initialized (collection: docStreamer.checkpoints)
 2025/11/17 16:13:43 [INFO] [CDC cdc_resume_timestamp] No resume timestamp found in checkpoint database.
 2025/11/17 16:13:43
 --- Phase 1: DISCOVERY ---
@@ -831,7 +795,7 @@ _  /_/ // /_/ / /__ _  /  / / / /_/ /  / / /  /_/ // /_/ /     ____/ // /_ _  / 
 
 ### Full Load Optimization
 
-docMongoStream uses dedicated worker pools for both migration phases, eliminating sequential bottlenecks and maximizing concurrent I/O. The Full Load phase relies on splitting work into as many parallel jobs as possible without overwhelming the source DocumentDB or target MongoDB I/O queues. However, the settings multiply each other and if you configure them too high, you can easily saturate your CPU or network. The formula below might help you tune these settings accordingly:
+Percona docStreamer uses dedicated worker pools for both migration phases, eliminating sequential bottlenecks and maximizing concurrent I/O. The Full Load phase relies on splitting work into as many parallel jobs as possible without overwhelming the source DocumentDB or target MongoDB I/O queues. However, the settings multiply each other and if you configure them too high, you can easily saturate your CPU or network. The formula below might help you tune these settings accordingly:
 
 ***Total Threads = migration.max_concurrent_workers * cloner.num_read_workers + cloner.num_insert_workers***
 
@@ -874,7 +838,7 @@ This setting determines the write pipeline's capacity during live synchronizatio
 
 **Note:** Setting this value too high may saturate connections or CPU resources on the target MongoDB cluster, potentially degrading the performance of other operations.
 
-**Note on Partitioning:** docMongoStream uses Key-Based Partitioning to guarantee strict data ordering. This means all updates for a specific document are handled by the same worker. In rare cases of "Hot Keys" (a single document receiving massive update volume), one worker may be utilized more than others. This is an intentional trade-off to ensure data integrity.
+**Note on Partitioning:** Percona docStreamer uses Key-Based Partitioning to guarantee strict data ordering. This means all updates for a specific document are handled by the same worker. In rare cases of "Hot Keys" (a single document receiving massive update volume), one worker may be utilized more than others. This is an intentional trade-off to ensure data integrity.
 
 
 | Setting | Purpose |
@@ -900,7 +864,7 @@ The data validation engine is highly configurable to balance performance impact 
 
 ## Additional Documentation
 
-We have created a page dedicated to a more in [depth explanation of how docMongoStream works](./details.md) as well as a [frequently asked questions](./faq.md) page.
+We have created a page dedicated to a more in [depth explanation of how Percona docStreamer works](./details.md) as well as a [frequently asked questions](./faq.md) page.
 
 
 

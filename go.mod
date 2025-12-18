@@ -1,4 +1,4 @@
-module github.com/Percona-Lab/docMongoStream
+module github.com/Percona-Lab/percona-docstreamer
 
 go 1.23.4
 

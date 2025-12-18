@@ -1,19 +1,19 @@
 # Frequently Asked Questions
 
 ## Q: Where is data stored during the Full Load sync? Will this cause Out-Of-Memory (OOM) errors on my Source or Destination database?
-**A:** No, docMongoStream is designed to minimize memory pressure on your Source and Destination databases.
+**A:** No, docStreamer is designed to minimize memory pressure on your Source and Destination databases.
 
-Where Data Lives: The data from batches is stored exclusively in the RAM of the machine running docMongoStream. It acts as a streaming middleman, holding data in memory only long enough to transfer it from Source to Destination.
+Where Data Lives: The data from batches is stored exclusively in the RAM of the machine running docStreamer. It acts as a streaming middleman, holding data in memory only long enough to transfer it from Source to Destination.
 
-Source Database Impact: The impact is minimal. docMongoStream uses "cursors" to stream documents one by one and uses efficient range queries (based on _id) to avoid loading large datasets into the Source's memory.
+Source Database Impact: The impact is minimal. docStreamer uses "cursors" to stream documents one by one and uses efficient range queries (based on _id) to avoid loading large datasets into the Source's memory.
 
 Destination Database Impact: The impact is standard for write operations. Data is sent in bulk batches (default ~48MB, this number can change depending on your settings). The destination database processes these writes normally and does not need to cache the entire migration in RAM.
 
-OOM Risk: The risk of running out of memory lies with the host running docMongoStream, not your databases. If that machine is undersized, docMongoStream may crash, but your databases will remain safe.
+OOM Risk: The risk of running out of memory lies with the host running docStreamer, not your databases. If that machine is undersized, docStreamer may crash, but your databases will remain safe.
 
 
 ## Q: What happens if I run a new migration (Full Sync) into a destination where the Database and Collection names already exist?
-**A:** If you perform a Full Sync into a cluster that already contains data with matching Database and Collection names, docMongoStream resolves conflicts based on the unique _id of the documents:
+**A:** If you perform a Full Sync into a cluster that already contains data with matching Database and Collection names, docStreamer resolves conflicts based on the unique _id of the documents:
   1. Non-Matching IDs: If the records in the source have completely different _ids than those in the destination, the destination records remain unaffected. The new records from the source are simply inserted (appended) into the collection.
   2. Matching IDs: If a record in the source shares the exact same _id as a record in the destination, the source data will overwrite the destination record.
 
@@ -27,32 +27,32 @@ OOM Risk: The risk of running out of memory lies with the host running docMongoS
 ---
 
 ## Q: What happens if the application crashes during the Full Load phase?
-**A:** If docMongoStream stops (crash, restart, power loss) during the Full Load, it resumes the migration from the point of the last completed collection. It does *not* start from scratch.
+**A:** If docStreamer stops (crash, restart, power loss) during the Full Load, it resumes the migration from the point of the last completed collection. It does *not* start from scratch.
 
 ### Detailed Recovery Workflow
 
 #### **The "Anchor" Checkpoint**
-- Before copying any data, docMongoStream saves an **Anchor Timestamp** (**T₀**) to the target database.
-- If docMongoStream crashes at 50% completion, this Anchor remains in the database, preserving the original start time of the migration project.
+- Before copying any data, docStreamer saves an **Anchor Timestamp** (**T₀**) to the target database.
+- If docStreamer crashes at 50% completion, this Anchor remains in the database, preserving the original start time of the migration project.
 
 #### **Smart Resume Logic**
-- **On Restart:** docMongoStream detects the Anchor and recognizes a *Partial Full Load*.
+- **On Restart:** docStreamer detects the Anchor and recognizes a *Partial Full Load*.
 - **Skipping Completed Work:** It scans the checkpoints to determine which collections finished successfully.
 - **Resuming Work:** It launches workers only for the remaining (incomplete) collections.
 
 #### **Consistency**
-By reusing the original Anchor **T₀** instead of capturing a new timestamp, docMongoStream ensures that when the CDC phase starts, it will “rewind” back to the very beginning of the project — capturing any updates that occurred on already-finished collections while docMongoStream was down.
+By reusing the original Anchor **T₀** instead of capturing a new timestamp, docStreamer ensures that when the CDC phase starts, it will “rewind” back to the very beginning of the project — capturing any updates that occurred on already-finished collections while docStreamer was down.
 
 #### **How Idempotency Handles Interrupted Collections**
-- For the collection being copied when the crash occurred, docMongoStream restarts that collection from the **beginning**.
+- For the collection being copied when the crash occurred, docStreamer restarts that collection from the **beginning**.
 - **No duplicates:** Because workers use Upserts (`ReplaceOne` with `upsert: true`), re-copying simply overwrites documents with identical data. No duplicate errors or cleanup required.
 
 ---
 
 ## Q: How does the "Resumable Full Load" work?
 **A:**
-- If docMongoStream stops during copying, simply run `start` again.
-- docMongoStream detects the existing Anchor Timestamp.
+- If docStreamer stops during copying, simply run `start` again.
+- docStreamer detects the existing Anchor Timestamp.
 - It scans checkpoints to determine which collections completed.
 - It skips completed collections and launches workers only for pending ones.
 - After all collections finish, it proceeds to CDC using the original **T₀**.
@@ -67,7 +67,7 @@ By reusing the original Anchor **T₀** instead of capturing a new timestamp, do
    This drops target databases and clears checkpoints.
 
 2. **Manual Cleanup**  
-   Drop the `docMongoStream` database in the target.  
+   Drop the `docStreamer` database in the target.  
    The next run will be treated as a new migration.
 
 ---
@@ -89,7 +89,7 @@ Set `change_stream_log_retention_duration` to **7 days or longer** for large mig
 ---
 
 ## Q: Does resuming create duplicate data?
-**A:** No. docMongoStream uses **Idempotent Writes (Upserts)**.
+**A:** No. docStreamer uses **Idempotent Writes (Upserts)**.
 
 - Completed collections are skipped entirely.
 - If a worker crashed mid-collection, that collection restarts.
@@ -97,13 +97,13 @@ Set `change_stream_log_retention_duration` to **7 days or longer** for large mig
 
 ---
 
-## Q: Why doesn't docMongoStream use MongoDB Transactions?
-**A:** docMongoStream is built for **high-throughput eventual consistency** using **Idempotent Writes**, not strict transactional atomicity.
+## Q: Why doesn't docStreamer use MongoDB Transactions?
+**A:** docStreamer is built for **high-throughput eventual consistency** using **Idempotent Writes**, not strict transactional atomicity.
 
 ### Key Points
 
 #### **Idempotency > Rollbacks**
-- Instead of rollback logic, docMongoStream simply reprocesses batches after a crash.
+- Instead of rollback logic, docStreamer simply reprocesses batches after a crash.
 - Upserts ensure re-copying data overwrites identical documents without errors.
 
 #### **Full Load Phase**
@@ -118,16 +118,16 @@ Set `change_stream_log_retention_duration` to **7 days or longer** for large mig
 ### Worker Failure Example
 1. Worker copies 10,000 docs → crashes.
 2. Migration halts.
-3. You restart docMongoStream.
+3. You restart docStreamer.
 4. It restarts the collection from the beginning.
 5. Upserts overwrite identical docs → no duplicates.
 
-This design makes docMongoStream **crash-safe**.
+This design makes docStreamer **crash-safe**.
 
 ---
 
-## Q: How does docMongoStream handle `_id` fields with mixed data types?
-**A:** docMongoStream auto-detects mixed `_id` types and switches to **Linear Scan Mode** to guarantee consistency.
+## Q: How does docStreamer handle `_id` fields with mixed data types?
+**A:** docStreamer auto-detects mixed `_id` types and switches to **Linear Scan Mode** to guarantee consistency.
 
 ### Technical Breakdown
 
@@ -135,7 +135,7 @@ This design makes docMongoStream **crash-safe**.
 Databases like DocumentDB may produce unstable sorting for mixed `_id` types without secondary indexes, causing parallel range queries to skip documents.
 
 #### Automatic Detection
-During Discovery, docMongoStream:
+During Discovery, docStreamer:
 - Samples start/end/random documents
 - Checks `_id` types
 - Runs test queries
@@ -150,7 +150,7 @@ If inconsistency is detected → flagged as **Unsafe for Range Scan**.
 
 ---
 
-## Q: Why does docMongoStream sometimes log “Strategy Override: Switching to Linear Scan”?
+## Q: Why does docStreamer sometimes log “Strategy Override: Switching to Linear Scan”?
 **A:** It’s an automatic safeguard triggered when mixed-type `_id` fields could cause data loss.
 
 ### Scenario
@@ -188,7 +188,7 @@ If unsafe → linear scan is enforced.
 **A:** To avoid false positives caused by CDC updates during validation.
 
 ### How It Works
-- docMongoStream tracks “in-flight” CDC writes.
+- docStreamer tracks “in-flight” CDC writes.
 - If validator reads a doc currently being updated, it defers the check.
 - It retries after `retry_interval_ms`.
 
@@ -212,12 +212,12 @@ Indexes created on the source **after** migration starts (during CDC) are **not*
 
 ---
 
-## Q: What happens if the source environment is a Sharded Amazon DocumentDB cluster? Will docMongoStream work?
-**A:** docMongoStream is designed to work with sharded source environments, as long as the connection details point to the cluster's router/endpoint (equivalent to a mongos instance in a MongoDB sharded cluster).
+## Q: What happens if the source environment is a Sharded Amazon DocumentDB cluster? Will docStreamer work?
+**A:** docStreamer is designed to work with sharded source environments, as long as the connection details point to the cluster's router/endpoint (equivalent to a mongos instance in a MongoDB sharded cluster).
 
-- Full Load: The initial data copy phase should work correctly. docMongoStream connects to the cluster endpoint and issues standard find commands to discover and copy data. The router is responsible for distributing these queries across all shards and aggregating the results for a complete snapshot.
+- Full Load: The initial data copy phase should work correctly. docStreamer connects to the cluster endpoint and issues standard find commands to discover and copy data. The router is responsible for distributing these queries across all shards and aggregating the results for a complete snapshot.
 
-- CDC (Real-Time Replication): The continuous replication phase relies on the DocumentDB cluster supporting cluster-wide change streams. docMongoStream explicitly uses and checks for this capability by running the watch operation against the main client, which is intended to capture changes across all databases and collections.
+- CDC (Real-Time Replication): The continuous replication phase relies on the DocumentDB cluster supporting cluster-wide change streams. docStreamer explicitly uses and checks for this capability by running the watch operation against the main client, which is intended to capture changes across all databases and collections.
 
 ### Caveats and Current Limitations Regarding Sharding
 
@@ -231,8 +231,8 @@ While the architecture supports sharding, there are important caveats, particula
 
 ---
 
-## Q: Are new databases and collections migrated to destination if they were created on source while docMongoStream is running?
-**A:** Yes. New collections and databases created while docMongoStream is running (and while it is paused), will be detected and migrated.
+## Q: Are new databases and collections migrated to destination if they were created on source while docStreamer is running?
+**A:** Yes. New collections and databases created while docStreamer is running (and while it is paused), will be detected and migrated.
 
 ***Example***
 
@@ -259,7 +259,7 @@ airline           2.93 GiB
 config            7.84 MiB
 custom_ids       19.31 MiB
 cvg_1             2.14 MiB
-docMongoStream    1.09 MiB
+docStreamer    1.09 MiB
 generic         144.02 MiB
 good_ids         18.36 MiB
 ind_1            64.18 MiB
@@ -271,8 +271,8 @@ sea_2           956.00 KiB
 Status:
 
 ```bash
-./docMongoStream status
---- docMongoStream Status (Live) ---
+./docStreamer status
+--- docStreamer Status (Live) ---
 PID: 1908370 (Querying http://localhost:8080/status)
 {
     "ok": true,
@@ -343,8 +343,8 @@ CDC logs:
 Status:
 
 ```bash
-./docMongoStream status
---- docMongoStream Status (Live) ---
+./docStreamer status
+--- docStreamer Status (Live) ---
 PID: 1908370 (Querying http://localhost:8080/status)
 {
     "ok": true,
@@ -390,7 +390,7 @@ airline            2.93 GiB
 config             7.83 MiB
 custom_ids        19.31 MiB
 cvg_1              2.14 MiB
-docMongoStream  1000.00 KiB
+docStreamer  1000.00 KiB
 generic          144.02 MiB
 good_ids          18.36 MiB
 ind_1             73.24 MiB
