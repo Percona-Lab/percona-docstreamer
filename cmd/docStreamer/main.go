@@ -40,6 +40,10 @@ import (
 	"github.com/Percona-Lab/percona-docstreamer/internal/validator"
 )
 
+// Declare the version variable.
+// The Makefile will override this value during build.
+var version = "1"
+
 // --- Helper function for password prompt ---
 func getPassword(prompt string) (string, error) {
 	fmt.Print(prompt)
@@ -63,10 +67,13 @@ func getConfirmation(prompt string) (bool, error) {
 }
 
 var rootCmd = &cobra.Command{
-	Use:   "docStreamer",
-	Short: "DocumentDB to MongoDB Migration and Sync Tool",
-	Long: `docStreamer is a tool for performing a full load and continuous data
-capture (CDC) migration from AWS DocumentDB to MongoDB.`,
+	Use:     "docStreamer",
+	Version: version,
+	Short:   "DocumentDB to MongoDB Migration and Sync Tool",
+	Long: fmt.Sprintf(`docStreamer is a tool for performing a full load and continuous data
+capture (CDC) migration from AWS DocumentDB to MongoDB.
+
+docStreamer %s `, version),
 	CompletionOptions: cobra.CompletionOptions{
 		DisableDefaultCmd: true,
 	},
