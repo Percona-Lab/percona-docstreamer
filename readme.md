@@ -159,13 +159,14 @@ If your host is running out of memory, you can lower the RAM requirement by modi
 
 All you need to do is follow 3 steps:
 
-1. Download the binary (compiled for linux amd64) from the [bin](./bin) folder
+1. Go to our repo (you are already here)
+2. Go to the [releases](https://github.com/Percona-Lab/percona-docstreamer/releases) page and download the appropriate release for your needs 
 2. Download the [config.yaml](./config.yaml) 
 3. Follow the rest of the instructions below
 
 ### The hard way
 
-You might want to compile Percona docStreamer for a different architecture (not tested) other than linux, so in order to do that you will just need to follow a few steps:
+You might want to compile Percona docStreamer for a different architecture (not tested) other than linux or the ones provided, so in order to do that you will just need to follow a few steps:
 
 1. Clone this repo
 2. Make whatever changes to the application you want (not required)
@@ -181,6 +182,20 @@ Build for your current OS and Architecture
 ```bash
 go build -o ./bin/docStreamer ./cmd/docStreamer/
 ```
+
+This project includes a Makefile to simplify building and packaging.
+
+```bash
+git clone https://github.com/Percona-Lab/percona-docstreamer.git
+cd percona-docstreamer
+go mod tidy
+```
+
+```bash
+# Build a binary for your CURRENT machine only (no .tar.gz)
+make build-local
+```
+
 
 ## Configure Users
 
