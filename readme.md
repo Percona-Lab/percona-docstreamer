@@ -246,6 +246,12 @@ mongo:
 
 Percona docStreamer configuration options are self explanatory and documented within the configuration file itself. The only parameters you have to pass to the application at runtime are the usernames for the source and destination environments, the passwords for each are interactive and you will be prompted for it accordingly. You can also configure environment variables so you don't have to type them if you prefer, the choice is yours.
 
+In addition to the above, you may include any additional standard MongoDB connection parameters using the `extra_params` configuration.
+
+```yaml
+extra_params: "directConnection=true&replicaSet=rs&ssl=false"
+```
+
 ### Credentials
 
 Credentials for the source and target databases are required. They can be provided in three ways, in order of priority:

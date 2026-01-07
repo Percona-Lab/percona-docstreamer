@@ -35,6 +35,7 @@ docdb:
   ca_file: "/home/daniel.almeida/global-bundle.pem"
   # If true, tlsAllowInvalidHostnames=true will be added to the connection string.
   tls_allow_invalid_hostnames: true
+  # extra_params: "directConnection=true&replicaSet=rs&ssl=false"
   extra_params: ""
 
 # -----------------------------------------------
@@ -45,6 +46,7 @@ mongo:
   port: "27017"
   ca_file: ""
   tls_allow_invalid_hostnames: true 
+  # extra_params: "directConnection=true&replicaSet=rs&ssl=false"
   extra_params: ""
 
 # -----------------------------------------------
