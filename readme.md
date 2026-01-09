@@ -196,8 +196,9 @@ go mod tidy
 make build-local
 ```
 
-
 ## Configure Users
+
+### Migration Users
 
 You need to create users in both source and destination environments, you can name them whatever you like:
 
@@ -220,6 +221,11 @@ db.getSiblingDB('admin').createUser({
    roles: ['restore', 'clusterMonitor', 'clusterManager','readWriteAnyDatabase','dbAdminAnyDatabase']
   });
 ```  
+
+### Application Users
+
+Because docStreamer does not migrate user accounts or roles, you must manually create any users and roles required by your application. [Follow the appropriate procedure](https://www.mongodb.com/docs/manual/tutorial/manage-users-and-roles/) based on whether you are migrating to a sharded cluster or a replica set. Failure to create these users and roles in the destination cluster will prevent your application from connecting after the cutover process.
+
 
 ## Configuring Percona docStreamer
 
