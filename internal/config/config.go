@@ -35,6 +35,7 @@ type DocDBConfig struct {
 	CaFile                   string `mapstructure:"ca_file"`
 	ExtraParams              string `mapstructure:"extra_params"`
 	TlsAllowInvalidHostnames bool   `mapstructure:"tls_allow_invalid_hostnames"`
+	TLS                      bool   `mapstructure:"tls"`
 }
 
 // MongoConfig holds target-specific settings
@@ -44,6 +45,7 @@ type MongoConfig struct {
 	CaFile                   string `mapstructure:"ca_file"`
 	ExtraParams              string `mapstructure:"extra_params"`
 	TlsAllowInvalidHostnames bool   `mapstructure:"tls_allow_invalid_hostnames"`
+	TLS                      bool   `mapstructure:"tls"`
 }
 
 // MigrationConfig holds general migration settings
@@ -113,12 +115,14 @@ func LoadConfig() {
 	viper.SetDefault("docdb.ca_file", "global-bundle.pem")
 	viper.SetDefault("docdb.extra_params", "")
 	viper.SetDefault("docdb.tls_allow_invalid_hostnames", false)
+	viper.SetDefault("docdb.tls", false)
 
 	viper.SetDefault("mongo.endpoint", "localhost")
 	viper.SetDefault("mongo.port", "27017")
 	viper.SetDefault("mongo.ca_file", "")
 	viper.SetDefault("mongo.extra_params", "")
 	viper.SetDefault("mongo.tls_allow_invalid_hostnames", false)
+	viper.SetDefault("mongo.tls", false)
 
 	viper.SetDefault("migration.network_compressors", "zlib,snappy")
 	viper.SetDefault("migration.exclude_dbs", []string{"admin", "local", "config"})
@@ -220,8 +224,13 @@ func buildTLSParams(extraParams string, allowInvalid bool) string {
 func (c *Config) BuildDocDBURI(user, password string) string {
 	useTunnel := (c.DocDB.Endpoint == "localhost" || c.DocDB.Endpoint == "127.0.0.1")
 	params := url.Values{}
-	addQueryParam(&params, "tls", "true")
-	addQueryParam(&params, "tlsCAFile", c.DocDB.CaFile)
+	if c.DocDB.TLS {
+		addQueryParam(&params, "tls", "true")
+		addQueryParam(&params, "tlsCAFile", c.DocDB.CaFile)
+	} else {
+		addQueryParam(&params, "tls", "false")
+		// We do not add tlsCAFile if tls is false
+	}
 
 	if useTunnel {
 		addQueryParam(&params, "directConnection", "true")
@@ -250,10 +259,15 @@ func (c *Config) BuildDocDBURI(user, password string) string {
 
 func (c *Config) BuildMongoURI(user, password string) string {
 	params := url.Values{}
-	if c.Mongo.CaFile != "" {
+	if c.Mongo.TLS {
 		addQueryParam(&params, "tls", "true")
-		addQueryParam(&params, "tlsCAFile", c.Mongo.CaFile)
+		if c.Mongo.CaFile != "" {
+			addQueryParam(&params, "tlsCAFile", c.Mongo.CaFile)
+		}
+	} else {
+		addQueryParam(&params, "tls", "false")
 	}
+
 	addQueryParam(&params, "compressors", c.Migration.NetworkCompressors)
 
 	finalParamsStr := buildTLSParams(c.Mongo.ExtraParams, c.Mongo.TlsAllowInvalidHostnames)

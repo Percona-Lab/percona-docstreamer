@@ -236,6 +236,7 @@ The application is configured via the [config.yaml](./config.yaml) file in the a
 docdb:
   endpoint: "localhost"
   port: "7777"
+  tls: true
   ca_file: "/home/daniel.almeida/global-bundle.pem"
   # If true, tlsAllowInvalidHostnames=true will be added to the connection string.
   tls_allow_invalid_hostnames: true
@@ -245,6 +246,7 @@ docdb:
 mongo:
   endpoint: "dan-ps-lab-mongos00.tp.int.percona.com"
   port: "27017"
+  tls: false
   ca_file: ""
   tls_allow_invalid_hostnames: true 
   extra_params: ""
@@ -255,7 +257,7 @@ Percona docStreamer configuration options are self explanatory and documented wi
 In addition to the above, you may include any additional standard MongoDB connection parameters using the `extra_params` configuration.
 
 ```yaml
-extra_params: "directConnection=true&replicaSet=rs&ssl=false"
+extra_params: "directConnection=true&replicaSet=rsName"
 ```
 
 ### Credentials

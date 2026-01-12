@@ -32,10 +32,11 @@ logging:
 docdb:
   endpoint: "localhost"
   port: "7777"
+  tls: true
   ca_file: "/home/daniel.almeida/global-bundle.pem"
   # If true, tlsAllowInvalidHostnames=true will be added to the connection string.
   tls_allow_invalid_hostnames: true
-  # extra_params: "directConnection=true&replicaSet=rs&ssl=false"
+  # extra_params: "directConnection=true&replicaSet=rsName"
   extra_params: ""
 
 # -----------------------------------------------
@@ -44,9 +45,10 @@ docdb:
 mongo:
   endpoint: "dan-ps-lab-mongos00.tp.int.percona.com"
   port: "27017"
+  tls: false
   ca_file: ""
   tls_allow_invalid_hostnames: true 
-  # extra_params: "directConnection=true&replicaSet=rs&ssl=false"
+  # extra_params: "directConnection=true&replicaSet=rsName"
   extra_params: ""
 
 # -----------------------------------------------
