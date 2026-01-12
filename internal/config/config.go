@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/fsnotify/fsnotify"
@@ -161,6 +163,12 @@ func LoadConfig() {
 	viper.AddConfigPath(".")
 	viper.AddConfigPath("/etc/docStreamer")
 	viper.AddConfigPath("$HOME/.docStreamer")
+
+	ex, err := os.Executable()
+	if err == nil {
+		exePath := filepath.Dir(ex)
+		viper.AddConfigPath(exePath)
+	}
 
 	if err := viper.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
