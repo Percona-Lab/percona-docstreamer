@@ -133,8 +133,7 @@ func startAction(cmd *cobra.Command, args []string) {
 	mongoURI := config.Cfg.BuildMongoURI(mongoUser, mongoPass)
 
 	logging.PrintStep("Connecting to source DocumentDB...", 0)
-	tlsConfig := &tls.Config{InsecureSkipVerify: config.Cfg.DocDB.TlsAllowInvalidHostnames}
-	clientOpts := options.Client().ApplyURI(docdbURI).SetTLSConfig(tlsConfig)
+	clientOpts := options.Client().ApplyURI(docdbURI)
 	sourceClient, err := mongo.Connect(clientOpts)
 	if err != nil {
 		logging.PrintError(fmt.Sprintf("Failed to create source client: %v", err), 0)
@@ -149,8 +148,7 @@ func startAction(cmd *cobra.Command, args []string) {
 	}
 
 	logging.PrintStep("Connecting to target MongoDB...", 0)
-	mongoTlsConfig := &tls.Config{InsecureSkipVerify: config.Cfg.Mongo.TlsAllowInvalidHostnames}
-	mongoClientOpts := options.Client().ApplyURI(mongoURI).SetTLSConfig(mongoTlsConfig)
+	mongoClientOpts := options.Client().ApplyURI(mongoURI)
 	targetClient, err := mongo.Connect(mongoClientOpts)
 	if err != nil {
 		logging.PrintError(fmt.Sprintf("Failed to create target client: %v", err), 0)
