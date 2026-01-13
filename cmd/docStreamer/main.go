@@ -152,6 +152,7 @@ func startAction(cmd *cobra.Command, args []string) {
 		logging.PrintError(fmt.Sprintf("Failed to connect to source: %v", err), 0)
 		os.Exit(1)
 	}
+	logging.PrintSuccess("Connection to source successful.", 0)
 
 	logging.PrintStep("Connecting to target MongoDB...", 0)
 	mongoClientOpts := options.Client().ApplyURI(mongoURI)
@@ -174,7 +175,7 @@ func startAction(cmd *cobra.Command, args []string) {
 		logging.PrintError(fmt.Sprintf("Failed to connect to target: %v", err), 0)
 		os.Exit(1)
 	}
-	logging.PrintSuccess("Connections successful.", 0)
+	logging.PrintSuccess("Connection to target successful.", 0)
 
 	logging.PrintStep("Validating DocumentDB Change Stream configuration...", 0)
 	ctxValidate, cancelValidate := context.WithTimeout(context.Background(), 15*time.Second)
