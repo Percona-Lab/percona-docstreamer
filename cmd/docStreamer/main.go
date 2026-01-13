@@ -134,6 +134,12 @@ func startAction(cmd *cobra.Command, args []string) {
 
 	logging.PrintStep("Connecting to source DocumentDB...", 0)
 	clientOpts := options.Client().ApplyURI(docdbURI)
+	// --- Conditionally apply InsecureSkipVerify ---
+	// If TLS is ON and we need to skip hostname validation (e.g. tunneling),
+	// we must force the driver to use a custom TLS config.
+	if config.Cfg.DocDB.TLS && config.Cfg.DocDB.TlsAllowInvalidHostnames {
+		clientOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
+	}
 	sourceClient, err := mongo.Connect(clientOpts)
 	if err != nil {
 		logging.PrintError(fmt.Sprintf("Failed to create source client: %v", err), 0)
@@ -149,6 +155,13 @@ func startAction(cmd *cobra.Command, args []string) {
 
 	logging.PrintStep("Connecting to target MongoDB...", 0)
 	mongoClientOpts := options.Client().ApplyURI(mongoURI)
+	// --- Conditionally apply InsecureSkipVerify ---
+	// If TLS is ON and we need to skip hostname validation (e.g. tunneling),
+	// we must force the driver to use a custom TLS config.
+	if config.Cfg.Mongo.TLS && config.Cfg.Mongo.TlsAllowInvalidHostnames {
+		mongoClientOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
+	}
+
 	targetClient, err := mongo.Connect(mongoClientOpts)
 	if err != nil {
 		logging.PrintError(fmt.Sprintf("Failed to create target client: %v", err), 0)
