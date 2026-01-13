@@ -546,10 +546,14 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 
 	docdbURI := config.Cfg.BuildDocDBURI(docdbUser, docdbPass)
 	mongoURI := config.Cfg.BuildMongoURI(mongoUser, mongoPass)
-	tlsConfig := &tls.Config{InsecureSkipVerify: config.Cfg.DocDB.TlsAllowInvalidHostnames}
-	clientOpts := options.Client().ApplyURI(docdbURI).SetTLSConfig(tlsConfig)
 
+	// --- Use conditional TLS logic for Source (DocumentDB) ---
+	clientOpts := options.Client().ApplyURI(docdbURI)
+	if config.Cfg.DocDB.TLS && config.Cfg.DocDB.TlsAllowInvalidHostnames {
+		clientOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
+	}
 	sourceClient, err := mongo.Connect(clientOpts)
+
 	if err != nil {
 		logging.PrintError(err.Error(), 0)
 		return
@@ -563,9 +567,13 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		}
 	}()
 
-	mongoTlsConfig := &tls.Config{InsecureSkipVerify: config.Cfg.Mongo.TlsAllowInvalidHostnames}
-	mongoClientOpts := options.Client().ApplyURI(mongoURI).SetTLSConfig(mongoTlsConfig)
+	// --- Use conditional TLS logic for Target (MongoDB) ---
+	mongoClientOpts := options.Client().ApplyURI(mongoURI)
+	if config.Cfg.Mongo.TLS && config.Cfg.Mongo.TlsAllowInvalidHostnames {
+		mongoClientOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
+	}
 	targetClient, err := mongo.Connect(mongoClientOpts)
+
 	if err != nil {
 		logging.PrintError(err.Error(), 0)
 		return
@@ -872,7 +880,7 @@ func init() {
 	runCmd.Flags().String("docdb-pass", "", "")
 	runCmd.Flags().String("mongo-pass", "", "")
 	runCmd.Flags().Bool("destroy", false, "")
-	runCmd.Flags().Bool("debug", false, "") // Internal debug flag for run command
+	runCmd.Flags().Bool("debug", false, "")
 	runCmd.Flags().MarkHidden("docdb-user")
 	runCmd.Flags().MarkHidden("mongo-user")
 	runCmd.Flags().MarkHidden("docdb-pass")
