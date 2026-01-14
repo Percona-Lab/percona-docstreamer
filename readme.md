@@ -14,7 +14,7 @@ Percona docStreamer automates the complete, end-to-end migration from an Amazon 
 * Full Sync: A parallelized, high-speed copy of all existing data from source collections.
 * Continuous Sync (CDC): Opens a change stream on the source DocumentDB to capture all inserts, updates, deletes and DDLs (with a few exceptions), applying them in batches to the target MongoDB for real-time synchronization.
 
-## Prerequisites
+## 1. Prerequisites
 
 ### DocumentDB Pre-Setup
 
@@ -61,69 +61,7 @@ db.adminCommand({
 });
 ```
 
-The command below would only enable them for the 3 collections shown:
-
-```bash
-use admin;
-db.adminCommand({modifyChangeStreams: 1, database: "percona_db_1", collection: "test_1", enable: true});
-db.adminCommand({modifyChangeStreams: 1, database: "percona_db_1", collection: "test_2", enable: true});
-db.adminCommand({modifyChangeStreams: 1, database: "percona_db_1", collection: "test_3", enable: true});
-```
-
-## Important Notes & Limitations 
-
-### Best Practices & Safety Precautions
-
-To ensure data integrity and prevent accidental data loss during migration, we recommend following these guidelines before initiating a docStreamer process.
-
- - Backup Your Destination ***(if the destination environment contains data)*** Because Percona docStreamer will overwrite documents with matching _ids, always create a backup of your destination database before running a Full Sync. This ensures you can roll back if valid data is accidentally overwritten.
-
- - Audit Existing Collections: ***(if the destination environment contains data)*** Check your destination database to see if collections with the same names as your source already exist. If they do, verify if the data is intended to be merged. If not, consider renaming the source or destination collection.
-
-- Verify Connection Strings: Double-check your SOURCE and DESTINATION URIs. A common mistake is pointing the destination to a production environment instead of a staging environment, which can lead to unintended data commingling.
-
-- Test with a Staging Run: If possible, perform a dry run or a migration into a temporary empty cluster/database first. This allows you to verify that the data maps correctly and the volume is as expected without risking your main data store.
-
-**CRITICAL WARNING** regarding Data Overwrites: Please be aware that if a document in your Source has the same _id as a document in your Destination, the Destination document will be overwritten immediately. This action is irreversible once the sync is performed.
-
-### Sharding support not tested
-
-Migration from DocumentDB sharded clusters has not been tested and therefore the behavior is unknown. Support for sharded DocumentDB clusters will be added in the future.
-
-### DocumentDB Cursor Rate Limiting
-
-AWS DocumentDB enforces service quotas, including limits on the number of cursors and the rate of getMore operations, which are fundamental to how change streams work.
-
-Symptom: If the migration falls too far behind (e.g., after being stopped for a long time) or if there is a massive burst of write activity, docStreamer may hit these rate limits. This can cause the change stream to fail or be terminated by AWS.
-
-Behavior: Percona docStreamer is designed to be resilient and will attempt to retry and resume the stream. However, persistent rate-limiting from the DocumentDB side may require intervention (e.g., scaling your DocumentDB instance or running the migration during off-peak hours).
-
-### DDL Operation Support During CDC Stage
-
-Percona docStreamer has support for replicating most DDL operations during the CDC stage (after the full sync has completed).
-
-Supported: drop (collection), dropDatabase, rename (collection), create (collection). 
-
-**NOT Supported**: createIndexes, dropIndexes. These operations will be skipped. You must manually recreate or drop indexes on the target cluster.
-
-### Supported Index Types
-
-Percona docStreamer automatically handles the creation of indexes during the Full Sync stage to ensure your destination performance matches the source. However, there are specific limitations regarding index types.
-
-Currently Supported:
-
-Most standard MongoDB index types (e.g., Single Field, Compound, Multikey, Geospatial).
-
-Not Currently Supported: 
-
-The following index types are not migrated during the Full Sync and must be created manually on the destination if required:
-
- - Text Indexes
- - Partial Indexes
-
-***Note:*** We recommend reviewing your source indexes prior to migration. If your application relies heavily on text search or partial indexing, plan to run a post-migration script to reconstruct these specific indexes on the destination cluster.
-
-## Installing Percona docStreamer
+## 2. Installing Percona docStreamer
 
 We recommend you have a dedicated server to run Percona docStreamer. 
 
@@ -196,7 +134,7 @@ go mod tidy
 make build-local
 ```
 
-## Configure Users
+## 3. Configure Users
 
 ### Migration Users
 
@@ -227,9 +165,9 @@ db.getSiblingDB('admin').createUser({
 Because docStreamer does not migrate user accounts or roles, you must manually create any users and roles required by your application. [Follow the appropriate procedure](https://www.mongodb.com/docs/manual/tutorial/manage-users-and-roles/) based on whether you are migrating to a sharded cluster or a replica set. Failure to create these users and roles in the destination cluster will prevent your application from connecting after the cutover process.
 
 
-## Configuring Percona docStreamer
+## 4. Configuring Percona docStreamer
 
-The application is configured via the [config.yaml](./config.yaml) file in the application's root directory. You will need to at the very least edit the source and destination parameters. 
+The application is configured via the [config.yaml](./config.yaml) file in the application's root directory. Make sure you download the config file, as you will need to at the very least edit the source and destination parameters. 
 
 ```yaml
 # Source DocumentDB
@@ -357,7 +295,7 @@ dry_run: False
 
 You can modify any configuration through the [config.yaml](./config.yaml) file, including log locations and performance-related parameters. All options are clearly documented, and you are free to adjust them as needed.
 
-## How to Use Percona docStreamer
+## 5. How to Use Percona docStreamer
 
 Percona docStreamer runs as a background process that is controlled through a small set of simple commands, making its operation straightforward. After updating the configuration file to match your environment, you can execute the appropriate commands for each specific use case as shown below.
 
@@ -820,7 +758,7 @@ _  __  /_  __ \  ___/____ \_  __/_  ___/  _ \  __ `/_  __ `__ \  _ \_  ___/
 ```
 </details>
 
-## Performance & Optimization
+## 6. Performance & Optimization
 
 ### Full Load Optimization
 
@@ -891,10 +829,62 @@ The data validation engine is highly configurable to balance performance impact 
 | retry_interval_ms | 500 | Hot Key Handling. If a record fails validation because it is actively being modified (detected via dirty tracking), the validator waits this long before re-checking it. |
 | max_retries | 3 | Persistence. How many times to retry a "Hot Key" before giving up. After this many attempts, the record is marked as a mismatch/skipped to move on. |
 
-## Additional Documentation
+
+## 7. Additional Documentation
 
 We have created a page dedicated to a more in [depth explanation of how Percona docStreamer works](./details.md) as well as a [frequently asked questions](./faq.md) page.
 
 
+## 8. Important Notes & Limitations 
 
+### Best Practices & Safety Precautions
+
+To ensure data integrity and prevent accidental data loss during migration, we recommend following these guidelines before initiating a docStreamer process.
+
+ - Backup Your Destination ***(if the destination environment contains data)*** Because Percona docStreamer will overwrite documents with matching _ids, always create a backup of your destination database before running a Full Sync. This ensures you can roll back if valid data is accidentally overwritten.
+
+ - Audit Existing Collections: ***(if the destination environment contains data)*** Check your destination database to see if collections with the same names as your source already exist. If they do, verify if the data is intended to be merged. If not, consider renaming the source or destination collection.
+
+- Verify Connection Strings: Double-check your SOURCE and DESTINATION URIs. A common mistake is pointing the destination to a production environment instead of a staging environment, which can lead to unintended data commingling.
+
+- Test with a Staging Run: If possible, perform a dry run or a migration into a temporary empty cluster/database first. This allows you to verify that the data maps correctly and the volume is as expected without risking your main data store.
+
+**CRITICAL WARNING** regarding Data Overwrites: Please be aware that if a document in your Source has the same _id as a document in your Destination, the Destination document will be overwritten immediately. This action is irreversible once the sync is performed.
+
+### Sharding support not tested
+
+Migration from DocumentDB sharded clusters has not been tested and therefore the behavior is unknown. Support for sharded DocumentDB clusters will be added in the future.
+
+### DocumentDB Cursor Rate Limiting
+
+AWS DocumentDB enforces service quotas, including limits on the number of cursors and the rate of getMore operations, which are fundamental to how change streams work.
+
+Symptom: If the migration falls too far behind (e.g., after being stopped for a long time) or if there is a massive burst of write activity, docStreamer may hit these rate limits. This can cause the change stream to fail or be terminated by AWS.
+
+Behavior: Percona docStreamer is designed to be resilient and will attempt to retry and resume the stream. However, persistent rate-limiting from the DocumentDB side may require intervention (e.g., scaling your DocumentDB instance or running the migration during off-peak hours).
+
+### DDL Operation Support During CDC Stage
+
+Percona docStreamer has support for replicating most DDL operations during the CDC stage (after the full sync has completed).
+
+Supported: drop (collection), dropDatabase, rename (collection), create (collection). 
+
+**NOT Supported**: createIndexes, dropIndexes. These operations will be skipped. You must manually recreate or drop indexes on the target cluster.
+
+### Supported Index Types
+
+Percona docStreamer automatically handles the creation of indexes during the Full Sync stage to ensure your destination performance matches the source. However, there are specific limitations regarding index types.
+
+Currently Supported:
+
+Most standard MongoDB index types (e.g., Single Field, Compound, Multikey, Geospatial).
+
+Not Currently Supported: 
+
+The following index types are not migrated during the Full Sync and must be created manually on the destination if required:
+
+ - Text Indexes
+ - Partial Indexes
+
+***Note:*** We recommend reviewing your source indexes prior to migration. If your application relies heavily on text search or partial indexing, plan to run a post-migration script to reconstruct these specific indexes on the destination cluster.
 
