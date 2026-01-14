@@ -390,7 +390,7 @@ func (cm *CopyManager) runLinearScan(ctx context.Context, sourceColl, targetColl
 		// It avoids memory sorts and "mixed type" index failures entirely.
 		readOpts := options.Find().
 			SetBatchSize(int32(config.Cfg.Cloner.ReadBatchSize))
-			// NOTE: NO SORT HERE. This is the key fix for Linear Mode.
+			// NOTE: NO SORT HERE. This is the fix for Linear Mode.
 
 		cursor, err := sourceColl.Find(errCtx, bson.D{}, readOpts)
 		if err != nil {
@@ -635,7 +635,7 @@ func (cm *CopyManager) readWorker(
 	}
 }
 
-// insertWorker runs BulkWrite with ReplaceOneModels
+// insertWorker runs BulkWrite with ReplaceOneModels and Retry Logic
 func (cm *CopyManager) insertWorker(
 	ctx context.Context,
 	cancel context.CancelFunc,
@@ -656,23 +656,50 @@ func (cm *CopyManager) insertWorker(
 		if len(batch.models) == 0 {
 			continue
 		}
-		if ctx.Err() != nil {
-			return
-		}
 
-		start := time.Now()
-		res, err := coll.BulkWrite(ctx, batch.models, bulkWriteOpts)
-
+		var res *mongo.BulkWriteResult
+		var err error
 		var docCount int64
-		if res != nil {
-			docCount = res.InsertedCount + res.UpsertedCount + res.MatchedCount
+
+		// --- RETRY LOOP ---
+		maxRetries := 5
+		for i := 1; i <= maxRetries; i++ {
+			if ctx.Err() != nil {
+				return
+			}
+
+			start := time.Now()
+			res, err = coll.BulkWrite(ctx, batch.models, bulkWriteOpts)
+
+			// Capture count even on partial success/failure
+			docCount = 0
+			if res != nil {
+				docCount = res.InsertedCount + res.UpsertedCount + res.MatchedCount
+			}
+
+			// Log the attempt duration
+			logging.LogFullLoadBatchOp(start, ns, docCount, batch.size, err)
+
+			if err == nil {
+				break // Success!
+			}
+
+			// If it's a retryable error, wait and try again
+			if shouldRetry(err) {
+				logging.PrintWarning(fmt.Sprintf("[%s] BulkWrite error (attempt %d/%d): %v. Retrying...", ns, i, maxRetries, err), 0)
+				time.Sleep(time.Second * time.Duration(i)) // Exponential-ish backoff
+				continue
+			}
+
+			// If it's not retryable (e.g. auth error, bad query), break immediately
+			break
 		}
-		logging.LogFullLoadBatchOp(start, ns, docCount, batch.size, err)
 
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
+			// Fatal error after retries
 			logging.PrintError(fmt.Sprintf("[%s] BulkWrite failed: %v", ns, err), 4)
 			cancel()
 			return
@@ -684,14 +711,14 @@ func (cm *CopyManager) insertWorker(
 			statusMgr.AddClonedBytes(batch.size)
 		}
 
-		elapsed := time.Since(start)
-
+		// Success Log (Debug level shows range)
+		elapsed := time.Duration(0) // Logic for elapsed only makes sense per-attempt, but we can log final success msg
 		if config.Cfg.Logging.Level == "debug" {
 			logging.PrintStep(fmt.Sprintf("[%s] Processed batch: %d inserted, %d replaced. (%s) in %s. Range: [%v - %v]",
 				ns, res.InsertedCount+res.UpsertedCount, res.ModifiedCount, humanize.Bytes(uint64(batch.size)), elapsed, batch.first, batch.last), 4)
 		} else {
-			logging.PrintStep(fmt.Sprintf("[%s] Processed batch: %d inserted, %d replaced. (%s) in %s",
-				ns, res.InsertedCount+res.UpsertedCount, res.ModifiedCount, humanize.Bytes(uint64(batch.size)), elapsed), 4)
+			logging.PrintStep(fmt.Sprintf("[%s] Processed batch: %d inserted, %d replaced. (%s)",
+				ns, res.InsertedCount+res.UpsertedCount, res.ModifiedCount, humanize.Bytes(uint64(batch.size))), 4)
 		}
 	}
 }
