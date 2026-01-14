@@ -190,6 +190,22 @@ mongo:
   extra_params: ""
 ```  
 
+***Note about using multiple target endpoints:*** You can configure multiple target MongoDB endpoints, as long as they use the same port. All you need to do is provide a comma separated list of nodes as shown below:
+
+```yaml
+# -----------------------------------------------
+# Target MongoDB
+# -----------------------------------------------
+mongo:
+  endpoint: "dan-ps-lab-mongos00.tp.int.percona.com,dan-ps-lab-mongos01.tp.int.percona.com"
+  port: "27017"
+  tls: false
+  ca_file: ""
+  tls_allow_invalid_hostnames: true
+  # extra_params: "directConnection=true&replicaSet=rs&ssl=false"
+  extra_params: ""
+```  
+
 Percona docStreamer configuration options are self explanatory and documented within the configuration file itself. The only parameters you have to pass to the application at runtime are the usernames for the source and destination environments, the passwords for each are interactive and you will be prompted for it accordingly. You can also configure environment variables so you don't have to type them if you prefer, the choice is yours.
 
 In addition to the above, you may include any additional standard MongoDB connection parameters using the `extra_params` configuration.
