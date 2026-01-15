@@ -231,6 +231,17 @@ While the architecture supports sharding, there are important caveats, particula
 
 ---
 
+## Q: Can I migrate from a non sharded DocumentDB cluster to a sharded MongoDB cluster?
+**A:** Yes, please note that docStreamer does not perform sharding setup operations (such as enableSharding or shardCollection). You must configure the sharding topology manually before starting the migration.
+
+Recommended Workflow:
+
+1. Pre-Create and Shard: Before starting the migration, manually create your target databases and collections, and enable sharding with your desired shard keys.
+2. Start Migration: When docStreamer starts, it will detect that the collections already exist and skip the creation step.
+3. Data Loading: The tool will insert data through the mongos router, allowing MongoDB to automatically distribute the documents across shards based on your pre-configured setup.
+
+---
+
 ## Q: Are new databases and collections migrated to destination if they were created on source while docStreamer is running?
 **A:** Yes. New collections and databases created while docStreamer is running (and while it is paused), will be detected and migrated.
 

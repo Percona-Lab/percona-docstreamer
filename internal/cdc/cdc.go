@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,10 +20,9 @@ import (
 )
 
 type CDCManager struct {
-	sourceClient *mongo.Client
-	targetClient *mongo.Client
-	eventQueue   chan *ChangeEvent
-	// channel type carries Batch struct (Models + IDs)
+	sourceClient       *mongo.Client
+	targetClient       *mongo.Client
+	eventQueue         chan *ChangeEvent
 	flushQueues        []chan map[string]*Batch
 	bulkWriters        []*BulkWriter
 	startAt            bson.Timestamp
@@ -31,14 +31,30 @@ type CDCManager struct {
 	statusManager      *status.Manager
 	tracker            *validator.InFlightTracker
 	store              *validator.Store
-	validatorMgr       *validator.Manager // Access to validation manager
+	validatorMgr       *validator.Manager
 	shutdownWG         sync.WaitGroup
 	workerWG           sync.WaitGroup
 	totalEventsApplied atomic.Int64
 	checkpointDocID    string
-	// Maps for fast exclusion lookup
-	excludeDBs   map[string]bool
-	excludeColls map[string]bool
+	excludeDBs         map[string]bool
+	excludeColls       map[string]bool
+	fatalErrorChan     chan error
+}
+
+// shouldRetry checks if an error is a transient network or connection issue
+func shouldRetry(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connection") ||
+		strings.Contains(msg, "network") ||
+		strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "deadline") ||
+		strings.Contains(msg, "socket") ||
+		strings.Contains(msg, "topology") ||
+		strings.Contains(msg, "context canceled") ||
+		strings.Contains(msg, "server selection error")
 }
 
 func NewManager(source, target *mongo.Client, checkpointDocID string, startAt bson.Timestamp, checkpoint *checkpoint.Manager, statusMgr *status.Manager, tracker *validator.InFlightTracker, store *validator.Store, valMgr *validator.Manager) *CDCManager {
@@ -98,6 +114,7 @@ func NewManager(source, target *mongo.Client, checkpointDocID string, startAt bs
 		checkpointDocID:  checkpointDocID,
 		excludeDBs:       excludeDBs,
 		excludeColls:     excludeColls,
+		fatalErrorChan:   make(chan error, workerCount+1), // Buffer slightly to prevent blocking
 	}
 	mgr.totalEventsApplied.Store(initialEvents)
 	return mgr
@@ -107,8 +124,12 @@ func NewManager(source, target *mongo.Client, checkpointDocID string, startAt bs
 func (m *CDCManager) handleBulkWrite(ctx context.Context, batchMap map[string]*Batch) (int64, []string, bson.Timestamp, error) {
 	var totalOps int64
 	var namespaces []string
-	var firstErr error
+	var lastErr error
 	var batchMaxTS bson.Timestamp
+
+	// Configurable Retry Settings
+	maxRetries := config.Cfg.CDC.NumRetries
+	retryInterval := time.Duration(config.Cfg.CDC.RetryIntervalMS) * time.Millisecond
 
 	for ns, batch := range batchMap {
 		if len(batch.Models) == 0 {
@@ -130,21 +151,59 @@ func (m *CDCManager) handleBulkWrite(ctx context.Context, batchMap map[string]*B
 		targetColl := m.targetClient.Database(db).Collection(coll)
 		opts := options.BulkWrite().SetOrdered(true)
 
-		result, err := targetColl.BulkWrite(ctx, batch.Models, opts)
+		// --- RETRY LOOP ---
+		var success bool
+		for i := 0; i <= maxRetries; i++ {
+			if ctx.Err() != nil {
+				return totalOps, namespaces, batchMaxTS, ctx.Err()
+			}
 
-		if err != nil {
-			logging.PrintError(fmt.Sprintf("[%s] BulkWrite failed: %v", ns, err), 0)
-			if wErr, ok := err.(mongo.BulkWriteException); ok {
-				logging.PrintError(fmt.Sprintf("[%s] ... %d write errors", ns, len(wErr.WriteErrors)), 0)
+			// If this is a retry, wait before proceeding
+			if i > 0 {
+				time.Sleep(retryInterval)
 			}
-			if firstErr == nil {
-				firstErr = err
+
+			result, err := targetColl.BulkWrite(ctx, batch.Models, opts)
+
+			if err != nil {
+				// 1. Is it a BulkWriteException (partial failure)?
+				if wErr, ok := err.(mongo.BulkWriteException); ok {
+					// Check if any errors inside are non-transient (e.g. DuplicateKey if we weren't doing upserts, or Schema validation)
+					// But we mostly care about network here. If the error itself is a connectivity one, shouldRetry will catch it.
+					// For structural errors (e.g. type mismatch), we SHOULD NOT retry.
+					logging.PrintError(fmt.Sprintf("[%s] BulkWrite Partial Error: %d write errors", ns, len(wErr.WriteErrors)), 0)
+					lastErr = err
+					// If it's a structural error, break immediately (don't retry infinite loops on bad data)
+					if !shouldRetry(err) {
+						break
+					}
+				}
+
+				// 2. Check if the error is Transient/Network related
+				if shouldRetry(err) {
+					logging.PrintWarning(fmt.Sprintf("[%s] CDC BulkWrite failed (attempt %d/%d): %v. Retrying...", ns, i+1, maxRetries+1, err), 0)
+					lastErr = err
+					continue // Retry loop
+				}
+
+				// 3. If not retryable, log and break
+				logging.PrintError(fmt.Sprintf("[%s] CDC BulkWrite FATAL error: %v", ns, err), 0)
+				lastErr = err
+				break
 			}
-			continue
+
+			// Success!
+			totalOps += result.InsertedCount + result.ModifiedCount + result.UpsertedCount + result.DeletedCount
+			namespaces = append(namespaces, ns)
+			success = true
+			break // Exit retry loop
 		}
 
-		totalOps += result.InsertedCount + result.ModifiedCount + result.UpsertedCount + result.DeletedCount
-		namespaces = append(namespaces, ns)
+		if !success {
+			// If we exhausted retries or hit a fatal error, we stop processing this batch map.
+			// This causes the worker to report the error upstream, likely pausing the pipeline.
+			return totalOps, namespaces, batchMaxTS, lastErr
+		}
 
 		// --- EVENT-DRIVEN VALIDATION ---
 		// The write succeeded. Now we queue these IDs for validation.
@@ -153,12 +212,15 @@ func (m *CDCManager) handleBulkWrite(ctx context.Context, batchMap map[string]*B
 		}
 	}
 
-	return totalOps, namespaces, batchMaxTS, firstErr
+	return totalOps, namespaces, batchMaxTS, nil
 }
 
 func (m *CDCManager) startFlushWorkers() {
 	workerCount := len(m.flushQueues)
 	logging.PrintInfo(fmt.Sprintf("[CDC] Starting %d partition-aware write workers...", workerCount), 0)
+
+	// Use configurable timeout
+	writeTimeout := time.Duration(config.Cfg.CDC.WriteTimeoutMS) * time.Millisecond
 
 	for i := 0; i < workerCount; i++ {
 		m.workerWG.Add(1)
@@ -167,18 +229,30 @@ func (m *CDCManager) startFlushWorkers() {
 
 			for batch := range queue {
 				start := time.Now()
-				writeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				// Capture max timestamp returned by handleBulkWrite
+
+				// Apply configurable timeout for the write operation
+				writeCtx, cancel := context.WithTimeout(context.Background(), writeTimeout)
+
 				flushedCount, namespaces, batchMaxTS, err := m.handleBulkWrite(writeCtx, batch)
 				cancel()
 
 				logging.LogCDCOp(start, flushedCount, namespaces, err)
 
 				if err != nil {
-					logging.PrintError(fmt.Sprintf("[CDC Worker %d] CRITICAL: Batch flush failed: %v", workerID, err), 0)
+					errMsg := fmt.Errorf("[CDC Worker %d] FATAL: Batch flush failed after retries: %w", workerID, err)
+					logging.PrintError(errMsg.Error(), 0)
+
+					// 1. Report Fatal Error
+					select {
+					case m.fatalErrorChan <- errMsg:
+					default:
+						// Channel full, another worker probably already reported an error
+					}
+
+					// 2. Stop this worker immediately
+					return
 				} else {
 					m.totalEventsApplied.Add(flushedCount)
-					// Update status with the applied timestamp
 					m.statusManager.UpdateAppliedStats(batchMaxTS)
 				}
 			}
@@ -189,7 +263,7 @@ func (m *CDCManager) startFlushWorkers() {
 func (m *CDCManager) Start(ctx context.Context) error {
 	logging.PrintInfo(fmt.Sprintf("Starting cluster-wide CDC... Resuming from checkpoint: %v", m.startAt), 0)
 
-	// FIX: Reconcile stats on startup ---
+	// Reconcile stats on startup ---
 	go func() {
 		logging.PrintInfo("[CDC] Reconciling validation statistics...", 0)
 		if err := m.validatorMgr.ReconcileStats(ctx); err != nil {
@@ -199,17 +273,41 @@ func (m *CDCManager) Start(ctx context.Context) error {
 		}
 	}()
 
+	// 1. Wrap context to allow cancellation on fatal error
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// 2. Start monitor for fatal errors
+	go func() {
+		select {
+		case err := <-m.fatalErrorChan:
+			logging.PrintError(fmt.Sprintf("FATAL CDC ERROR: %v. Initiating shutdown.", err), 0)
+			m.statusManager.SetError(err.Error())
+			cancel() // Cancel the main context
+		case <-ctx.Done():
+			// Normal shutdown
+		}
+	}()
+
 	m.startFlushWorkers()
 	m.shutdownWG.Add(1)
 	go m.processChanges(ctx)
 
 	err := m.watchChanges(ctx)
 
+	// Check if exit was due to fatal error
+	select {
+	case fatalErr := <-m.fatalErrorChan:
+		err = fatalErr
+	default:
+	}
+
 	logging.PrintInfo("[CDC] Watcher stopped. Waiting for processor to finalize...", 0)
 	m.shutdownWG.Wait()
 	m.workerWG.Wait()
 
-	if (m.lastSuccessfulTS != bson.Timestamp{}) {
+	// Only save checkpoint if we exited cleanly (no fatal errors)
+	if err == nil && (m.lastSuccessfulTS != bson.Timestamp{}) {
 		initialT0, _ := m.checkpoint.GetResumeTimestamp(context.Background(), m.checkpointDocID)
 		if initialT0.T == 0 || m.lastSuccessfulTS.T > initialT0.T || (m.lastSuccessfulTS.T == initialT0.T && m.lastSuccessfulTS.I > initialT0.I) {
 			saveCtx := context.Background()
@@ -218,7 +316,10 @@ func (m *CDCManager) Start(ctx context.Context) error {
 		}
 		m.statusManager.UpdateCDCStats(m.totalEventsApplied.Load(), m.lastSuccessfulTS)
 		m.statusManager.Persist(context.Background())
+	} else if err != nil {
+		logging.PrintWarning("Skipping final checkpoint save due to error shutdown.", 0)
 	}
+
 	return err
 }
 

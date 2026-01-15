@@ -96,7 +96,6 @@ func (s *Segmenter) findSegmentMaxKey(ctx context.Context, minKey, maxKey bson.R
 		return bson.RawValue{}, fmt.Errorf("failed to unmarshal minKey: %w", err)
 	}
 
-	// Filter: _id > currentMin
 	filter := bson.D{}
 	isMin := false
 	switch minVal.(type) {
@@ -115,7 +114,11 @@ func (s *Segmenter) findSegmentMaxKey(ctx context.Context, minKey, maxKey bson.R
 		SetProjection(bson.D{{Key: "_id", Value: 1}})
 
 	var res *mongo.SingleResult
-	maxRetries := 5
+
+	// Use Configured Retry Logic
+	maxRetries := config.Cfg.Cloner.NumRetries
+	retryInterval := time.Duration(config.Cfg.Cloner.RetryIntervalMS) * time.Millisecond
+
 	for i := 1; i <= maxRetries; i++ {
 		if ctx.Err() != nil {
 			return bson.RawValue{}, ctx.Err()
@@ -128,7 +131,7 @@ func (s *Segmenter) findSegmentMaxKey(ctx context.Context, minKey, maxKey bson.R
 			break
 		}
 		logging.PrintWarning(fmt.Sprintf("[%s] Segmenter find error (attempt %d/%d): %v. Retrying...", s.mcoll.Name(), i, maxRetries, res.Err()), 0)
-		time.Sleep(time.Second * time.Duration(i))
+		time.Sleep(retryInterval)
 	}
 
 	if res.Err() != nil {
@@ -390,7 +393,7 @@ func (cm *CopyManager) runLinearScan(ctx context.Context, sourceColl, targetColl
 		// It avoids memory sorts and "mixed type" index failures entirely.
 		readOpts := options.Find().
 			SetBatchSize(int32(config.Cfg.Cloner.ReadBatchSize))
-			// NOTE: NO SORT HERE. This is the fix for Linear Mode.
+			// NO SORT HERE. This is the fix for Linear Mode.
 
 		cursor, err := sourceColl.Find(errCtx, bson.D{}, readOpts)
 		if err != nil {
@@ -530,8 +533,10 @@ func (cm *CopyManager) readWorker(
 			SetBatchSize(int32(config.Cfg.Cloner.ReadBatchSize)).
 			SetSort(bson.D{{Key: "_id", Value: int32(1)}})
 
-		maxRetries := 5
 		success := false
+
+		maxRetries := config.Cfg.Cloner.NumRetries
+		retryInterval := time.Duration(config.Cfg.Cloner.RetryIntervalMS) * time.Millisecond
 
 	RetryLoop:
 		for i := 1; i <= maxRetries; i++ {
@@ -543,7 +548,7 @@ func (cm *CopyManager) readWorker(
 			if err != nil {
 				if shouldRetry(err) {
 					logging.PrintWarning(fmt.Sprintf("[%s] Read Worker %d Find error (attempt %d/%d): %v. Retrying...", ns, workerID, i, maxRetries, err), 0)
-					time.Sleep(time.Second * time.Duration(i))
+					time.Sleep(retryInterval)
 					continue RetryLoop
 				}
 				logging.PrintError(fmt.Sprintf("[%s] Read Worker %d Find fatal error: %v", ns, workerID, err), 4)
@@ -603,7 +608,7 @@ func (cm *CopyManager) readWorker(
 				}
 				if shouldRetry(err) {
 					logging.PrintWarning(fmt.Sprintf("[%s] Read Worker %d cursor broken (attempt %d/%d): %v. Retrying segment...", ns, workerID, i, maxRetries, err), 0)
-					time.Sleep(time.Second * time.Duration(i))
+					time.Sleep(retryInterval)
 					continue RetryLoop
 				}
 				logging.PrintError(fmt.Sprintf("[%s] Read Worker %d cursor fatal error: %v", ns, workerID, err), 4)
@@ -652,6 +657,10 @@ func (cm *CopyManager) insertWorker(
 		SetOrdered(false).
 		SetBypassDocumentValidation(true)
 
+	maxRetries := config.Cfg.Cloner.NumRetries
+	retryInterval := time.Duration(config.Cfg.Cloner.RetryIntervalMS) * time.Millisecond
+	writeTimeout := time.Duration(config.Cfg.Cloner.WriteTimeoutMS) * time.Millisecond
+
 	for batch := range queue {
 		if len(batch.models) == 0 {
 			continue
@@ -662,14 +671,19 @@ func (cm *CopyManager) insertWorker(
 		var docCount int64
 
 		// --- RETRY LOOP ---
-		maxRetries := 5
 		for i := 1; i <= maxRetries; i++ {
 			if ctx.Err() != nil {
 				return
 			}
 
 			start := time.Now()
-			res, err = coll.BulkWrite(ctx, batch.models, bulkWriteOpts)
+
+			// Detach from parent cancel context for the specific write timeout
+			// This ensures a network hang doesn't block indefinitely,
+			// but we still respect overall app shutdown (handled by checking ctx.Err at top of loop)
+			writeCtx, writeCancel := context.WithTimeout(context.Background(), writeTimeout)
+			res, err = coll.BulkWrite(writeCtx, batch.models, bulkWriteOpts)
+			writeCancel()
 
 			// Capture count even on partial success/failure
 			docCount = 0
@@ -687,7 +701,7 @@ func (cm *CopyManager) insertWorker(
 			// If it's a retryable error, wait and try again
 			if shouldRetry(err) {
 				logging.PrintWarning(fmt.Sprintf("[%s] BulkWrite error (attempt %d/%d): %v. Retrying...", ns, i, maxRetries, err), 0)
-				time.Sleep(time.Second * time.Duration(i)) // Exponential-ish backoff
+				time.Sleep(retryInterval)
 				continue
 			}
 
@@ -711,8 +725,8 @@ func (cm *CopyManager) insertWorker(
 			statusMgr.AddClonedBytes(batch.size)
 		}
 
-		// Success Log (Debug level shows range)
-		elapsed := time.Duration(0) // Logic for elapsed only makes sense per-attempt, but we can log final success msg
+		// Success Log
+		elapsed := time.Duration(0)
 		if config.Cfg.Logging.Level == "debug" {
 			logging.PrintStep(fmt.Sprintf("[%s] Processed batch: %d inserted, %d replaced. (%s) in %s. Range: [%v - %v]",
 				ns, res.InsertedCount+res.UpsertedCount, res.ModifiedCount, humanize.Bytes(uint64(batch.size)), elapsed, batch.first, batch.last), 4)

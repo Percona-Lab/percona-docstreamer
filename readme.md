@@ -812,7 +812,6 @@ Total Destination Connections = 2 Collections * 8 Insert Workers (16 concurrent 
 | `cloner.insert_batch_size` | Number of documents per insert batch |
 | `cloner.insert_batch_bytes` | Max size (in bytes) of a single insert batch, default 16777216 bytes (16MB) |
 
-
 ### CDC Optimization
 
 Change Data Capture (CDC) performance is largely governed by concurrency and batching efficiency. You can optimize the process using the `max_write_workers` setting, in combination with the batch size. `max_write_workers` controls the number of concurrent background routines that act as "consumers" during the CDC phase. These workers are responsible for processing batched change events and applying them to the target MongoDB.
@@ -823,7 +822,6 @@ This setting determines the write pipeline's capacity during live synchronizatio
 
 **Note on Partitioning:** Percona docStreamer uses Key-Based Partitioning to guarantee strict data ordering. This means all updates for a specific document are handled by the same worker. In rare cases of "Hot Keys" (a single document receiving massive update volume), one worker may be utilized more than others. This is an intentional trade-off to ensure data integrity.
 
-
 | Setting | Purpose |
 |--------:|---------|
 | `cdc.max_write_workers` | Number of concurrent background workers that act as CDC consumers. Increase this value to utilize more target MongoDB resources and improve real-time throughput. (Default: 4) |
@@ -831,6 +829,32 @@ This setting determines the write pipeline's capacity during live synchronizatio
 | `cdc.batch_interval_ms` | Maximum wait time before flushing an incomplete batch. Lower values reduce latency; higher values increase overall throughput. This ensures low-volume changes are still applied quickly |
 | `cdc.max_await_time_ms` | Max time (in ms) for the change stream to wait for new events |
 
+
+### Reliability & Error Handling
+
+docStreamer treats error handling differently depending on the migration phase. Because Full Load and CDC have different operational characteristics, their reliability settings are configured separately in `config.yaml`.
+
+1. Full Load Strategy (Cloner)
+
+The Full Load is a high-throughput, batch-oriented process. In case of connectivity issues (independent of the cause), we want to "Fail Fast." If a batch fails repeatedly, it usually indicates a structural problem (e.g., target disk full, authentication failure, or under-provisioned resources). It is often better for the process to stop quickly so you can fix the issue and resume, rather than stalling for minutes.
+
+2. CDC Strategy (Continuous Sync)
+
+The CDC process is a long-running, real-time stream and we handle connectivity issues slightly differently. The process must survive transient network issues, primary elections, or temporary connectivity drops without crashing. We generally recommend higher retry counts and longer timeouts for CDC to prevent the migration from stopping during the night due to a minor network blip.
+
+#### Configuration
+
+You can tune these behaviors independently in the cloner and cdc sections of your config.yaml as shown below:
+
+| Setting | Purpose |
+|--------:|---------|
+| `cloner.num_retries` | How many times to retry failed operations (reads/writes). default: 5 |
+| `cloner.retry_interval_ms` | How long to wait (in ms) between failed retries, default: 1000 |
+| `cloner.write_timeout_ms` | Max time (in ms) for a bulk write batch to complete. default: 30000 |
+|--------:|---------|
+| `cdc.num_retries` | How many times to retry a failed batch (due to network/connection issues). default: 5 |
+| `cdc.retry_interval_ms` | How long to wait (in milliseconds) between retry attempts. default: 1000 |
+| `cdc.write_timeout_ms` | Max time (in ms) for a BulkWrite operation to complete. default: 30000 |
 
 ### Validation Optimization
 
@@ -901,6 +925,7 @@ The following index types are not migrated during the Full Sync and must be crea
 
  - Text Indexes
  - Partial Indexes
+ - TTL Indexes
 
 ***Note:*** We recommend reviewing your source indexes prior to migration. If your application relies heavily on text search or partial indexing, plan to run a post-migration script to reconstruct these specific indexes on the destination cluster.
 

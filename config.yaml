@@ -158,6 +158,18 @@ cloner:
   # A collection of 1M docs will be split into 100 segments of 10k docs
   segment_size_docs: 10000
 
+  # num_retries: How many times to retry failed operations (reads/writes)
+  # Default: 5
+  num_retries: 5
+
+  # retry_interval_ms: How long to wait (in ms) between retries
+  # Default: 1000
+  retry_interval_ms: 1000
+
+  # write_timeout_ms: Max time (in ms) for a single bulk write batch to complete
+  # Default: 30000
+  write_timeout_ms: 30000
+
 # -----------------------------------------------
 # Change Data Capture (CDC) Settings
 # -----------------------------------------------
@@ -180,3 +192,17 @@ cdc:
   # It prevents the application from falling behind simply because it can't write fast enough.
   # Resource Usage: Setting this too high can saturate the connections or CPU on your target MongoDB cluster, potentially slowing down other operations.
   max_write_workers: 8              
+
+  # num_retries: How many times to retry a failed batch (due to network/connection issues)
+  # before giving up and stopping the migration.
+  # Default: 10
+  num_retries: 10
+
+  # retry_interval_ms: How long to wait (in milliseconds) between retry attempts.
+  # Default: 1000 (1 second)
+  retry_interval_ms: 1000
+
+  # write_timeout_ms: The maximum time to wait for a BulkWrite operation to complete.
+  # If the network hangs, this ensures the worker doesn't freeze forever.
+  # Default: 30000 (30 seconds)
+  write_timeout_ms: 30000

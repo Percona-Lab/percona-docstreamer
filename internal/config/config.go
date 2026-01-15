@@ -18,6 +18,9 @@ type CDCConfig struct {
 	BatchIntervalMS int `mapstructure:"batch_interval_ms"`
 	MaxAwaitTimeMS  int `mapstructure:"max_await_time_ms"`
 	MaxWriteWorkers int `mapstructure:"max_write_workers"`
+	NumRetries      int `mapstructure:"num_retries"`
+	RetryIntervalMS int `mapstructure:"retry_interval_ms"`
+	WriteTimeoutMS  int `mapstructure:"write_timeout_ms"`
 }
 
 // LoggingConfig holds logging settings
@@ -76,6 +79,9 @@ type ClonerConfig struct {
 	InsertBatchSize  int   `mapstructure:"insert_batch_size"`
 	ReadBatchSize    int   `mapstructure:"read_batch_size"`
 	InsertBatchBytes int64 `mapstructure:"insert_batch_bytes"`
+	NumRetries       int   `mapstructure:"num_retries"`
+	RetryIntervalMS  int   `mapstructure:"retry_interval_ms"`
+	WriteTimeoutMS   int   `mapstructure:"write_timeout_ms"`
 }
 
 // ValidationConfig holds settings for online data validation
@@ -141,17 +147,25 @@ func LoadConfig() {
 	viper.SetDefault("migration.env_prefix", "MIGRATION")
 	viper.SetDefault("migration.status_http_port", "8080")
 
+	// Cloner Defaults
 	viper.SetDefault("cloner.num_read_workers", 4)
 	viper.SetDefault("cloner.num_insert_workers", 8)
 	viper.SetDefault("cloner.read_batch_size", 1000)
 	viper.SetDefault("cloner.insert_batch_size", 1000)
 	viper.SetDefault("cloner.insert_batch_bytes", 48*1024*1024)
 	viper.SetDefault("cloner.segment_size_docs", 10000)
+	viper.SetDefault("cloner.num_retries", 5)
+	viper.SetDefault("cloner.retry_interval_ms", 1000)
+	viper.SetDefault("cloner.write_timeout_ms", 30000)
 
+	// CDC Defaults
 	viper.SetDefault("cdc.batch_size", 1000)
 	viper.SetDefault("cdc.batch_interval_ms", 500)
 	viper.SetDefault("cdc.max_await_time_ms", 1000)
 	viper.SetDefault("cdc.max_write_workers", 4)
+	viper.SetDefault("cdc.num_retries", 10)
+	viper.SetDefault("cdc.retry_interval_ms", 1000)
+	viper.SetDefault("cdc.write_timeout_ms", 30000)
 
 	// Validation Defaults
 	viper.SetDefault("validation.enabled", true)
