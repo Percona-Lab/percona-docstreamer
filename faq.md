@@ -26,36 +26,52 @@ OOM Risk: The risk of running out of memory lies with the host running docStream
 
 ---
 
-## Q: What happens if the application crashes during the Full Load phase?
-**A:** If docStreamer stops (crash, restart, power loss) during the Full Load, it resumes the migration from the point of the last completed collection. It does *not* start from scratch.
+### Q: What happens if the application crashes during the Full Load phase?
 
-### Detailed Recovery Workflow
+**A:** If docStreamer stops (crash, restart, power loss) during the Full Load, it attempts to "fail safe" and resume the migration.
 
-#### **The "Anchor" Checkpoint**
-- Before copying any data, docStreamer saves an **Anchor Timestamp** (**T₀**) to the target database.
-- If docStreamer crashes at 50% completion, this Anchor remains in the database, preserving the original start time of the migration project.
+#### 1. Smart Resume Logic
+On restart, docStreamer detects an existing **Anchor Timestamp** (T₀) in the database.
+* **Completed Collections:** It scans the checkpoints to see which collections finished successfully and skips them.
+* **Incomplete Collections:** It launches workers only for the remaining (incomplete) collections.
+* **Interrupted Collections:** Any collection that was *in-progress* during the crash is restarted from the **beginning**. Because workers use "Upserts" (ReplaceOne), re-copying simply overwrites documents with identical data.
 
-#### **Smart Resume Logic**
-- **On Restart:** docStreamer detects the Anchor and recognizes a *Partial Full Load*.
-- **Skipping Completed Work:** It scans the checkpoints to determine which collections finished successfully.
-- **Resuming Work:** It launches workers only for the remaining (incomplete) collections.
+#### 2. The "Anchor" & Consistency
+By reusing the original Anchor T₀ instead of capturing a new timestamp, docStreamer ensures that when the CDC phase starts, it will "rewind" back to the very beginning of the project. This captures any updates that occurred on *already-finished* collections while docStreamer was down.
 
-#### **Consistency**
-By reusing the original Anchor **T₀** instead of capturing a new timestamp, docStreamer ensures that when the CDC phase starts, it will “rewind” back to the very beginning of the project — capturing any updates that occurred on already-finished collections while docStreamer was down.
-
-#### **How Idempotency Handles Interrupted Collections**
-- For the collection being copied when the crash occurred, docStreamer restarts that collection from the **beginning**.
-- **No duplicates:** Because workers use Upserts (`ReplaceOne` with `upsert: true`), re-copying simply overwrites documents with identical data. No duplicate errors or cleanup required.
+> **CRITICAL WARNING: The 7-Day Limit**
+>
+> While the Anchor preserves consistency, it does **not** reset the timer on AWS DocumentDB's Change Stream retention (Hard Limit: 7 Days).
+>
+> * **The Risk:** If your total elapsed time (`Run 1` + `Downtime` + `Run 2`) exceeds 7 days, the Anchor T₀ will become "stale" (older than the oldest available log).
+> * **The Result:** The CDC phase will fail to start because the required history is lost.
+> * **Recommendation:** If you are migrating a massive dataset and have significant downtime, it is safer to **Start Fresh** (drop target & restart) to capture a new, fresh Anchor Timestamp.
 
 ---
 
-## Q: How does the "Resumable Full Load" work?
-**A:**
-- If docStreamer stops during copying, simply run `start` again.
-- docStreamer detects the existing Anchor Timestamp.
-- It scans checkpoints to determine which collections completed.
-- It skips completed collections and launches workers only for pending ones.
-- After all collections finish, it proceeds to CDC using the original **T₀**.
+### Q: What happens if a large collection migration is interrupted and I restart the application?
+
+**A:** `docStreamer` tracks completion at the **collection level**, not the document level. If a collection was only 99% complete when the application stopped, it is marked as "incomplete". On restart, **the entire collection is re-migrated from the beginning.**
+
+Here is the detailed workflow and resource impact:
+
+#### 1. The Workflow: "Reset and Replay"
+Because no checkpoint was saved for that specific collection, `docStreamer` treats it as a fresh task.
+* **Selection:** The application opens a new cursor on the Source DocumentDB and reads **every single document** again, starting from the first record.
+* **Transfer:** Every document is serialized and sent over the network to the Destination MongoDB again.
+* **Write Operation:** The application uses `ReplaceOne` operations with `upsert: true`.
+    * *Existing Records:* If a document was already migrated, MongoDB locates it by `_id` and overwrites it (effectively a "no-op" for data, but still a write operation).
+    * *New Records:* If the document hadn't been reached yet, it is inserted normally.
+
+#### 2. Resource Usage Impact
+Restarting a large collection is **not** free. It incurs the same resource penalties as running it for the first time, even for data that is already there.
+
+* **Network Bandwidth:** **High.** You will re-transmit 100% of the data volume. (e.g., If you had transferred 1TB of a 1.2TB collection, you will transfer that 1TB again).
+* **Source I/O:** **High.** DocumentDB must perform a full collection scan again, consuming read IOPS and CPU.
+* **Destination I/O:** **High.** MongoDB must perform a write operation for every document. Even if the data is identical, it still requires an index lookup (to find the `_id`) and a storage engine write (to update the record/timestamp).
+* **Memory:** **Moderate.** The application allocates memory to buffer batches of documents just as it did during the first run.
+
+> **Summary:** Resuming a failed collection is safe (no duplicates), but highly inefficient. It effectively "double-pays" the resource cost for any data migrated prior to the crash.
 
 ---
 
