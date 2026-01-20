@@ -138,7 +138,9 @@ make build-local
 
 ### Migration Users
 
-You need to create users in both source and destination environments, you can name them whatever you like:
+You must create users in both the source and destination environments.
+
+**Important for Sharded Clusters:** If your destination is a Sharded Cluster, you must create the user on the mongos router AND manually on the primary node of each backend shard. This is required because docStreamer connects directly to the shards to monitor their load (CPU/Memory/Locks) during the migration (see [Adaptive Flow Control](#adaptive-flow-control-throttling) for more details).
 
 ***Source (DocumentDB)***
 
@@ -855,6 +857,60 @@ You can tune these behaviors independently in the cloner and cdc sections of you
 | `cdc.num_retries` | How many times to retry a failed batch (due to network/connection issues). default: 5 |
 | `cdc.retry_interval_ms` | How long to wait (in milliseconds) between retry attempts. default: 1000 |
 | `cdc.write_timeout_ms` | Max time (in ms) for a BulkWrite operation to complete. default: 30000 |
+
+
+### Adaptive Flow Control (Throttling)
+
+docStreamer includes an intelligent, Cluster-Aware Flow Control mechanism designed to protect your target MongoDB from being overwhelmed. 
+
+While internal buffers (`queue_size`) protect the docStreamer application itself from running out of memory, they do not protect the destination database. If docStreamer pushes data faster than the target can write it, the target database may experience lock contention, CPU saturation, or OOM (Out of Memory) crashes.
+
+**How it works:** The Flow Control system runs a background monitor that polls the target MongoDB's status every second.
+* **Replica Sets:** It monitors the single primary node.
+* **Sharded Clusters:** It automatically discovers the cluster topology via the `config` database and opens direct connections to **every backend shard**. It then aggregates metrics across the entire cluster. If *any* single shard becomes overloaded, docStreamer pauses the migration globally to let that shard recover.
+
+docStreamer monitors two specific health indicators:
+
+#### 1. Global Lock Queue (`flow_control.target_max_queued_ops`)
+
+* **What it measures:** The number of operations currently waiting (queued) inside the WiredTiger storage engine because the database cannot process them fast enough.
+* **Metric Source:** `db.serverStatus().globalLock.currentQueue.total`
+* **Scope:** **Cluster-Wide.** docStreamer checks this on the Mongos and **every backend shard**. It takes the *maximum* value found.
+* **Impact:** If *any* single node shows a queue higher than your limit (e.g., > 50), it is a definitive sign that the node is saturated (CPU or I/O bound). docStreamer pauses data fetching immediately.
+
+#### 2. Resident Memory (`flow_control.target_max_resident_mb`)
+
+* **What it measures:** The actual physical RAM usage of the `mongod` process in Megabytes.
+* **Metric Source:** `db.serverStatus().mem.resident`
+* **Scope:** **Cluster-Wide.** docStreamer checks this on the Mongos and **every backend shard**.
+* **Impact:** If you are migrating to a smaller instance or a container with strict memory limits, you can set this threshold (e.g., `8192` for 8GB). If *any* shard's memory usage exceeds this, docStreamer pauses. This is critical for preventing the Operating System from killing the database process due to OOM (Out of Memory).
+
+**Behavior when throttled:** When a threshold is breached on *any* node, you will see a warning in the logs identifying the specific issue:  
+`[WARN] [FlowControl] THROTTLING PAUSED: Cluster High Load: Max Queued Ops (150) > Limit (50)`
+
+docStreamer will stop reading from the source (DocumentDB) but keep the connections open. Once all nodes in the cluster drop back to safe levels, migration resumes automatically.
+
+#### Configuration for Sharded Clusters
+
+When migrating to a **Sharded MongoDB Cluster** via a `mongos` router, special care must be taken to ensure the backend shards are protected.
+
+**Important:** docStreamer attempts to auto-discover and monitor backend shards. For this protection to work, the **Migration User** must exist on the shard nodes (see [Configure Users](#3-configure-users)). If the user is missing on the shards, docStreamer will fall back to monitoring *only* the `mongos` router, leaving your backend shards unprotected.
+
+Even with Flow Control enabled, we recommend tuning concurrency to prevent "bursty" traffic patterns:
+
+1.  **Enable Flow Control (Critical):**
+    * Set `flow_control.enabled: true`.
+    * Set `flow_control.target_max_resident_mb` to a safe limit for your shard nodes (e.g., if shards have 16GB RAM, set this to `14000`).
+
+2.  **Throttle Write Workers:**
+    * High concurrency can flood the shards with connections before Flow Control kicks in.
+    * **Action:** Reduce `cloner.num_insert_workers`.
+    * **Recommendation:** Start with 4-8 workers per collection.
+
+3.  **Reduce Batch Size:**
+    * Large batches require large memory allocation on the Shard to process.
+    * **Action:** Reduce `cloner.insert_batch_bytes` to **16MB** (16777216).
+    * **Trade-off:** This slightly increases network chatter but significantly reduces the "memory spike" per write operation on the backend.
 
 ### Validation Optimization
 

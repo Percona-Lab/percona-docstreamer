@@ -11,6 +11,7 @@ import (
 
 	"github.com/Percona-Lab/percona-docstreamer/internal/checkpoint"
 	"github.com/Percona-Lab/percona-docstreamer/internal/config"
+	"github.com/Percona-Lab/percona-docstreamer/internal/flow"
 	"github.com/Percona-Lab/percona-docstreamer/internal/logging"
 	"github.com/Percona-Lab/percona-docstreamer/internal/status"
 	"github.com/Percona-Lab/percona-docstreamer/internal/validator"
@@ -39,6 +40,7 @@ type CDCManager struct {
 	excludeDBs         map[string]bool
 	excludeColls       map[string]bool
 	fatalErrorChan     chan error
+	flowMgr            *flow.Manager
 }
 
 // shouldRetry checks if an error is a transient network or connection issue
@@ -57,7 +59,7 @@ func shouldRetry(err error) bool {
 		strings.Contains(msg, "server selection error")
 }
 
-func NewManager(source, target *mongo.Client, checkpointDocID string, startAt bson.Timestamp, checkpoint *checkpoint.Manager, statusMgr *status.Manager, tracker *validator.InFlightTracker, store *validator.Store, valMgr *validator.Manager) *CDCManager {
+func NewManager(source, target *mongo.Client, checkpointDocID string, startAt bson.Timestamp, checkpoint *checkpoint.Manager, statusMgr *status.Manager, tracker *validator.InFlightTracker, store *validator.Store, valMgr *validator.Manager, flowMgr *flow.Manager) *CDCManager {
 	resumeTS, found := checkpoint.GetResumeTimestamp(context.Background(), checkpointDocID)
 
 	if !found {
@@ -114,7 +116,8 @@ func NewManager(source, target *mongo.Client, checkpointDocID string, startAt bs
 		checkpointDocID:  checkpointDocID,
 		excludeDBs:       excludeDBs,
 		excludeColls:     excludeColls,
-		fatalErrorChan:   make(chan error, workerCount+1), // Buffer slightly to prevent blocking
+		fatalErrorChan:   make(chan error, workerCount+1),
+		flowMgr:          flowMgr,
 	}
 	mgr.totalEventsApplied.Store(initialEvents)
 	return mgr
@@ -368,6 +371,10 @@ func (m *CDCManager) processChanges(ctx context.Context) {
 	defer retryTicker.Stop()
 
 	for {
+		// CHECK THROTTLE
+		if m.flowMgr != nil {
+			m.flowMgr.Wait()
+		}
 		select {
 		case <-ctx.Done():
 			for i, writer := range m.bulkWriters {

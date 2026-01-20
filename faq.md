@@ -212,6 +212,43 @@ Indexes created on the source **after** migration starts (during CDC) are **not*
 
 ---
 
+### Adaptive Flow Control
+
+**Q: Why do I need Flow Control? Can't I just increase the number of workers?**
+**A:** Increasing workers speeds up data *reading*, but it can easily overwhelm your target database. If you push data faster than MongoDB can write it to disk, you risk:
+1.  **Lock Contention:** Operations pile up, causing latency spikes for other applications using the cluster.
+2.  **Memory Saturation:** MongoDB may consume all available RAM, leading to OOM (Out of Memory) crashes by the Operating System.
+3.  **Replica Set Lag:** Secondary nodes may fall too far behind, risking data consistency or triggering elections.
+
+Flow Control acts as an intelligent "brake," ensuring migration speed never exceeds the target's physical capacity.
+
+**Q: What exactly happens when the destination is overloaded?**
+**A:** When `docStreamer` detects that the target is stressed (high queue depth or memory usage):
+1.  **Status Change:** The application enters a `PAUSED` state and logs a warning (e.g., `[WARN] THROTTLING PAUSED`).
+2.  **Source Throttle:** It stops fetching new documents from DocumentDB immediately.
+3.  **Connection Keep-Alive:** Existing connections remain open, but no new write operations are sent.
+4.  **Auto-Resume:** The background monitor continues checking every second. As soon as the target's metrics drop below your configured thresholds, the migration automatically resumes exactly where it left off.
+
+**Q: Does this work with Sharded Clusters?**
+**A:** **Yes.** This is a Cluster-Aware feature.
+* **Standard tools** often only monitor the `mongos` router, which usually reports "healthy" metrics (0 queues) even when backend shards are struggling.
+* **docStreamer** automatically discovers your cluster topology and opens direct monitoring connections to **every backend shard**.
+* **Protection:** If *any* single shard becomes overloaded, the entire migration pauses. This prevents a "hot shard" scenario where one specific shard causes a cluster-wide failure.
+
+**Q: I see "targetQueuedOps: 0" in the status output. Is Flow Control working?**
+**A:** **Yes, this is normal.** MongoDB is highly optimized. A value of `0` means your database is handling the current write load instantly without any backlog.
+* **Healthy:** `0 - 10`
+* **Warning:** `10 - 50` (Micro-bursts)
+* **Critical:** `> 50` (Sustained saturation)
+Flow Control only steps in when it sees the critical values you defined in `config.yaml`.
+
+**Q: Will Flow Control slow down my migration?**
+**A:** It might slightly extend the total duration, but it **prevents failure**.
+* *Without Flow Control:* You might migrate 20% faster, but risk crashing the production database or forcing a restart due to errors.
+* *With Flow Control:* You get the maximum *safe* speed your hardware can handle, with zero manual intervention required to prevent crashes.
+
+---
+
 ## Q: What happens if the source environment is a Sharded Amazon DocumentDB cluster? Will docStreamer work?
 **A:** docStreamer is designed to work with sharded source environments, as long as the connection details point to the cluster's router/endpoint (equivalent to a mongos instance in a MongoDB sharded cluster).
 

@@ -143,11 +143,15 @@ cloner:
   # Increase writers to achieve 1:8 ratio with readers, this typically provides an effective performance
   # however it is important to keep in mind this is per collection, so tune this wisely (see max_concurrent_workers)
   # e.g. If num_read_workers = 4 then set num_insert_workers to 32 (e.g. 4 * 8 = 32)
+  # CRITICAL: Reduce insert workers to limit concurrent writes.
+  # High values here can OOM a shard by flooding it with connections/data.
+  # Recommendation: 4-8 per collection
   num_insert_workers: 8
   
   # read_batch_size: Number of documents per read batch
   read_batch_size: 1000
   
+  # Reduce batch size to lower memory pressure per request on the cluster.
   # insert_batch_size: Number of documents per insert batch
   insert_batch_size: 1000
   
@@ -206,3 +210,40 @@ cdc:
   # If the network hangs, this ensures the worker doesn't freeze forever.
   # Default: 30000 (30 seconds)
   write_timeout_ms: 30000
+
+# -----------------------------------------------
+# Adaptive Flow Control (Throttling)
+# -----------------------------------------------
+flow_control:
+  # Enabled: If true, docStreamer continuously monitors the target MongoDB's health.
+  # It polls `db.serverStatus()` on the target (and all shards if discovered) every second.
+  # If any node shows signs of overload (high queues or memory usage), 
+  # docStreamer will temporarily pause fetching new data from the source.
+  enabled: true
+
+  # Check Interval: How often (in milliseconds) to poll the target database for its status.
+  # Default: 1000 (1 second)
+  check_interval_ms: 1000
+
+  # Target Max Queued Ops: The safety limit for the Target's Global Lock Queue.
+  # Source Metric: db.serverStatus().globalLock.currentQueue.total
+  # Checks BOTH Mongos and all backend Shards.
+  # If ANY node has more than this many operations queued, docStreamer pauses.
+  # Default: 50
+  target_max_queued_ops: 50
+
+  # Target Max Resident MB: The safety limit for Target RAM usage.
+  # Source Metric: db.serverStatus().mem.resident
+  # If the target's Resident Memory exceeds this value (in Megabytes), docStreamer will pause. 
+  # This is critical for preventing OOM (Out of Memory) kills on the target host.
+  # SHARDED CLUSTERS NOTE: 
+  # If the migration user exists on the backend shards, this setting PROTECTS THE SHARDS directly.
+  # If the user only exists on Mongos, this setting only protects the Mongos router.
+  # Set to 0 to disable memory-based throttling.
+  # Default: 0 (Disabled)
+  target_max_resident_mb: 0
+
+  # Pause Duration: How long (in milliseconds) to sleep when an overload is detected.
+  # The application will re-check the status after this duration.
+  # Default: 500
+  pause_duration_ms: 500

@@ -12,6 +12,7 @@ import (
 	"github.com/Percona-Lab/percona-docstreamer/internal/checkpoint"
 	"github.com/Percona-Lab/percona-docstreamer/internal/config"
 	"github.com/Percona-Lab/percona-docstreamer/internal/discover"
+	"github.com/Percona-Lab/percona-docstreamer/internal/flow"
 	"github.com/Percona-Lab/percona-docstreamer/internal/indexer"
 	"github.com/Percona-Lab/percona-docstreamer/internal/logging"
 	"github.com/Percona-Lab/percona-docstreamer/internal/status"
@@ -196,9 +197,11 @@ type CopyManager struct {
 	checkpointMgr   *checkpoint.Manager
 	checkpointDocID string
 	initialMaxKey   bson.RawValue
+	flowMgr         *flow.Manager
 }
 
-func NewCopyManager(source, target *mongo.Client, collInfo discover.CollectionInfo, statusMgr *status.Manager, checkpointMgr *checkpoint.Manager, checkpointDocID string) *CopyManager {
+// Update: NewCopyManager now accepts flowMgr
+func NewCopyManager(source, target *mongo.Client, collInfo discover.CollectionInfo, statusMgr *status.Manager, checkpointMgr *checkpoint.Manager, checkpointDocID string, flowMgr *flow.Manager) *CopyManager {
 	return &CopyManager{
 		sourceClient:    source,
 		targetClient:    target,
@@ -206,6 +209,7 @@ func NewCopyManager(source, target *mongo.Client, collInfo discover.CollectionIn
 		statusMgr:       statusMgr,
 		checkpointMgr:   checkpointMgr,
 		checkpointDocID: checkpointDocID,
+		flowMgr:         flowMgr,
 	}
 }
 
@@ -486,6 +490,10 @@ func (cm *CopyManager) readWorker(
 	logging.PrintStep(fmt.Sprintf("[%s] Read Worker %d started", ns, workerID), 4)
 
 	for segment := range segmentQueue {
+		// CHECK THROTTLE BEFORE READING
+		if cm.flowMgr != nil {
+			cm.flowMgr.Wait()
+		}
 		var minVal, maxVal interface{}
 		if err := segment.Min.Unmarshal(&minVal); err != nil {
 			logging.PrintError(fmt.Sprintf("Min unmarshal failed: %v", err), 0)

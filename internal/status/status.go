@@ -16,6 +16,14 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
+type FlowControlStatus struct {
+	Enabled          bool   `json:"enabled"`
+	IsPaused         bool   `json:"isPaused"`
+	PauseReason      string `json:"pauseReason,omitempty"`
+	TargetQueuedOps  int    `json:"targetQueuedOps"`
+	TargetResidentMB int    `json:"targetResidentMB"`
+}
+
 // ValidationInfo shows the sync progress
 type ValidationInfo struct {
 	TotalChecked    int64   `json:"totalChecked"`
@@ -39,6 +47,8 @@ type Status struct {
 	LastEventTimestamp   bson.Timestamp `json:"lastEventTimestamp,omitempty"`
 	LastAppliedTimestamp bson.Timestamp `json:"lastAppliedTimestamp,omitempty"`
 	LastBatchAppliedAt   time.Time      `json:"lastBatchAppliedAt,omitempty"`
+	FlowQueuedOps        int            `bson:"flowQueuedOps"`
+	FlowResidentMB       int            `bson:"flowResidentMB"`
 }
 
 type OpTimeInfo struct {
@@ -57,17 +67,18 @@ type InitialSync struct {
 }
 
 type StatusOutput struct {
-	OK                        bool           `json:"ok"`
-	State                     string         `json:"state"`
-	Info                      string         `json:"info"`
-	TimeSinceLastEventSeconds float64        `json:"timeSinceLastEventSeconds"`
-	CDCLagSeconds             float64        `json:"cdcLagSeconds"`
-	EventsApplied             int64          `json:"totalEventsApplied"`
-	Validation                ValidationInfo `json:"validation"`
-	LastSourceEventTime       OpTimeInfo     `json:"lastSourceEventTime"`
-	LastAppliedEventTime      OpTimeInfo     `json:"lastAppliedEventTime"`
-	LastBatchAppliedAt        string         `json:"lastBatchAppliedAt"`
-	InitialSync               InitialSync    `json:"initialSync"`
+	OK                        bool               `json:"ok"`
+	State                     string             `json:"state"`
+	Info                      string             `json:"info"`
+	FlowControl               *FlowControlStatus `json:"flowControl,omitempty"`
+	TimeSinceLastEventSeconds float64            `json:"timeSinceLastEventSeconds"`
+	CDCLagSeconds             float64            `json:"cdcLagSeconds"`
+	EventsApplied             int64              `json:"totalEventsApplied"`
+	Validation                ValidationInfo     `json:"validation"`
+	LastSourceEventTime       OpTimeInfo         `json:"lastSourceEventTime"`
+	LastAppliedEventTime      OpTimeInfo         `json:"lastAppliedEventTime"`
+	LastBatchAppliedAt        string             `json:"lastBatchAppliedAt"`
+	InitialSync               InitialSync        `json:"initialSync"`
 }
 
 type Manager struct {
@@ -83,22 +94,30 @@ type Manager struct {
 	lastEventTimestamp   bson.Timestamp
 	lastAppliedTimestamp bson.Timestamp
 	lastBatchAppliedAt   time.Time
-
-	targetClient *mongo.Client
-	isPersisted  bool
-	lock         sync.RWMutex
+	flowStatus           FlowControlStatus
+	targetClient         *mongo.Client
+	isPersisted          bool
+	lock                 sync.RWMutex
 }
 
 func NewManager(targetClient *mongo.Client, isPersisted bool) *Manager {
 	logging.PrintInfo(fmt.Sprintf("Status manager initialized (collection: %s.%s)",
 		config.Cfg.Migration.MetadataDB, config.Cfg.Migration.StatusCollection), 0)
 
-	return &Manager{
+	mgr := &Manager{
 		state:           "starting",
 		lastStateChange: time.Now().UTC(),
 		targetClient:    targetClient,
 		isPersisted:     isPersisted,
 	}
+
+	// Initialize Flow Control status immediately from config
+	// This ensures it reports "enabled: true" even before the first health check runs
+	if config.Cfg.FlowControl.Enabled {
+		mgr.flowStatus.Enabled = true
+	}
+
+	return mgr
 }
 
 func (m *Manager) SetState(state, message string) {
@@ -186,6 +205,21 @@ func (m *Manager) UpdateAppliedStats(lastAppliedTS bson.Timestamp) {
 	}
 }
 
+func (m *Manager) UpdateFlowControl(paused bool, reason string, queuedOps, residentMB int) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	m.flowStatus = FlowControlStatus{
+		Enabled:          true,
+		IsPaused:         paused,
+		PauseReason:      reason,
+		TargetQueuedOps:  queuedOps,
+		TargetResidentMB: residentMB,
+	}
+
+	go m.Persist(context.Background())
+}
+
 func (m *Manager) LoadAndMerge(ctx context.Context) error {
 	m.lock.Lock()
 	defer m.lock.Unlock()
@@ -217,6 +251,8 @@ func (m *Manager) LoadAndMerge(ctx context.Context) error {
 	m.lastAppliedTimestamp = s.LastAppliedTimestamp
 	m.lastBatchAppliedAt = s.LastBatchAppliedAt
 	m.isPersisted = true
+	m.flowStatus.TargetQueuedOps = s.FlowQueuedOps
+	m.flowStatus.TargetResidentMB = s.FlowResidentMB
 	return nil
 }
 
@@ -243,6 +279,8 @@ func (m *Manager) Persist(ctx context.Context) {
 		"lastEventTimestamp":   m.lastEventTimestamp,
 		"lastAppliedTimestamp": m.lastAppliedTimestamp,
 		"lastBatchAppliedAt":   m.lastBatchAppliedAt,
+		"flowQueuedOps":        m.flowStatus.TargetQueuedOps,
+		"flowResidentMB":       m.flowStatus.TargetResidentMB,
 	}
 
 	opts := options.Replace().SetUpsert(true)
@@ -437,6 +475,7 @@ func (m *Manager) ToJSON(ctx context.Context) ([]byte, error) {
 		OK:                        baseState != "error",
 		State:                     baseState,
 		Info:                      info,
+		FlowControl:               &m.flowStatus,
 		TimeSinceLastEventSeconds: idleTime,
 		CDCLagSeconds:             cdcLag,
 		EventsApplied:             m.eventsApplied,
@@ -453,6 +492,10 @@ func (m *Manager) ToJSON(ctx context.Context) ([]byte, error) {
 			EstimatedCloneSizeHuman: ByteToHuman(m.estimatedBytes),
 			ClonedSizeHuman:         ByteToHuman(m.clonedBytes),
 		},
+	}
+	// If flow control is disabled in config, we can hide it or show enabled: false
+	if !config.Cfg.FlowControl.Enabled {
+		s.FlowControl = nil
 	}
 	return json.MarshalIndent(s, "", "    ")
 }

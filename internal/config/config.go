@@ -94,15 +94,25 @@ type ValidationConfig struct {
 	QueueSize            int  `mapstructure:"queue_size"`
 }
 
+// FlowControlConfig holds settings for adaptive throttling
+type FlowControlConfig struct {
+	Enabled             bool `mapstructure:"enabled"`
+	CheckIntervalMS     int  `mapstructure:"check_interval_ms"`
+	TargetMaxQueuedOps  int  `mapstructure:"target_max_queued_ops"`
+	TargetMaxResidentMB int  `mapstructure:"target_max_resident_mb"`
+	PauseDurationMS     int  `mapstructure:"pause_duration_ms"`
+}
+
 // Config holds all configuration for the application
 type Config struct {
-	Logging    LoggingConfig    `mapstructure:"logging"`
-	DocDB      DocDBConfig      `mapstructure:"docdb"`
-	Mongo      MongoConfig      `mapstructure:"mongo"`
-	Migration  MigrationConfig  `mapstructure:"migration"`
-	Cloner     ClonerConfig     `mapstructure:"cloner"`
-	CDC        CDCConfig        `mapstructure:"cdc"`
-	Validation ValidationConfig `mapstructure:"validation"`
+	Logging     LoggingConfig     `mapstructure:"logging"`
+	DocDB       DocDBConfig       `mapstructure:"docdb"`
+	Mongo       MongoConfig       `mapstructure:"mongo"`
+	Migration   MigrationConfig   `mapstructure:"migration"`
+	Cloner      ClonerConfig      `mapstructure:"cloner"`
+	CDC         CDCConfig         `mapstructure:"cdc"`
+	Validation  ValidationConfig  `mapstructure:"validation"`
+	FlowControl FlowControlConfig `mapstructure:"flow_control"`
 }
 
 // Cfg is the global config object
@@ -174,6 +184,13 @@ func LoadConfig() {
 	viper.SetDefault("validation.max_validation_workers", 4)
 	viper.SetDefault("validation.max_retries", 3)
 	viper.SetDefault("validation.queue_size", 2000)
+
+	// Flow control Defaults
+	viper.SetDefault("flow_control.enabled", true)
+	viper.SetDefault("flow_control.check_interval_ms", 1000)
+	viper.SetDefault("flow_control.target_max_queued_ops", 50) // Conservative default
+	viper.SetDefault("flow_control.target_max_resident_mb", 0) // 0 = disabled
+	viper.SetDefault("flow_control.pause_duration_ms", 500)
 
 	// --- 2. Read config file ---
 	viper.SetConfigName("config")

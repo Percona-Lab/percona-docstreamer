@@ -33,6 +33,7 @@ import (
 	"github.com/Percona-Lab/percona-docstreamer/internal/config"
 	"github.com/Percona-Lab/percona-docstreamer/internal/dbops"
 	"github.com/Percona-Lab/percona-docstreamer/internal/discover"
+	"github.com/Percona-Lab/percona-docstreamer/internal/flow"
 	"github.com/Percona-Lab/percona-docstreamer/internal/logging"
 	"github.com/Percona-Lab/percona-docstreamer/internal/pid"
 	"github.com/Percona-Lab/percona-docstreamer/internal/status"
@@ -221,12 +222,8 @@ func startAction(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	var hiddenargs = []string{"run",
-		"--docdb-user", docdbUser,
-		"--mongo-user", mongoUser,
-		"--docdb-pass", docdbPass,
-		"--mongo-pass", mongoPass,
-	}
+	var hiddenargs = []string{"run"}
+
 	if config.Cfg.Migration.Destroy {
 		hiddenargs = append(hiddenargs, "--destroy")
 	}
@@ -241,6 +238,15 @@ func startAction(cmd *cobra.Command, args []string) {
 	runCmd.SysProcAttr = &syscall.SysProcAttr{
 		Setsid: true, // Detach
 	}
+
+	// Inherit the current environment
+	runCmd.Env = os.Environ()
+	// Append credentials explicitly
+	runCmd.Env = append(runCmd.Env, fmt.Sprintf("DOCDB_USER=%s", docdbUser))
+	runCmd.Env = append(runCmd.Env, fmt.Sprintf("MONGO_USER=%s", mongoUser))
+	runCmd.Env = append(runCmd.Env, fmt.Sprintf("DOCDB_PASS=%s", docdbPass))
+	runCmd.Env = append(runCmd.Env, fmt.Sprintf("MONGO_PASS=%s", mongoPass))
+
 	if err := runCmd.Start(); err != nil {
 		logging.PrintError(fmt.Sprintf("Failed to launch background process: %v", err), 0)
 		os.Exit(1)
@@ -539,9 +545,25 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	}()
 
 	docdbUser, _ := cmd.Flags().GetString("docdb-user")
+	if docdbUser == "" {
+		docdbUser = os.Getenv("DOCDB_USER")
+	}
+
 	mongoUser, _ := cmd.Flags().GetString("mongo-user")
+	if mongoUser == "" {
+		mongoUser = os.Getenv("MONGO_USER")
+	}
+
 	docdbPass, _ := cmd.Flags().GetString("docdb-pass")
+	if docdbPass == "" {
+		docdbPass = os.Getenv("DOCDB_PASS")
+	}
+
 	mongoPass, _ := cmd.Flags().GetString("mongo-pass")
+	if mongoPass == "" {
+		mongoPass = os.Getenv("MONGO_PASS")
+	}
+
 	destroy, _ := cmd.Flags().GetBool("destroy")
 
 	docdbURI := config.Cfg.BuildDocDBURI(docdbUser, docdbPass)
@@ -578,6 +600,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		logging.PrintError(err.Error(), 0)
 		return
 	}
+
 	// --- Disconnect with timeout ---
 	defer func() {
 		dCtx, dCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -647,7 +670,14 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	valStore := validator.NewStore(targetClient)
 
 	apiServer = api.NewServer(config.Cfg.Migration.StatusHTTPPort)
+	// Initialize Status Manager BEFORE Flow Manager
 	statusManager = status.NewManager(targetClient, false)
+
+	// --- FLOW CONTROL ---
+	// Pass mongoUser and mongoPass so we can connect to shards if discovered
+	flowManager := flow.NewManager(targetClient, statusManager, mongoUser, mongoPass)
+	flowManager.Start()
+	defer flowManager.Stop()
 
 	validationManager := validator.NewManager(sourceClient, targetClient, tracker, valStore, statusManager)
 	defer validationManager.Close()
@@ -730,7 +760,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 				logging.PrintPhase("4", "FULL DATA LOAD")
 				statusManager.SetState("running", "Initial Sync (Full Load)")
 
-				_, err = launchFullLoadWorkers(ctx, sourceClient, targetClient, toRun, statusManager, checkpointManager)
+				_, err = launchFullLoadWorkers(ctx, sourceClient, targetClient, toRun, statusManager, checkpointManager, flowManager)
 				if err != nil {
 					if err != context.Canceled {
 						statusManager.SetError(err.Error())
@@ -785,6 +815,8 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 
 		startAt = resumeAt
 		statusManager.SetCloneCompleted()
+
+		statusManager.SetInitialSyncCompleted(0)
 	}
 
 	if ctx.Err() != nil {
@@ -805,6 +837,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		tracker,
 		valStore,
 		validationManager,
+		flowManager,
 	)
 
 	cdcManager.Start(ctx)
@@ -824,7 +857,7 @@ func extractDBNames(collections []discover.CollectionInfo) []string {
 	return dbNames
 }
 
-func launchFullLoadWorkers(ctx context.Context, source, target *mongo.Client, collections []discover.CollectionInfo, statusMgr *status.Manager, checkpointMgr *checkpoint.Manager) (bson.Timestamp, error) {
+func launchFullLoadWorkers(ctx context.Context, source, target *mongo.Client, collections []discover.CollectionInfo, statusMgr *status.Manager, checkpointMgr *checkpoint.Manager, flowMgr *flow.Manager) (bson.Timestamp, error) {
 	jobs := make(chan discover.CollectionInfo, len(collections))
 	for _, c := range collections {
 		jobs <- c
@@ -844,7 +877,7 @@ func launchFullLoadWorkers(ctx context.Context, source, target *mongo.Client, co
 				}
 				ns := collInfo.Namespace
 				logging.PrintStep(fmt.Sprintf("[Worker %d] Starting full load for %s", workerID, ns), 0)
-				copier := cloner.NewCopyManager(source, target, collInfo, statusMgr, checkpointMgr, config.Cfg.Migration.CheckpointDocID)
+				copier := cloner.NewCopyManager(source, target, collInfo, statusMgr, checkpointMgr, config.Cfg.Migration.CheckpointDocID, flowMgr)
 				docCount, _, err := copier.Do(ctx)
 				start := time.Now()
 				logging.LogFullLoadOp(start, ns, docCount, err)
