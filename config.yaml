@@ -103,6 +103,11 @@ sharding:
   #   shard_key: "email, rental_id"
   - namespace: "lukRange_1.test_1"
     shard_key: "uuid_type:1, objectid_type:1"
+    pre_split_strategy: "composite_uuid_oid"
+    # Explicitly map the fields (REQUIRED)
+    # These must match the field names in your shard_key above
+    uuid_field: "uuid_type"
+    oid_field: "objectid_type"
 
   # # Example 2: Hashed Sharding
   # # Shards on 'uuid' using a Hashed Index

@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"strings"
@@ -145,6 +146,177 @@ func distributeChunks(ctx context.Context, targetClient *mongo.Client, ns string
 	}
 
 	logging.PrintSuccess(fmt.Sprintf("[%s] Distribution complete. Moved: %d, Errors: %d", ns, moves, errors), 0)
+}
+
+// parseShardKeyNames extracts field names from a shard key string (e.g., "uuid:1, oid:1" -> ["uuid", "oid"])
+func parseShardKeyNames(shardKey string) []string {
+	var names []string
+	parts := strings.Split(shardKey, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		// Split on ":" to separate field name from type (1, -1, hashed)
+		kv := strings.Split(part, ":")
+		if len(kv) > 0 {
+			names = append(names, strings.TrimSpace(kv[0]))
+		}
+	}
+	return names
+}
+
+// preSplitCompositeUUID implements the deterministic splitting logic
+// It validates fields against the shard key order and supports UUID, OID, or both.
+func preSplitCompositeUUID(ctx context.Context, targetClient *mongo.Client, ns, shardKeyStr, uuidField, oidField string) {
+	// 1. Get ordered list of keys from ShardKey string
+	orderedKeys := parseShardKeyNames(shardKeyStr)
+	if len(orderedKeys) == 0 {
+		logging.PrintWarning(fmt.Sprintf("[%s] Cannot run composite pre-split: No keys found in %s", ns, shardKeyStr), 0)
+		return
+	}
+
+	// 2. Strict Validation: User MUST provide fields in config
+	if uuidField == "" && oidField == "" {
+		logging.PrintError(fmt.Sprintf("[%s] Composite pre-split enabled but 'uuid_field' and 'oid_field' are MISSING in config. We will NOT guess. Please configure them.", ns), 0)
+		return
+	}
+
+	// 3. Verify that configured fields actually exist in the shard key
+	if uuidField != "" {
+		found := false
+		for _, k := range orderedKeys {
+			if k == uuidField {
+				found = true
+				break
+			}
+		}
+		if !found {
+			logging.PrintError(fmt.Sprintf("[%s] Configured UUID field '%s' not found in shard key '%s'. Skipping split.", ns, uuidField, shardKeyStr), 0)
+			return
+		}
+	}
+	if oidField != "" {
+		found := false
+		for _, k := range orderedKeys {
+			if k == oidField {
+				found = true
+				break
+			}
+		}
+		if !found {
+			logging.PrintError(fmt.Sprintf("[%s] Configured OID field '%s' not found in shard key '%s'. Skipping split.", ns, oidField, shardKeyStr), 0)
+			return
+		}
+	}
+
+	logging.PrintStep(fmt.Sprintf("[%s] Starting Deterministic Pre-Split (Strategy: composite_uuid_oid). UUID='%s', OID='%s'", ns, uuidField, oidField), 0)
+
+	adminDB := targetClient.Database("admin")
+	splitCount := 0
+	errCount := 0
+
+	hexDigits := []string{"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"}
+
+	// === Phase 1A: Split the "Null" Zone ===
+	// Logic: UUID is null (if it exists), OID iterates 0-F.
+	// Only valid if we have both fields.
+	if uuidField != "" && oidField != "" {
+		logging.PrintInfo(fmt.Sprintf("[%s] Phase 1A: Splitting NULL zone...", ns), 0)
+
+		for _, digit := range hexDigits {
+			oidHex := digit + "00000000000000000000000"
+			oid, err := bson.ObjectIDFromHex(oidHex)
+			if err != nil {
+				continue
+			}
+
+			// Construct Middle Point respecting Order of keys in Shard Key
+			middle := bson.D{}
+			for _, k := range orderedKeys {
+				if k == uuidField {
+					middle = append(middle, bson.E{Key: k, Value: nil})
+				} else if k == oidField {
+					middle = append(middle, bson.E{Key: k, Value: oid})
+				} else {
+					// For any other keys (if compound has 3+ keys), use MinKey
+					middle = append(middle, bson.E{Key: k, Value: bson.MinKey{}})
+				}
+			}
+
+			if err := adminDB.RunCommand(ctx, bson.D{{Key: "split", Value: ns}, {Key: "middle", Value: middle}}).Err(); err == nil {
+				splitCount++
+			} else {
+				errCount++
+			}
+		}
+	} else if oidField != "" && uuidField == "" {
+		// Single OID Key or OID is primary
+		logging.PrintInfo(fmt.Sprintf("[%s] Splitting OID zone (0-F)...", ns), 0)
+		for _, digit := range hexDigits {
+			oidHex := digit + "00000000000000000000000"
+			oid, err := bson.ObjectIDFromHex(oidHex)
+			if err != nil {
+				continue
+			}
+			middle := bson.D{}
+			for _, k := range orderedKeys {
+				if k == oidField {
+					middle = append(middle, bson.E{Key: k, Value: oid})
+				} else {
+					middle = append(middle, bson.E{Key: k, Value: bson.MinKey{}})
+				}
+			}
+			if err := adminDB.RunCommand(ctx, bson.D{{Key: "split", Value: ns}, {Key: "middle", Value: middle}}).Err(); err == nil {
+				splitCount++
+			} else {
+				errCount++
+			}
+		}
+	}
+
+	// === Phase 1B: Split the "UUID" Zone ===
+	// Logic: UUID iterates 00-FF, OID is MinKey (if exists).
+	if uuidField != "" {
+		logging.PrintInfo(fmt.Sprintf("[%s] Phase 1B: Splitting UUID zone (00-FF)...", ns), 0)
+
+		for _, i := range hexDigits {
+			for _, j := range hexDigits {
+				prefix := i + j
+				if prefix == "00" {
+					continue
+				}
+
+				uuidHex := prefix + "000000000000000000000000000000"
+				uuidBytes, err := hex.DecodeString(uuidHex)
+				if err != nil {
+					continue
+				}
+				uuidVal := bson.Binary{Data: uuidBytes, Subtype: 0x04}
+
+				middle := bson.D{}
+				for _, k := range orderedKeys {
+					if k == uuidField {
+						middle = append(middle, bson.E{Key: k, Value: uuidVal})
+					} else {
+						// OID or others -> MinKey
+						middle = append(middle, bson.E{Key: k, Value: bson.MinKey{}})
+					}
+				}
+
+				if err := adminDB.RunCommand(ctx, bson.D{{Key: "split", Value: ns}, {Key: "middle", Value: middle}}).Err(); err == nil {
+					splitCount++
+					if splitCount%50 == 0 {
+						logging.PrintInfo(fmt.Sprintf("[%s] Created %d splits...", ns, splitCount), 0)
+					}
+				} else {
+					errCount++
+				}
+			}
+		}
+	}
+
+	logging.PrintSuccess(fmt.Sprintf("[%s] Deterministic split complete. Created %d chunks.", ns, splitCount), 0)
 }
 
 // preSplitRangeSharding calculates split points by SAMPLING the source.
@@ -308,17 +480,25 @@ func applySharding(ctx context.Context, targetClient *mongo.Client, sourceColl *
 		{Key: "key", Value: keyDoc},
 	}
 
-	if isHashed && len(keyDoc) == 1 {
+	// Handle NumInitialChunks (Usually only valid for Hashed sharding)
+	var numChunks int64
+	if rule.NumInitialChunks > 0 {
+		numChunks = int64(rule.NumInitialChunks)
+		logging.PrintInfo(fmt.Sprintf("[%s] Using configured NumInitialChunks: %d", ns, numChunks), 0)
+	} else {
+		// Default Calculation based on size
 		const chunkSize = 128 * 1024 * 1024
 		totalSize := collInfo.Size
 		if totalSize == 0 {
 			totalSize = collInfo.Count * 1024
 		}
-
-		numChunks := int64(math.Ceil(float64(totalSize) / float64(chunkSize)))
+		numChunks = int64(math.Ceil(float64(totalSize) / float64(chunkSize)))
 		if numChunks < 2 {
 			numChunks = 2
 		}
+	}
+
+	if isHashed && len(keyDoc) == 1 {
 		cmd = append(cmd, bson.E{Key: "numInitialChunks", Value: numChunks})
 		logging.PrintInfo(fmt.Sprintf("[%s] Hashed Sharding: Pre-allocating %d chunks.", ns, numChunks), 0)
 	}
@@ -333,7 +513,16 @@ func applySharding(ctx context.Context, targetClient *mongo.Client, sourceColl *
 	shards, err := getShardList(ctx, targetClient)
 	if err == nil {
 		if !isHashed {
-			preSplitRangeSharding(ctx, targetClient, sourceColl, ns, keyDoc, collInfo)
+			// Check strategy
+			if rule.PreSplitStrategy == "composite_uuid_oid" {
+				// PASS THE CONFIGURED FIELDS from config. We do NOT guess.
+				preSplitCompositeUUID(ctx, targetClient, ns, rule.ShardKey, rule.UUIDField, rule.OIDField)
+			} else if rule.DisablePreSplit {
+				logging.PrintWarning(fmt.Sprintf("[%s] Pre-splitting disabled by config. Target will have 1 chunk (Hot Shard detected).", ns), 0)
+			} else {
+				// Default fallback to scanning
+				preSplitRangeSharding(ctx, targetClient, sourceColl, ns, keyDoc, collInfo)
+			}
 		}
 		distributeChunks(ctx, targetClient, ns, shards)
 	} else {

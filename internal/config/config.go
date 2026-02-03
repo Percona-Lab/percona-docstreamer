@@ -14,8 +14,18 @@ import (
 
 // ShardRule defines the sharding configuration for a specific collection
 type ShardRule struct {
-	Namespace string `mapstructure:"namespace"` // e.g. "db.collection"
-	ShardKey  string `mapstructure:"shard_key"` // e.g. "field_1:1, field_2:hashed"
+	Namespace        string `mapstructure:"namespace"`          // e.g. "db.collection"
+	ShardKey         string `mapstructure:"shard_key"`          // e.g. "field_1:1, field_2:hashed"
+	NumInitialChunks int    `mapstructure:"num_initial_chunks"` // Optional: Set specific number of chunks (Hashed only)
+	DisablePreSplit  bool   `mapstructure:"disable_presplit"`   // Optional: Skip source scanning (Fast start, but 1 chunk for Range)
+
+	// Options: "none" (default), "scan", "composite_uuid_oid"
+	PreSplitStrategy string `mapstructure:"pre_split_strategy"`
+
+	// Explicitly define fields for the composite_uuid_oid strategy.
+	// We do NOT guess. You must specify which field is which.
+	UUIDField string `mapstructure:"uuid_field"` // e.g. "uuid_type"
+	OIDField  string `mapstructure:"oid_field"`  // e.g. "objectid_type"
 }
 
 // CDCConfig holds tuning parameters for Change Data Capture

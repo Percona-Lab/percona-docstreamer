@@ -313,6 +313,67 @@ dry_run: False
 
 You can modify any configuration through the [config.yaml](./config.yaml) file, including log locations and performance-related parameters. All options are clearly documented, and you are free to adjust them as needed.
 
+### Sharding Configuration
+
+If you are migrating to a **Sharded MongoDB Cluster**, docStreamer can be configured to automatically shard the target collections. You can define specific rules for each collection in the `config.yaml`.
+
+#### 1. Range Sharding (Default Behavior)
+By default, docStreamer uses Range Sharding. It performs a sampled scan of the source DocumentDB to calculate optimal split points.
+
+> **Note:** For very large collections (100M+ documents), this scan can take a significant amount of time.
+
+```yaml
+sharding:
+  - namespace: "my_db.users"
+    shard_key: "email:1, rental_id:1"
+```
+
+#### 2. Deterministic Pre-Splitting (Optimized for UUID/ObjectIDs)
+If your shard key consists of a **UUID** and/or **ObjectID**, you can skip the slow source scan and use a deterministic strategy. This calculates split points mathematically in seconds, creating a perfectly pre-split and balanced target instantly.
+
+**Supported Keys:**
+* **Composite:** UUID + ObjectID (any order)
+* **Single Field:** UUID Only or ObjectID Only
+
+**Configuration Requirements:**
+You **must** explicitly map your fields using `uuid_field` and `oid_field` so the tool knows exactly how to split the data.
+
+```yaml
+sharding:
+  - namespace: "my_db.users"
+    shard_key: "order_id:1, random_objectid:1"
+    
+    # Enable the optimized strategy
+    pre_split_strategy: "composite_uuid_oid"
+    
+    # REQUIRED MAPPINGS:
+    # These must match the field names in your shard_key above.
+    uuid_field: "order_id"   # The field containing UUIDs
+    oid_field: "random_objectid"      # The field containing ObjectIDs
+```
+
+#### 3. Hashed Sharding
+If you use Hashed Sharding, scanning the source is unnecessary. You can simply specify the number of chunks you want to pre-allocate.
+
+```yaml
+sharding:
+  - namespace: "my_db.orders"
+    shard_key: "order_id:hashed"
+    
+    # Optional: Pre-allocate a specific number of empty chunks
+    num_initial_chunks: 2400
+```
+
+#### 4. Disable Pre-Splitting
+If you want to handle splitting manually or simply start with a single chunk (**Warning:** This creates a Hot Shard), you can disable the pre-splitting logic entirely.
+
+```yaml
+sharding:
+  - namespace: "my_db.audit_logs"
+    shard_key: "created_at:1"
+    disable_presplit: true
+```
+
 ## 5. How to Use Percona docStreamer
 
 Percona docStreamer runs as a background process that is controlled through a small set of simple commands, making its operation straightforward. After updating the configuration file to match your environment, you can execute the appropriate commands for each specific use case as shown below.
