@@ -12,6 +12,12 @@ import (
 	"github.com/spf13/viper"
 )
 
+// ShardRule defines the sharding configuration for a specific collection
+type ShardRule struct {
+	Namespace string `mapstructure:"namespace"` // e.g. "db.collection"
+	ShardKey  string `mapstructure:"shard_key"` // e.g. "field_1:1, field_2:hashed"
+}
+
 // CDCConfig holds tuning parameters for Change Data Capture
 type CDCConfig struct {
 	BatchSize       int `mapstructure:"batch_size"`
@@ -113,6 +119,7 @@ type Config struct {
 	CDC         CDCConfig         `mapstructure:"cdc"`
 	Validation  ValidationConfig  `mapstructure:"validation"`
 	FlowControl FlowControlConfig `mapstructure:"flow_control"`
+	Sharding    []ShardRule       `mapstructure:"sharding"`
 }
 
 // Cfg is the global config object

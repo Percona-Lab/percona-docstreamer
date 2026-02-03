@@ -249,7 +249,10 @@ func (cm *CopyManager) Do(ctx context.Context) (int64, bson.Timestamp, error) {
 	}
 
 	indexModels := convertIndexes(cm.collInfo.Indexes)
-	targetColl, err := indexer.CreateCollectionAndPreloadIndexes(ctx, targetDB, cm.collInfo, indexModels)
+
+	// --- FIX: Pass sourceColl as the 3rd argument ---
+	targetColl, err := indexer.CreateCollectionAndPreloadIndexes(ctx, targetDB, sourceColl, cm.collInfo, indexModels)
+	// ------------------------------------------------
 	if err != nil {
 		return 0, emptyTS, fmt.Errorf("failed to create collection and indexes: %w", err)
 	}

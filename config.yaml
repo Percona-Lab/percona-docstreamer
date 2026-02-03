@@ -96,6 +96,25 @@ migration:
   # to source and destination
   dry_run: False
 
+sharding:
+  # Example 1: Compound Range Sharding (Default behavior)
+  # Shards on 'email' (ascending) and 'rental_id' (ascending)
+  # - namespace: "my_db.users"
+  #   shard_key: "email, rental_id"
+  - namespace: "lukRange_1.test_1"
+    shard_key: "uuid_type:1, objectid_type:1"
+
+  # # Example 2: Hashed Sharding
+  # # Shards on 'uuid' using a Hashed Index
+  # - namespace: "my_db.orders"
+  #   shard_key: "uuid:hashed"
+
+  # # Example 3: Compound Hashed Sharding
+  # # Shards on 'region' (Range) and 'user_id' (Hashed)
+  # - namespace: "my_db.audit_logs"
+  #   shard_key: "region:1, user_id:hashed"  
+
+
 # -----------------------------------------------
 # Online Data Validation Settings
 # -----------------------------------------------
