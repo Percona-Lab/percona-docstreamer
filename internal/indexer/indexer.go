@@ -320,7 +320,6 @@ func preSplitCompositeUUID(ctx context.Context, targetClient *mongo.Client, ns, 
 }
 
 // preSplitRangeSharding calculates split points by SAMPLING the source.
-// OPTIMIZED: Uses a single cursor iteration instead of repeated Skip() calls.
 func preSplitRangeSharding(ctx context.Context, targetClient *mongo.Client, sourceColl *mongo.Collection, ns string, keyDoc bson.D, collInfo discover.CollectionInfo) {
 	const targetChunkSize = 128 * 1024 * 1024 // 128MB
 	totalSize := collInfo.Size
@@ -474,6 +473,15 @@ func applySharding(ctx context.Context, targetClient *mongo.Client, sourceColl *
 		}
 	}
 
+	logging.PrintInfo(fmt.Sprintf("[%s] Ensuring shard key index exists: %v", ns, keyDoc), 0)
+	_, err := targetClient.Database(dbName).Collection(collInfo.Coll).Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    keyDoc,
+		Options: options.Index().SetName("shard_key_index_auto"),
+	})
+	if err != nil {
+		logging.PrintWarning(fmt.Sprintf("[%s] Warning: Failed to pre-create shard key index (proceeding to shard): %v", ns, err), 0)
+	}
+
 	// 3. Shard Collection
 	cmd := bson.D{
 		{Key: "shardCollection", Value: ns},
@@ -543,19 +551,24 @@ func CreateCollectionAndPreloadIndexes(ctx context.Context, targetDB *mongo.Data
 
 	targetColl := targetDB.Collection(collInfo.Coll)
 
-	applySharding(ctx, targetDB.Client(), sourceColl, collInfo.DB, ns, collInfo)
-
+	// Create Indexes BEFORE Sharding ---
+	// This ensures that the shard key index (if it exists on source) is created
+	// before we attempt to shard the collection.
 	if len(indexes) > 0 {
 		logging.PrintInfo(fmt.Sprintf("[%s] Starting creation of %d indexes...", ns, len(indexes)), 0)
 		start := time.Now()
 		names, err := targetColl.Indexes().CreateMany(ctx, indexes)
 		if err != nil {
+			// Do not fail here; proceed to sharding. Use logs to warn.
 			logging.PrintWarning(fmt.Sprintf("[%s] Failed to create indexes (will retry post-load): %v", ns, err), 0)
 		} else {
 			elapsed := time.Since(start)
 			logging.PrintInfo(fmt.Sprintf("[%s] Submitted %d indexes in %s: %v", ns, len(names), elapsed, names), 0)
 		}
 	}
+
+	// Apply Sharding (Now safe because indexes exist)
+	applySharding(ctx, targetDB.Client(), sourceColl, collInfo.DB, ns, collInfo)
 
 	return targetColl, nil
 }
@@ -591,7 +604,6 @@ func FinalizeIndexes(ctx context.Context, targetColl *mongo.Collection, indexes 
 	indexesToBuild := []mongo.IndexModel{}
 	for _, idx := range indexes {
 		if !existingIndexes[idx.Name] {
-			// Reconstruct the model for the V2 driver
 			model := mongo.IndexModel{
 				Keys:    idx.Key,
 				Options: options.Index().SetName(idx.Name).SetUnique(idx.Unique),
