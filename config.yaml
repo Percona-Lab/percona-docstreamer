@@ -15,14 +15,14 @@
 logging:
   # Log level (e.g., "debug", "info", "warn", "error")
   level: "info"
- 
+
   # Path to the log file.
   # The directory will be created if it doesn't exist.
   file_path: "logs/docStreamer.log"
- 
+
   # Path to CDC ops log
   ops_log_path: "logs/cdc.log"
- 
+
   # Path to full load ops log
   full_load_log_path: "logs/full_load.log"
 
@@ -37,47 +37,56 @@ docdb:
   # If true, tlsAllowInvalidHostnames=true will be added to the connection string.
   tls_allow_invalid_hostnames: true
   # extra_params: "directConnection=true&replicaSet=rsName"
-  extra_params: ""
 
 # -----------------------------------------------
 # Target MongoDB
 # -----------------------------------------------
 mongo:
-  endpoint: "dan-ps-lab-mongos00.tp.int.percona.com"
+  endpoint: "dan-ps-lab-mongos00.tp.int.percona.com,dan-ps-lab-mongos01.tp.int.percona.com"
   port: "27017"
   tls: false
   ca_file: ""
-  tls_allow_invalid_hostnames: true 
+  tls_allow_invalid_hostnames: true
   # extra_params: "directConnection=true&replicaSet=rsName"
-  extra_params: ""
+  extra_params: "wtimeoutMS=120000&socketTimeoutMS=180000"
 
 # -----------------------------------------------
 # General Migration Settings
 # -----------------------------------------------
 migration:
+  go_mem_limit: "80%"  # 80% of available RAM recommended
+  go_gc: 50             # Lower values increase GC frequency (reduces RAM usage)
   # Prefix for environment variables (e.g., MIGRATION_DOCDB_USER)
   env_prefix: "MIGRATION"
   pid_file_path: "docStreamer.pid"
   # Port for the HTTP /status endpoint
   status_http_port: "8080"
-  network_compressors: "zlib,snappy"
-  
+  # network_compressors: "zlib,snappy"
+  network_compressors: ""
+
   # Databases to skip during discovery
   exclude_dbs:
     - "admin"
     - "local"
     - "config"
- 
+#    - "sea_1"
+#    - "lukHash_1"
+#    - "compoundShard"
+#    - "cvg_1"
+#    - "lukRange_1"
+#    - "singleFieldShard"
+
+
   # Collections to skip during discovery (format: "dbname.collname")
   # If you want to skip all collections for a given database, use exclude_dbs setting instead
-  exclude_collections: []  
- 
+  exclude_collections: []
+
   # max_concurrent_workers: This is the max number of collections to copy at the same time
   # Controls how many collections are migrated simultaneously during the full load stage
   # Example: If you have 50 collections and set this to 2, docStreamer will migrate 2 collections at a time.
   # As soon as one finishes, the next one starts.
   max_concurrent_workers: 2
- 
+
   # Database and collections to keep track of the migration
   metadata_db: "docStreamer"
   checkpoint_collection: "checkpoints"
@@ -86,39 +95,20 @@ migration:
   status_doc_id: "migration_status"
   validation_stats_collection: "validation_stats"
   validation_failures_collection: "validation_failures"
- 
+  validation_audit_collection: "validation_audit"
+
+  # Timeout for collection discovery and stats (in milliseconds)
+  # Default: 120000 (2 minutes) to handle large collections on DocumentDB
+  discovery_timeout_ms: 120000
+
   # Set the following to True if you want to start the migration all over from scratch
   # This will drop all databases and collections in the destination environment
   # except for admin, local and config
   destroy: False
- 
-  # Set the following to True if you do not want to make any changes and just want to validate you are able to connect 
+
+  # Set the following to True if you do not want to make any changes and just want to validate you are able to connect
   # to source and destination
   dry_run: False
-
-sharding:
-  # Example 1: Compound Range Sharding (Default behavior)
-  # Shards on 'email' (ascending) and 'rental_id' (ascending)
-  # - namespace: "my_db.users"
-  #   shard_key: "email, rental_id"
-  - namespace: "lukRange_1.test_1"
-    shard_key: "uuid_type:1, objectid_type:1"
-    pre_split_strategy: "composite_uuid_oid"
-    # Explicitly map the fields (REQUIRED)
-    # These must match the field names in your shard_key above
-    uuid_field: "uuid_type"
-    oid_field: "objectid_type"
-
-  # # Example 2: Hashed Sharding
-  # # Shards on 'uuid' using a Hashed Index
-  # - namespace: "my_db.orders"
-  #   shard_key: "uuid:hashed"
-
-  # # Example 3: Compound Hashed Sharding
-  # # Shards on 'region' (Range) and 'user_id' (Hashed)
-  # - namespace: "my_db.audit_logs"
-  #   shard_key: "region:1, user_id:hashed"  
-
 
 # -----------------------------------------------
 # Online Data Validation Settings
@@ -127,32 +117,90 @@ validation:
   # Enabled: If true, every batch written by CDC is immediately queued for verification.
   # This ensures data consistency in real-time.
   enabled: True
-  
+
   # Batch Size: How many documents to validate in a single lookup operation.
   # Larger batches reduce network round-trips but increase memory usage.
   # Default: 100
-  batch_size: 100
-  
+  batch_size: 500
+
   # Retry Interval (ms): If a record fails validation because it is being written to (Hot Key),
   # the validator will wait this many milliseconds before checking it again.
+
   # Default: 500ms
   retry_interval_ms: 500
 
   # Max Validation Workers: How many concurrent threads to use for verifying data.
   # Increase this to speed up validation if you have spare CPU/Network capacity.
   # Default: 4
-  max_validation_workers: 4
+  max_validation_workers: 16
 
   # Max Retries: How many times to retry validation for a "Hot Key" (actively modifying record)
   # before giving up and marking it as skipped/mismatched.
   # Default: 3
   max_retries: 3
 
+  # The maximum time (in minutes) a failed or hot key will wait in the queue.
+  # Even if the system is busy, the sweeper will FORCE a re-check at this interval
+  # to ensure nothing gets stuck forever.
+  # Default: 5
+  hot_key_check_interval_minutes: 5
+
+  # How often (in seconds) the system checks if the CDC is "Idle".
+  # If the CDC is idle (active lag is 0 and no events for >5s), the sweeper
+  # will run IMMEDIATELY to fix pending keys, ignoring the hot_key_check_interval_minutes timer.
+  #
+  #   - Lower values (e.g., 2): Faster repairs during quiet periods (more CPU).
+  #   - Higher values (e.g., 10): Less CPU usage, slightly slower reaction to idle time.
+  #
+  # Default: 5
+  idle_check_interval_seconds: 5
+
   # Queue Size: The buffer size for the validation channel.
   # If the CDC writer is faster than the validator, this buffer fills up.
   # If full, CDC will drop validation requests to avoid slowing down replication.
-  # Default: 2000
+  # Default: 2000 (lower than 100 will revert to default 2000)
   queue_size: 2000
+
+
+# -----------------------------------------------
+# Sharding Setting
+# -----------------------------------------------
+sharding:
+  # Example 1: Compound Range Sharding (Default behavior)
+  # Shards on 'email' (ascending) and 'rental_id' (ascending)
+    - namespace: "lukRange_1.test_1"
+      shard_key: "email, int64_type"
+
+  # Example 2: Custom compound range sharding with pre-splitting
+    - namespace: "lukHash_1.test_2"
+      shard_key: "lifecycleId:1, profileId:1"
+      unique_shard_key: False
+      pre_split_strategy: "composite_uuid_oid"
+      uuid_field: "lifecycleId"
+      oid_field: "profileId"
+
+  # Example 3: Hashed Sharding
+  # Shards on 'uuid' using a Hashed Index
+    - namespace: "lukHash_1.test_1"
+      shard_key: "orderId:hashed"
+      pre_split_strategy: "hashed_manual"
+      pre_split_chunk_count: 10 # This will create 10 evenly spaced chunks in the hash ring
+
+  # Example 4: Compound Hashed Sharding
+  # Shards on 'region' (Range) and 'user_id' (Hashed)
+    - namespace: "compoundShard.test"
+      shard_key: "lifecycleId:1, clientId:hashed"
+
+  # Example 5: Range Sharding
+  # Shards on 'entryTimestamp' using a range sharding
+    - namespace: "singleFieldShard.test"
+      shard_key: "entryTimestamp"
+      pre_split_strategy: "range_manual"
+      pre_split_chunk_count: 10
+      split_min: "1700000000000"  # Your start timestamp
+      split_max: "2200000000000"  # Your end timestamp
+      split_type: "int64"         # Since your data is Long('...')
+
 
 # -----------------------------------------------
 # Full Load Settings
@@ -161,24 +209,25 @@ cloner:
   # num_read_workers: Controls how many threads are used to read data for a single collection
   # This is the number of parallel readers (read workers) fetching from DocumentDB for one collection
   num_read_workers: 4
-  
+
   # num_insert_workers: Controls how many threads are used to write data for a single collection
-  # This is the number of parallel writers (insert workers) pushing to MongoDB for one given collection 
+  # This is the number of parallel writers (insert workers) pushing to MongoDB for one given collection
   # Increase writers to achieve 1:8 ratio with readers, this typically provides an effective performance
   # however it is important to keep in mind this is per collection, so tune this wisely (see max_concurrent_workers)
+
   # e.g. If num_read_workers = 4 then set num_insert_workers to 32 (e.g. 4 * 8 = 32)
   # CRITICAL: Reduce insert workers to limit concurrent writes.
   # High values here can OOM a shard by flooding it with connections/data.
   # Recommendation: 4-8 per collection
-  num_insert_workers: 8
-  
+  num_insert_workers: 4
+
   # read_batch_size: Number of documents per read batch
   read_batch_size: 1000
-  
+
   # Reduce batch size to lower memory pressure per request on the cluster.
   # insert_batch_size: Number of documents per insert batch
   insert_batch_size: 1000
-  
+
   # insert_batch_bytes: Max size (in bytes) of a single insert batch
   insert_batch_bytes: 50331648 # 48MB
 
@@ -196,30 +245,36 @@ cloner:
 
   # write_timeout_ms: Max time (in ms) for a single bulk write batch to complete
   # Default: 30000
-  write_timeout_ms: 30000
+  write_timeout_ms: 300000
 
 # -----------------------------------------------
 # Change Data Capture (CDC) Settings
 # -----------------------------------------------
 cdc:
   # batch_size: How many operations to batch together
-  batch_size: 1000
-  
+  batch_size: 50
+
   # batch_interval_ms: Max time to wait (in ms) before flushing a batch
   # This ensures low-volume changes are still applied quickly
   batch_interval_ms: 500
-  
+
   # max_await_time_ms: Max time (in ms) for the change stream to wait for new events
   max_await_time_ms: 1000
-  
-  # max_write_workers: Controls concurrency during the cdc phase
+
+  # max_write_workers: Controls concurrency during the cdc phase.
   # After the full load finishes, this setting controls how many threads apply the stream of real-time changes.
-  # This determines how "wide" your write pipeline is during the live cdc phase. A higher number allows for more parallelism when replaying real-time events
-  # Increase this value to utilize more target MongoDB resources and improve real-time throughput. (Default: 8)
-  # Increasing this value helps if you have a very high volume of changes on the source (DocumentDB) and your target (MongoDB) has plenty of CPU/IO capacity. 
-  # It prevents the application from falling behind simply because it can't write fast enough.
-  # Resource Usage: Setting this too high can saturate the connections or CPU on your target MongoDB cluster, potentially slowing down other operations.
-  max_write_workers: 8              
+  # This determines how "wide" your write pipeline is during the live cdc phase. A higher number allows for more 
+  # parallelism when replaying real-time events.
+  #
+  # Resource Usage: Setting this too high can saturate the connections or CPU on your target MongoDB cluster.
+  #
+  # TUNING GUIDANCE: 
+  # This value acts as the "Gas Pedal" for the migration. It must be configured lower than the 
+  # 'flow_control.active_client_threshold' setting. If max_write_workers is set higher than or equal to 
+  # that threshold, the application will detect its own heavy load as "congestion" and pause itself unnecessarily.
+  # Recommendation: Set this to 50-75% of 'active_client_threshold' (e.g., if threshold is 50, set this to 25-30).
+  # Default: 8
+  max_write_workers: 8
 
   # num_retries: How many times to retry a failed batch (due to network/connection issues)
   # before giving up and stopping the migration.
@@ -233,7 +288,7 @@ cdc:
   # write_timeout_ms: The maximum time to wait for a BulkWrite operation to complete.
   # If the network hangs, this ensures the worker doesn't freeze forever.
   # Default: 30000 (30 seconds)
-  write_timeout_ms: 30000
+  write_timeout_ms: 300000
 
 # -----------------------------------------------
 # Adaptive Flow Control (Throttling)
@@ -241,7 +296,7 @@ cdc:
 flow_control:
   # Enabled: If true, docStreamer continuously monitors the target MongoDB's health.
   # It polls `db.serverStatus()` on the target (and all shards if discovered) every second.
-  # If any node shows signs of overload (high queues or memory usage), 
+  # If any node shows signs of overload (high queues or memory usage),
   # docStreamer will temporarily pause fetching new data from the source.
   enabled: true
 
@@ -258,9 +313,9 @@ flow_control:
 
   # Target Max Resident MB: The safety limit for Target RAM usage.
   # Source Metric: db.serverStatus().mem.resident
-  # If the target's Resident Memory exceeds this value (in Megabytes), docStreamer will pause. 
+  # If the target's Resident Memory exceeds this value (in Megabytes), docStreamer will pause.
   # This is critical for preventing OOM (Out of Memory) kills on the target host.
-  # SHARDED CLUSTERS NOTE: 
+  # SHARDED CLUSTERS NOTE:
   # If the migration user exists on the backend shards, this setting PROTECTS THE SHARDS directly.
   # If the user only exists on Mongos, this setting only protects the Mongos router.
   # Set to 0 to disable memory-based throttling.
@@ -271,3 +326,28 @@ flow_control:
   # The application will re-check the status after this duration.
   # Default: 500
   pause_duration_ms: 500
+
+  # The maximum acceptable latency (in milliseconds) for a 'serverStatus' command 
+  # on the target MongoDB. If the target takes longer than this to respond, 
+  # docStreamer will pause CDC and Full Load writes to allow the database to recover.
+  # Default: 250
+  latency_threshold_ms: 250
+
+  # active_client_threshold: The maximum number of concurrent active clients allowed on the target MongoDB 
+  # before throttling occurs. This helps prevent connection storms and CPU saturation during heavy loads.
+  #
+  # TUNING GUIDANCE:
+  # This value acts as the "Speed Limit" for the migration. It measures the TOTAL active clients on the target DB,
+  # which includes:
+  #   1. The 'max_write_workers' from this application.
+  #   2. Internal background threads (validation, monitoring).
+  #   3. Any other external applications connected to the target.
+  # Ensure this limit is high enough to accommodate your 'max_write_workers' plus a buffer for other traffic.
+  # Default: 50
+  active_client_threshold: 50
+
+  # Min WiredTiger Tickets: The minimum number of available write tickets required on the target.
+  # Source Metric: db.serverStatus().wiredTiger.concurrentTransactions.write.available
+  # If the available write tickets on ANY node drop to or below this value, docStreamer will pause.
+  # Default: 0 (Disabled)
+  min_wired_tiger_tickets: 1
