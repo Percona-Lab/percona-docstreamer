@@ -7,10 +7,8 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
-// OperationType is the type of MongoDB operation
 type OperationType string
 
-// Constants for MongoDB operation types
 const (
 	Insert        OperationType = "insert"
 	Update        OperationType = "update"
@@ -25,36 +23,63 @@ const (
 	DropIndexes   OperationType = "dropIndexes"
 )
 
-// ChangeEvent represents a single event from the change stream
 type ChangeEvent struct {
 	ID            bson.Raw       `bson:"_id"`
 	OperationType OperationType  `bson:"operationType"`
 	ClusterTime   bson.Timestamp `bson:"clusterTime"`
-	// Use bson.M instead of bson.Raw to prevent buffer reuse corruption during async processing
-	FullDocument bson.M    `bson:"fullDocument"`
-	Namespace    Namespace `bson:"ns"`
-	DocumentKey  bson.M    `bson:"documentKey"`
-	To           Namespace `bson:"to,omitempty"`
-	UpdateFields bson.M    `bson:"updateDescription,omitempty"`
+	FullDocument  bson.M         `bson:"fullDocument"`
+	Namespace     Namespace      `bson:"ns"`
+	DocumentKey   bson.M         `bson:"documentKey"`
+	To            Namespace      `bson:"to,omitempty"`
+	UpdateFields  bson.M         `bson:"updateDescription,omitempty"`
 }
 
-// Namespace holds the db and collection
 type Namespace struct {
 	Database   string `bson:"db"`
 	Collection string `bson:"coll"`
 }
 
-// Ns returns the full namespace string
 func (e *ChangeEvent) Ns() string {
 	return fmt.Sprintf("%s.%s", e.Namespace.Database, e.Namespace.Collection)
 }
 
-// ToWriteModel is a helper
 func (e *ChangeEvent) ToWriteModel() mongo.WriteModel {
 	switch e.OperationType {
 	case Insert:
 		return mongo.NewInsertOneModel().SetDocument(e.FullDocument)
-	case Update, Replace:
+	case Replace:
+		return mongo.NewReplaceOneModel().
+			SetFilter(bson.D{{Key: "_id", Value: e.DocumentKey["_id"]}}).
+			SetReplacement(e.FullDocument).
+			SetUpsert(true)
+	case Update:
+		if e.UpdateFields != nil {
+			updateDoc := bson.D{}
+
+			if updated, ok := e.UpdateFields["updatedFields"].(bson.M); ok && len(updated) > 0 {
+				updateDoc = append(updateDoc, bson.E{Key: "$set", Value: updated})
+			}
+
+			if removed, ok := e.UpdateFields["removedFields"].(bson.A); ok && len(removed) > 0 {
+				unsetDoc := bson.D{}
+				for _, f := range removed {
+					if fieldStr, ok := f.(string); ok {
+						unsetDoc = append(unsetDoc, bson.E{Key: fieldStr, Value: ""})
+					}
+				}
+				if len(unsetDoc) > 0 {
+					updateDoc = append(updateDoc, bson.E{Key: "$unset", Value: unsetDoc})
+				}
+			}
+
+			if len(updateDoc) > 0 {
+				return mongo.NewUpdateOneModel().
+					SetFilter(bson.D{{Key: "_id", Value: e.DocumentKey["_id"]}}).
+					SetUpdate(updateDoc).
+					SetUpsert(false)
+			}
+		}
+		// Fallback if UpdateFields is empty but we have a FullDocument
 		return mongo.NewReplaceOneModel().
 			SetFilter(bson.D{{Key: "_id", Value: e.DocumentKey["_id"]}}).
 			SetReplacement(e.FullDocument).

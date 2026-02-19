@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Percona-Lab/percona-docstreamer/internal/config"
@@ -16,296 +16,459 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
-type FlowControlStatus struct {
-	Enabled          bool   `json:"enabled"`
-	IsPaused         bool   `json:"isPaused"`
-	PauseReason      string `json:"pauseReason,omitempty"`
-	TargetQueuedOps  int    `json:"targetQueuedOps"`
-	TargetResidentMB int    `json:"targetResidentMB"`
+type StatusOutput struct {
+	OK    bool   `json:"ok"`
+	State string `json:"state"`
+	Info  string `json:"info"`
+
+	FlowControl *FCStatus `json:"flowControl,omitempty"`
+
+	// CDC Metrics
+	TimeSinceLastEventSeconds float64 `json:"timeSinceLastEventSeconds"`
+	CDCLagSeconds             float64 `json:"cdcLagSeconds"`
+	TotalEventsApplied        int64   `json:"totalEventsApplied"`
+	AdaptiveSerialBatches     int64   `json:"adaptiveSerialBatches"`
+	InsertedDocs              int64   `json:"insertedDocs"`
+	UpdatedDocs               int64   `json:"updatedDocs"`
+	DeletedDocs               int64   `json:"deletedDocs"`
+
+	// Sub-sections
+	Validation           ValidationStats `json:"validation"`
+	LastSourceEventTime  TSTime          `json:"lastSourceEventTime"`
+	LastAppliedEventTime TSTime          `json:"lastAppliedEventTime"`
+	LastBatchAppliedAt   string          `json:"lastBatchAppliedAt"`
+	InitialSync          SyncStatus      `json:"initialSync"`
 }
 
-// ValidationInfo shows the sync progress
-type ValidationInfo struct {
-	TotalChecked    int64   `json:"totalChecked"`
-	ValidCount      int64   `json:"validCount"`
-	MismatchCount   int64   `json:"mismatchCount"`
-	SyncPercent     float64 `json:"syncPercent"`
-	LastValidatedAt string  `json:"lastValidatedAt"`
+type FCStatus struct {
+	Enabled             bool   `json:"enabled"`
+	IsPaused            bool   `json:"isPaused"`
+	PauseReason         string `json:"pauseReason,omitempty"`
+	CurrentQueuedOps    int    `json:"currentQueuedOps"`
+	CurrentResidentMB   int    `json:"currentResidentMB"`
+	CurrentWriterQueue  int    `json:"currentWriterQueue"`
+	NativeLagged        bool   `json:"isReplicationLagged"`
+	NativeSustainerRate int    `json:"assignedRateLimit"`
 }
 
-// Status represents the current state of the migration
-type Status struct {
-	State                string         `json:"state"`
-	LastStateChange      time.Time      `json:"lastStateChange"`
-	Error                string         `json:"error,omitempty"`
-	CloneCompleted       bool           `json:"cloneCompleted"`
-	InitialSyncCompleted bool           `json:"initialSyncCompleted"`
-	Lag                  int64          `json:"lag,omitempty"`
-	EstimatedBytes       int64          `json:"estimatedBytes"`
-	ClonedBytes          int64          `json:"clonedBytes"`
-	EventsApplied        int64          `json:"eventsApplied"`
-	LastEventTimestamp   bson.Timestamp `json:"lastEventTimestamp,omitempty"`
-	LastAppliedTimestamp bson.Timestamp `json:"lastAppliedTimestamp,omitempty"`
-	LastBatchAppliedAt   time.Time      `json:"lastBatchAppliedAt,omitempty"`
-	FlowQueuedOps        int            `bson:"flowQueuedOps"`
-	FlowResidentMB       int            `bson:"flowResidentMB"`
+type ValidationStats struct {
+	QueuedBatches  int64  `json:"queuedBatches"`
+	TotalChecked   int64  `json:"totalChecked"`
+	MismatchFound  int64  `json:"mismatchFound"`
+	MismatchFixed  int64  `json:"mismatchFixed"`
+	Pending        int64  `json:"pendingMismatches"`
+	HotKeysWaiting int64  `json:"hotKeysWaiting"`
+	SyncPercent    string `json:"syncPercent"`
+	LastValidated  string `json:"lastValidatedAt"`
 }
 
-type OpTimeInfo struct {
+type TSTime struct {
 	TS      string `json:"ts"`
 	ISODate string `json:"isoDate"`
 }
 
-type InitialSync struct {
-	Completed               bool   `json:"completed"`
-	CompletionLagSeconds    int64  `json:"completionLagSeconds"`
-	CloneCompleted          bool   `json:"cloneCompleted"`
-	EstimatedCloneSizeBytes int64  `json:"estimatedCloneSizeBytes"`
-	ClonedSizeBytes         int64  `json:"clonedSizeBytes"`
-	EstimatedCloneSizeHuman string `json:"estimatedCloneSizeHuman"`
-	ClonedSizeHuman         string `json:"clonedSizeHuman"`
-}
-
-type StatusOutput struct {
-	OK                        bool               `json:"ok"`
-	State                     string             `json:"state"`
-	Info                      string             `json:"info"`
-	FlowControl               *FlowControlStatus `json:"flowControl,omitempty"`
-	TimeSinceLastEventSeconds float64            `json:"timeSinceLastEventSeconds"`
-	CDCLagSeconds             float64            `json:"cdcLagSeconds"`
-	EventsApplied             int64              `json:"totalEventsApplied"`
-	Validation                ValidationInfo     `json:"validation"`
-	LastSourceEventTime       OpTimeInfo         `json:"lastSourceEventTime"`
-	LastAppliedEventTime      OpTimeInfo         `json:"lastAppliedEventTime"`
-	LastBatchAppliedAt        string             `json:"lastBatchAppliedAt"`
-	InitialSync               InitialSync        `json:"initialSync"`
+type SyncStatus struct {
+	Completed               bool    `json:"completed"`
+	ProgressPercent         float64 `json:"progressPercent"`
+	ClonedDocs              int64   `json:"clonedDocs"`
+	EstimatedTotalDocs      int64   `json:"estimatedTotalDocs"`
+	ClonedBytes             int64   `json:"clonedBytes"`
+	EstimatedTotalBytes     int64   `json:"estimatedTotalBytes"`
+	ClonedSizeHuman         string  `json:"clonedSizeHuman"`
+	EstimatedCloneSizeHuman string  `json:"estimatedCloneSizeHuman"`
+	StartedAt               string  `json:"startedAt"`
+	EndedAt                 string  `json:"endedAt"`
+	Duration                string  `json:"duration"`
+	CompletionLagSeconds    float64 `json:"completionLagSeconds"`
 }
 
 type Manager struct {
-	state                string
-	lastStateChange      time.Time
-	error                string
-	cloneCompleted       bool
-	initialSyncCompleted bool
-	lag                  int64
-	estimatedBytes       int64
-	clonedBytes          int64
-	eventsApplied        int64
-	lastEventTimestamp   bson.Timestamp
-	lastAppliedTimestamp bson.Timestamp
-	lastBatchAppliedAt   time.Time
-	flowStatus           FlowControlStatus
-	targetClient         *mongo.Client
-	isPersisted          bool
-	lock                 sync.RWMutex
+	client           *mongo.Client
+	collection       *mongo.Collection
+	docID            string
+	state            string
+	info             string
+	mu               sync.RWMutex
+	startTime        time.Time
+	initialSyncStart time.Time
+	initialSyncEnd   time.Time
+
+	// Atomic Counters (CDC)
+	eventsApplied atomic.Int64
+	insertedDocs  atomic.Int64
+	updatedDocs   atomic.Int64
+	deletedDocs   atomic.Int64
+	serialBatches atomic.Int64
+
+	// Atomic Counters (Initial Sync)
+	estimatedTotalBytes atomic.Int64
+	estimatedTotalDocs  atomic.Int64
+	clonedBytes         atomic.Int64
+	clonedDocs          atomic.Int64
+
+	// Timestamps (Stored as Unix Seconds)
+	lastSourceEventTime  atomic.Int64
+	lastAppliedEventTime atomic.Int64
+	lastBatchAppliedAt   atomic.Int64
+
+	// Flags
+	cloneCompleted       atomic.Bool
+	initialSyncCompleted atomic.Bool
+
+	// Flow Control State (In-Memory)
+	fcIsPaused        atomic.Bool
+	fcReason          atomic.Value
+	fcQueuedOps       atomic.Int64
+	fcResidentMB      atomic.Int64
+	fcWriterQueue     atomic.Int64
+	fcNativeLagged    atomic.Bool
+	fcNativeSustainer atomic.Int64
+
+	// Validation Stats (In-Memory)
+	valTotalChecked  atomic.Int64
+	valMismatchFound atomic.Int64
+	valMismatchFixed atomic.Int64
+	valPending       atomic.Int64
+	valHotKeys       atomic.Int64
+	valLastCheck     atomic.Int64
+	valQueueSize     atomic.Int64
 }
 
-func NewManager(targetClient *mongo.Client, isPersisted bool) *Manager {
-	logging.PrintInfo(fmt.Sprintf("Status manager initialized (collection: %s.%s)",
-		config.Cfg.Migration.MetadataDB, config.Cfg.Migration.StatusCollection), 0)
+func NewManager(client *mongo.Client, isSource bool) *Manager {
+	dbName := config.Cfg.Migration.MetadataDB
+	collName := config.Cfg.Migration.StatusCollection
+	docID := config.Cfg.Migration.StatusDocID
 
-	mgr := &Manager{
-		state:           "starting",
-		lastStateChange: time.Now().UTC(),
-		targetClient:    targetClient,
-		isPersisted:     isPersisted,
+	m := &Manager{
+		client:     client,
+		collection: client.Database(dbName).Collection(collName),
+		docID:      docID,
+		state:      "initializing",
+		startTime:  time.Now().UTC(),
 	}
-
-	// Initialize Flow Control status immediately from config
-	// This ensures it reports "enabled: true" even before the first health check runs
-	if config.Cfg.FlowControl.Enabled {
-		mgr.flowStatus.Enabled = true
-	}
-
-	return mgr
+	m.fcReason.Store("")
+	return m
 }
 
-func (m *Manager) SetState(state, message string) {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-	m.state = fmt.Sprintf("%s (%s)", state, message)
-	m.lastStateChange = time.Now().UTC()
-	logging.PrintInfo(fmt.Sprintf("[STATUS] State changed to: %s", m.state), 0)
-}
-
-// IsCDCActive checks if the application is currently in the CDC phase
-func (m *Manager) IsCDCActive() bool {
-	m.lock.RLock()
-	defer m.lock.RUnlock()
-	return strings.HasPrefix(m.state, "running") && m.initialSyncCompleted
-}
-
-// IsCloneCompleted returns the current full load status
-func (m *Manager) IsCloneCompleted() bool {
-	m.lock.RLock()
-	defer m.lock.RUnlock()
-	return m.cloneCompleted
-}
-
-func (m *Manager) SetError(errMsg string) {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-	m.state = "error"
-	m.error = errMsg
-	m.lastStateChange = time.Now().UTC()
-}
-
-func (m *Manager) AddEstimatedBytes(bytes int64) {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-	m.estimatedBytes += bytes
-}
-
-func (m *Manager) AddClonedBytes(bytes int64) {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-	m.clonedBytes += bytes
-}
-
-func (m *Manager) SetCloneCompleted() {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-	m.cloneCompleted = true
-	if m.estimatedBytes > m.clonedBytes {
-		m.clonedBytes = m.estimatedBytes
-	}
-}
-
-func (m *Manager) SetInitialSyncCompleted(lag int64) {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-	m.initialSyncCompleted = true
-	m.lag = lag
-}
-
-func (m *Manager) GetEventsApplied() int64 {
-	m.lock.RLock()
-	defer m.lock.RUnlock()
-	return m.eventsApplied
-}
-
-// UpdateCDCStats updates the "Read" stats
-func (m *Manager) UpdateCDCStats(eventsApplied int64, lastEventTS bson.Timestamp) {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-	m.eventsApplied = eventsApplied
-	m.lastEventTimestamp = lastEventTS
-}
-
-// UpdateAppliedStats updates the "Write" stats (called by flush workers)
-func (m *Manager) UpdateAppliedStats(lastAppliedTS bson.Timestamp) {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-	m.lastBatchAppliedAt = time.Now().UTC()
-
-	// Only update if newer
-	if lastAppliedTS.T > m.lastAppliedTimestamp.T ||
-		(lastAppliedTS.T == m.lastAppliedTimestamp.T && lastAppliedTS.I > m.lastAppliedTimestamp.I) {
-		m.lastAppliedTimestamp = lastAppliedTS
-	}
-}
-
-func (m *Manager) UpdateFlowControl(paused bool, reason string, queuedOps, residentMB int) {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-
-	m.flowStatus = FlowControlStatus{
-		Enabled:          true,
-		IsPaused:         paused,
-		PauseReason:      reason,
-		TargetQueuedOps:  queuedOps,
-		TargetResidentMB: residentMB,
-	}
+func (m *Manager) UpdateFlowControl(paused bool, reason string, queuedOps, residentMB, writerQueue int, nativeLagged bool, nativeSustainer int) {
+	m.fcIsPaused.Store(paused)
+	m.fcReason.Store(reason)
+	m.fcQueuedOps.Store(int64(queuedOps))
+	m.fcResidentMB.Store(int64(residentMB))
+	m.fcWriterQueue.Store(int64(writerQueue))
+	m.fcNativeLagged.Store(nativeLagged)
+	m.fcNativeSustainer.Store(int64(nativeSustainer))
 
 	go m.Persist(context.Background())
 }
 
+func (m *Manager) UpdateValidationStats(checked, found, fixed, pending, hotKeys int64) {
+	if checked > 0 {
+		m.valTotalChecked.Add(checked)
+	}
+	if found > 0 {
+		m.valMismatchFound.Add(found)
+	}
+	if fixed > 0 {
+		m.valMismatchFixed.Add(fixed)
+	}
+	m.valPending.Store(pending)
+	m.valHotKeys.Store(hotKeys)
+	m.valLastCheck.Store(time.Now().UTC().Unix())
+}
+
+func (m *Manager) SetValidationQueueSize(size int) {
+	m.valQueueSize.Store(int64(size))
+}
+
+func (m *Manager) SetState(state, info string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.state = state
+	m.info = info
+}
+
+func (m *Manager) SetError(err string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.state = "error"
+	m.info = err
+}
+
+func (m *Manager) UpdateCDCStats(applied, inserted, updated, deleted int64, lastSourceTS bson.Timestamp) {
+	m.eventsApplied.Store(applied)
+	m.insertedDocs.Store(inserted)
+	m.updatedDocs.Store(updated)
+	m.deletedDocs.Store(deleted)
+	if lastSourceTS.T > 0 {
+		m.lastSourceEventTime.Store(int64(lastSourceTS.T))
+	}
+}
+
+func (m *Manager) UpdateAppliedStats(lastAppliedTS bson.Timestamp) {
+	if lastAppliedTS.T > 0 {
+		m.lastAppliedEventTime.Store(int64(lastAppliedTS.T))
+		m.lastBatchAppliedAt.Store(time.Now().UTC().Unix())
+	}
+}
+
+func (m *Manager) IncrementSerialBatches() {
+	m.serialBatches.Add(1)
+}
+
+func (m *Manager) GetEventsApplied() int64 {
+	return m.eventsApplied.Load()
+}
+func (m *Manager) GetInsertedDocs() int64 {
+	return m.insertedDocs.Load()
+}
+func (m *Manager) GetUpdatedDocs() int64 {
+	return m.updatedDocs.Load()
+}
+func (m *Manager) GetDeletedDocs() int64 {
+	return m.deletedDocs.Load()
+}
+
+func (m *Manager) AddEstimatedBytes(n int64) {
+	m.estimatedTotalBytes.Add(n)
+}
+func (m *Manager) AddEstimatedDocs(n int64) {
+	m.estimatedTotalDocs.Add(n)
+}
+func (m *Manager) AddClonedBytes(n int64) {
+	m.clonedBytes.Add(n)
+}
+func (m *Manager) AddClonedDocs(n int64) {
+	m.clonedDocs.Add(n)
+}
+func (m *Manager) ResetProgress() {
+	m.estimatedTotalBytes.Store(0)
+	m.estimatedTotalDocs.Store(0)
+	m.clonedBytes.Store(0)
+	m.clonedDocs.Store(0)
+}
+func (m *Manager) SetInitialSyncStart(t time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.initialSyncStart = t
+}
+func (m *Manager) SetInitialSyncEnd(t time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.initialSyncEnd = t
+}
+
+func (m *Manager) IsInitialSyncCompleted() bool {
+	return m.initialSyncCompleted.Load()
+}
+func (m *Manager) SetInitialSyncCompleted(lagSeconds float64) {
+	m.initialSyncCompleted.Store(true)
+}
+
 func (m *Manager) LoadAndMerge(ctx context.Context) error {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-
-	dbName := config.Cfg.Migration.MetadataDB
-	collName := config.Cfg.Migration.StatusCollection
-	docID := config.Cfg.Migration.StatusDocID
-	coll := m.targetClient.Database(dbName).Collection(collName)
-
-	var s Status
-	err := coll.FindOne(ctx, bson.D{{Key: "_id", Value: docID}}).Decode(&s)
+	var doc bson.M
+	err := m.collection.FindOne(ctx, bson.D{{Key: "_id", Value: m.docID}}).Decode(&doc)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
-			return nil
-		}
-		return fmt.Errorf("failed to load status: %w", err)
+		return err
 	}
 
-	m.state = s.State
-	m.lastStateChange = s.LastStateChange
-	m.error = s.Error
-	m.cloneCompleted = s.CloneCompleted
-	m.initialSyncCompleted = s.InitialSyncCompleted
-	m.lag = s.Lag
-	m.estimatedBytes = s.EstimatedBytes
-	m.clonedBytes = s.ClonedBytes
-	m.eventsApplied = s.EventsApplied
-	m.lastEventTimestamp = s.LastEventTimestamp
-	m.lastAppliedTimestamp = s.LastAppliedTimestamp
-	m.lastBatchAppliedAt = s.LastBatchAppliedAt
-	m.isPersisted = true
-	m.flowStatus.TargetQueuedOps = s.FlowQueuedOps
-	m.flowStatus.TargetResidentMB = s.FlowResidentMB
+	if val, ok := doc["lastSourceEventTime"]; ok {
+		m.lastSourceEventTime.Store(parseInt64(val))
+	}
+	if val, ok := doc["lastAppliedEventTime"]; ok {
+		m.lastAppliedEventTime.Store(parseInt64(val))
+	}
+
+	if val, ok := doc["lastBatchAppliedAt"]; ok {
+		if t, isTime := val.(time.Time); isTime {
+			m.lastBatchAppliedAt.Store(t.Unix())
+		} else {
+			m.lastBatchAppliedAt.Store(parseInt64(val))
+		}
+	}
+
+	if val, ok := doc["totalEventsApplied"]; ok {
+		m.eventsApplied.Store(parseInt64(val))
+	}
+	if val, ok := doc["insertedDocs"]; ok {
+		m.insertedDocs.Store(parseInt64(val))
+	}
+	if val, ok := doc["updatedDocs"]; ok {
+		m.updatedDocs.Store(parseInt64(val))
+	}
+	if val, ok := doc["deletedDocs"]; ok {
+		m.deletedDocs.Store(parseInt64(val))
+	}
+
+	if val, ok := doc["estimatedTotalBytes"]; ok {
+		m.estimatedTotalBytes.Store(parseInt64(val))
+	}
+	if val, ok := doc["estimatedTotalDocs"]; ok {
+		m.estimatedTotalDocs.Store(parseInt64(val))
+	}
+	if val, ok := doc["clonedBytes"]; ok {
+		m.clonedBytes.Store(parseInt64(val))
+	}
+	if val, ok := doc["clonedDocs"]; ok {
+		m.clonedDocs.Store(parseInt64(val))
+	}
+
+	if val, ok := doc["cloneCompleted"].(bool); ok {
+		m.cloneCompleted.Store(val)
+	}
+	if val, ok := doc["initialSyncCompleted"].(bool); ok {
+		m.initialSyncCompleted.Store(val)
+	}
+
+	m.mu.Lock()
+	if val, ok := doc["initialSyncStart"].(time.Time); ok {
+		m.initialSyncStart = val
+	}
+	if val, ok := doc["initialSyncEnd"].(time.Time); ok {
+		m.initialSyncEnd = val
+	}
+	m.mu.Unlock()
+
+	//Safe Validation Stats Loading (handles int32/int64/float64 transparently)
+	if valStatsRaw, ok := doc["validation"]; ok {
+		if valStats, isM := valStatsRaw.(bson.M); isM {
+			m.valTotalChecked.Store(parseInt64(valStats["totalChecked"]))
+			m.valMismatchFound.Store(parseInt64(valStats["mismatchFound"]))
+			m.valMismatchFixed.Store(parseInt64(valStats["mismatchFixed"]))
+		} else if valStatsD, isD := valStatsRaw.(bson.D); isD {
+			for _, e := range valStatsD {
+				switch e.Key {
+				case "totalChecked":
+					m.valTotalChecked.Store(parseInt64(e.Value))
+				case "mismatchFound":
+					m.valMismatchFound.Store(parseInt64(e.Value))
+				case "mismatchFixed":
+					m.valMismatchFixed.Store(parseInt64(e.Value))
+				}
+			}
+		}
+	}
+
+	if fc, ok := doc["flowControl"].(bson.M); ok {
+		if val, ok := fc["isPaused"].(bool); ok {
+			m.fcIsPaused.Store(val)
+		}
+		if val, ok := fc["pauseReason"].(string); ok {
+			m.fcReason.Store(val)
+		}
+		if val, ok := fc["currentQueuedOps"]; ok {
+			m.fcQueuedOps.Store(parseInt64(val))
+		}
+		if val, ok := fc["currentResidentMB"]; ok {
+			m.fcResidentMB.Store(parseInt64(val))
+		}
+		if val, ok := fc["currentWriterQueue"]; ok {
+			m.fcWriterQueue.Store(parseInt64(val))
+		}
+		if val, ok := fc["isReplicationLagged"].(bool); ok {
+			m.fcNativeLagged.Store(val)
+		}
+		if val, ok := fc["assignedRateLimit"]; ok {
+			m.fcNativeSustainer.Store(parseInt64(val))
+		}
+	}
+
 	return nil
 }
 
 func (m *Manager) Persist(ctx context.Context) {
-	m.lock.Lock()
-	defer m.lock.Unlock()
+	m.mu.RLock()
+	state := m.state
+	info := m.info
+	start := m.initialSyncStart
+	end := m.initialSyncEnd
+	m.mu.RUnlock()
 
-	dbName := config.Cfg.Migration.MetadataDB
-	collName := config.Cfg.Migration.StatusCollection
-	docID := config.Cfg.Migration.StatusDocID
-	coll := m.targetClient.Database(dbName).Collection(collName)
-
-	doc := bson.M{
-		"_id":                  docID,
-		"state":                m.state,
-		"lastStateChange":      m.lastStateChange,
-		"error":                m.error,
-		"cloneCompleted":       m.cloneCompleted,
-		"initialSyncCompleted": m.initialSyncCompleted,
-		"lag":                  m.lag,
-		"estimatedBytes":       m.estimatedBytes,
-		"clonedBytes":          m.clonedBytes,
-		"eventsApplied":        m.eventsApplied,
-		"lastEventTimestamp":   m.lastEventTimestamp,
-		"lastAppliedTimestamp": m.lastAppliedTimestamp,
-		"lastBatchAppliedAt":   m.lastBatchAppliedAt,
-		"flowQueuedOps":        m.flowStatus.TargetQueuedOps,
-		"flowResidentMB":       m.flowStatus.TargetResidentMB,
+	fcStatus := bson.M{
+		"enabled":             config.Cfg.FlowControl.Enabled,
+		"isPaused":            m.fcIsPaused.Load(),
+		"pauseReason":         m.fcReason.Load().(string),
+		"currentQueuedOps":    m.fcQueuedOps.Load(),
+		"currentResidentMB":   m.fcResidentMB.Load(),
+		"currentWriterQueue":  m.fcWriterQueue.Load(),
+		"isReplicationLagged": m.fcNativeLagged.Load(),
+		"assignedRateLimit":   m.fcNativeSustainer.Load(),
 	}
 
-	opts := options.Replace().SetUpsert(true)
-	_, err := coll.ReplaceOne(ctx, bson.D{{Key: "_id", Value: docID}}, doc, opts)
-	if err != nil {
-		logging.PrintWarning(fmt.Sprintf("[STATUS] Failed to persist status: %v", err), 0)
-	} else {
-		m.isPersisted = true
+	valStats := bson.M{
+		"totalChecked":    m.valTotalChecked.Load(),
+		"mismatchFound":   m.valMismatchFound.Load(),
+		"mismatchFixed":   m.valMismatchFixed.Load(),
+		"lastValidatedAt": time.Unix(m.valLastCheck.Load(), 0).UTC(),
 	}
+
+	update := bson.M{
+		"$set": bson.M{
+			"state":                 state,
+			"info":                  info,
+			"lastUpdated":           time.Now().UTC(),
+			"totalEventsApplied":    m.eventsApplied.Load(),
+			"insertedDocs":          m.insertedDocs.Load(),
+			"updatedDocs":           m.updatedDocs.Load(),
+			"deletedDocs":           m.deletedDocs.Load(),
+			"estimatedTotalBytes":   m.estimatedTotalBytes.Load(),
+			"estimatedTotalDocs":    m.estimatedTotalDocs.Load(),
+			"clonedBytes":           m.clonedBytes.Load(),
+			"clonedDocs":            m.clonedDocs.Load(),
+			"adaptiveSerialBatches": m.serialBatches.Load(),
+			"cloneCompleted":        m.cloneCompleted.Load(),
+			"initialSyncCompleted":  m.initialSyncCompleted.Load(),
+			"initialSyncStart":      start,
+			"initialSyncEnd":        end,
+			"flowControl":           fcStatus,
+			"validation":            valStats,
+			"lastSourceEventTime":   m.lastSourceEventTime.Load(),
+			"lastAppliedEventTime":  m.lastAppliedEventTime.Load(),
+			"lastBatchAppliedAt":    m.lastBatchAppliedAt.Load(),
+		},
+	}
+
+	opts := options.UpdateOne().SetUpsert(true)
+	shortCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	if _, err := m.collection.UpdateOne(shortCtx, bson.D{{Key: "_id", Value: m.docID}}, update, opts); err != nil {
+		logging.PrintWarning(fmt.Sprintf("[STATUS] Failed to persist status (Transient): %v", err), 0)
+	}
+}
+
+func (m *Manager) GetCDCIdleMetrics() (float64, float64) {
+	lastEvent := m.lastSourceEventTime.Load()
+	if lastEvent == 0 {
+		return 0, 0
+	}
+	now := time.Now().UTC().Unix()
+	idle := float64(now - lastEvent)
+
+	lastApplied := m.lastAppliedEventTime.Load()
+	lag := 0.0
+	if lastApplied > 0 {
+		lag = float64(lastEvent - lastApplied)
+	}
+	return idle, lag
+}
+
+func (m *Manager) GetStats() StatusOutput {
+	// Internal helper to get raw stats without HTTP wrapping if needed
+	return m.buildStatusOutput()
 }
 
 func (m *Manager) StatusHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	jsonBytes, err := m.ToJSON(r.Context())
-	if err != nil {
-		http.Error(w, "Failed to serialize status", http.StatusInternalServerError)
-		return
-	}
+	out := m.buildStatusOutput()
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(jsonBytes)
+	if b, err := json.MarshalIndent(out, "", "    "); err == nil {
+		w.Write(b)
+	} else {
+		json.NewEncoder(w).Encode(out)
+	}
 }
 
+// ByteToHuman converts bytes to human readable string
 func ByteToHuman(bytes int64) string {
 	const (
 		kb = 1024
@@ -314,188 +477,183 @@ func ByteToHuman(bytes int64) string {
 	)
 	f := float64(bytes)
 	if bytes >= gb {
-		return fmt.Sprintf("%.f GB", f/gb)
+		return fmt.Sprintf("%.1f GB", f/gb)
 	}
 	if bytes >= mb {
 		return fmt.Sprintf("%.1f MB", f/mb)
 	}
 	if bytes >= kb {
-		return fmt.Sprintf("%.f KB", f/kb)
+		return fmt.Sprintf("%.0f KB", f/kb)
 	}
 	return fmt.Sprintf("%d B", bytes)
 }
 
-// getValidationStats helper to fetch validation stats directly from DB
-func (m *Manager) getValidationStats(ctx context.Context) ValidationInfo {
-	statsColl := m.targetClient.Database(config.Cfg.Migration.MetadataDB).Collection(config.Cfg.Migration.ValidationStatsCollection)
-	failColl := m.targetClient.Database(config.Cfg.Migration.MetadataDB).Collection(config.Cfg.Migration.ValidationFailuresCollection)
+func (m *Manager) buildStatusOutput() StatusOutput {
+	m.mu.RLock()
+	state := m.state
+	info := m.info
+	start := m.initialSyncStart
+	end := m.initialSyncEnd
+	m.mu.RUnlock()
 
-	// 1. Aggregate totals (cumulative throughput) from stats
-	pipeline := mongo.Pipeline{
-		{{Key: "$group", Value: bson.D{
-			{Key: "_id", Value: nil},
-			{Key: "total", Value: bson.D{{Key: "$sum", Value: "$total_checked"}}},
-			{Key: "valid", Value: bson.D{{Key: "$sum", Value: "$valid_count"}}},
-			// We ignore mismatch sum from stats as it's historical
-			{Key: "lastVal", Value: bson.D{{Key: "$max", Value: "$last_updated"}}},
-		}}},
-	}
+	lastSourceUnix := m.lastSourceEventTime.Load()
+	lastAppliedUnix := m.lastAppliedEventTime.Load()
+	lastBatchUnix := m.lastBatchAppliedAt.Load()
 
-	cursor, err := statsColl.Aggregate(ctx, pipeline)
-	if err != nil {
-		return ValidationInfo{}
-	}
-	defer cursor.Close(ctx)
+	idleTime := 0.0
+	cdcLag := 0.0
 
-	var result struct {
-		Total   int64     `bson:"total"`
-		Valid   int64     `bson:"valid"`
-		LastVal time.Time `bson:"lastVal"`
-	}
-
-	if cursor.Next(ctx) {
-		if err := cursor.Decode(&result); err != nil {
-			logging.PrintWarning(fmt.Sprintf("[STATUS] Failed to decode stats: %v", err), 0)
-		}
-	}
-
-	// 2. Count ACTUAL active failures
-	currentMismatch, err := failColl.CountDocuments(ctx, bson.D{})
-	if err != nil {
-		logging.PrintWarning(fmt.Sprintf("[STATUS] Failed to count failures: %v", err), 0)
-		currentMismatch = 0
-	}
-
-	percent := 0.0
-	if result.Total > 0 {
-		percent = (float64(result.Valid) / float64(result.Total)) * 100.0
-	}
-
-	lastValStr := ""
-	if !result.LastVal.IsZero() {
-		lastValStr = result.LastVal.Format(time.RFC3339)
-	}
-
-	return ValidationInfo{
-		TotalChecked:    result.Total,
-		ValidCount:      result.Valid,
-		MismatchCount:   currentMismatch, // Use live count
-		SyncPercent:     percent,
-		LastValidatedAt: lastValStr,
-	}
-}
-
-// GetStats returns a snapshot of the current status for internal logic
-func (m *Manager) GetStats() StatusOutput {
-	m.lock.RLock()
-	defer m.lock.RUnlock()
-
-	var cdcLag float64
-	if m.initialSyncCompleted && m.lastEventTimestamp.T > 0 {
-		eventTime := time.Unix(int64(m.lastEventTimestamp.T), 0)
-		if !m.lastBatchAppliedAt.IsZero() {
-			if time.Since(m.lastBatchAppliedAt) > 10*time.Second {
-				cdcLag = 0.0
-			} else {
-				cdcLag = m.lastBatchAppliedAt.Sub(eventTime).Seconds()
-				if cdcLag < 0 {
-					cdcLag = 0.0
-				}
-			}
-		}
-	}
-
-	// We use a background context here because this is for internal logic
-	valInfo := m.getValidationStats(context.Background())
-
-	return StatusOutput{
-		CDCLagSeconds: cdcLag,
-		Validation:    valInfo,
-	}
-}
-
-func (m *Manager) ToJSON(ctx context.Context) ([]byte, error) {
-	m.lock.RLock()
-	defer m.lock.RUnlock()
-
-	opTimeInfo := OpTimeInfo{}
-	if m.lastEventTimestamp.T > 0 {
-		opTimeInfo.TS = fmt.Sprintf("%d.%d", m.lastEventTimestamp.T, m.lastEventTimestamp.I)
-		opTime := time.Unix(int64(m.lastEventTimestamp.T), 0).UTC()
-		opTimeInfo.ISODate = opTime.Format("2006-01-02T15:04:05Z")
-	}
-
-	// Applied Time Info
-	appliedTimeInfo := OpTimeInfo{}
-	if m.lastAppliedTimestamp.T > 0 {
-		appliedTimeInfo.TS = fmt.Sprintf("%d.%d", m.lastAppliedTimestamp.T, m.lastAppliedTimestamp.I)
-		apTime := time.Unix(int64(m.lastAppliedTimestamp.T), 0).UTC()
-		appliedTimeInfo.ISODate = apTime.Format("2006-01-02T15:04:05Z")
-	}
-
-	var idleTime float64
-	var cdcLag float64
-
-	if m.initialSyncCompleted && m.lastEventTimestamp.T > 0 {
-		eventTime := time.Unix(int64(m.lastEventTimestamp.T), 0)
+	if lastSourceUnix > 0 {
+		eventTime := time.Unix(lastSourceUnix, 0)
 		idleTime = time.Since(eventTime).Seconds()
 		if idleTime < 0 {
 			idleTime = 0.0
 		}
 
-		if !m.lastBatchAppliedAt.IsZero() {
-			if time.Since(m.lastBatchAppliedAt) > 10*time.Second {
+		if lastAppliedUnix > 0 {
+			cdcLag = float64(lastSourceUnix - lastAppliedUnix)
+			if cdcLag < 0 {
 				cdcLag = 0.0
-			} else {
-				cdcLag = m.lastBatchAppliedAt.Sub(eventTime).Seconds()
-				if cdcLag < 0 {
-					cdcLag = 0.0
-				}
 			}
 		}
 	}
 
-	baseState := m.state
-	info := ""
-	if idx := strings.Index(m.state, " ("); idx != -1 {
-		baseState = m.state[:idx]
-		info = strings.TrimSuffix(m.state[idx+2:], ")")
-	} else {
-		info = m.state
+	totalBytes := m.estimatedTotalBytes.Load()
+	clonedBytes := m.clonedBytes.Load()
+	var progress float64 = 0
+	if totalBytes > 0 {
+		progress = (float64(clonedBytes) / float64(totalBytes)) * 100.0
+	}
+	if m.cloneCompleted.Load() {
+		progress = 100.0
+	}
+
+	vChecked := m.valTotalChecked.Load()
+	vFound := m.valMismatchFound.Load()
+	vFixed := m.valMismatchFixed.Load()
+	vPending := m.valPending.Load()
+	vLast := m.valLastCheck.Load()
+
+	vPercentStr := "0.0%"
+	if vChecked > 0 {
+		validOrFixedCount := vChecked - vPending
+		if validOrFixedCount < 0 {
+			validOrFixedCount = 0
+		}
+		pct := (float64(validOrFixedCount) / float64(vChecked)) * 100.0
+		vPercentStr = fmt.Sprintf("%.1f%%", pct)
+	}
+
+	vLastStr := ""
+	if vLast > 0 {
+		vLastStr = time.Unix(vLast, 0).UTC().Format(time.RFC3339)
+	}
+
+	duration := "N/A"
+	if !start.IsZero() {
+		if !end.IsZero() {
+			duration = end.Sub(start).String()
+		} else {
+			duration = time.Since(start).String()
+		}
+	}
+
+	lastSourceTS := TSTime{}
+	if lastSourceUnix > 0 {
+		lastSourceTS.TS = fmt.Sprintf("%d", lastSourceUnix)
+		lastSourceTS.ISODate = time.Unix(lastSourceUnix, 0).UTC().Format(time.RFC3339)
+	}
+
+	lastAppliedTS := TSTime{}
+	if lastAppliedUnix > 0 {
+		lastAppliedTS.TS = fmt.Sprintf("%d", lastAppliedUnix)
+		lastAppliedTS.ISODate = time.Unix(lastAppliedUnix, 0).UTC().Format(time.RFC3339)
 	}
 
 	lastBatchStr := ""
-	if !m.lastBatchAppliedAt.IsZero() {
-		lastBatchStr = m.lastBatchAppliedAt.Format(time.RFC3339)
+	if lastBatchUnix > 0 {
+		lastBatchStr = time.Unix(lastBatchUnix, 0).UTC().Format(time.RFC3339)
 	}
 
-	valInfo := m.getValidationStats(ctx)
+	startStr := ""
+	if !start.IsZero() {
+		startStr = start.Format(time.RFC3339)
+	}
+	endStr := ""
+	if !end.IsZero() {
+		endStr = end.Format(time.RFC3339)
+	}
 
-	s := StatusOutput{
-		OK:                        baseState != "error",
-		State:                     baseState,
+	output := StatusOutput{
+		OK:                        state != "error",
+		State:                     state,
 		Info:                      info,
-		FlowControl:               &m.flowStatus,
 		TimeSinceLastEventSeconds: idleTime,
 		CDCLagSeconds:             cdcLag,
-		EventsApplied:             m.eventsApplied,
-		Validation:                valInfo,
-		LastSourceEventTime:       opTimeInfo,
-		LastAppliedEventTime:      appliedTimeInfo,
-		LastBatchAppliedAt:        lastBatchStr,
-		InitialSync: InitialSync{
-			Completed:               m.initialSyncCompleted,
-			CompletionLagSeconds:    m.lag,
-			CloneCompleted:          m.cloneCompleted,
-			EstimatedCloneSizeBytes: m.estimatedBytes,
-			ClonedSizeBytes:         m.clonedBytes,
-			EstimatedCloneSizeHuman: ByteToHuman(m.estimatedBytes),
-			ClonedSizeHuman:         ByteToHuman(m.clonedBytes),
+		TotalEventsApplied:        m.eventsApplied.Load(),
+		AdaptiveSerialBatches:     m.serialBatches.Load(),
+		InsertedDocs:              m.insertedDocs.Load(),
+		UpdatedDocs:               m.updatedDocs.Load(),
+		DeletedDocs:               m.deletedDocs.Load(),
+		Validation: ValidationStats{
+			QueuedBatches:  m.valQueueSize.Load(),
+			TotalChecked:   vChecked,
+			MismatchFound:  vFound,
+			MismatchFixed:  vFixed,
+			Pending:        vPending,
+			HotKeysWaiting: m.valHotKeys.Load(),
+			SyncPercent:    vPercentStr,
+			LastValidated:  vLastStr,
+		},
+		LastSourceEventTime:  lastSourceTS,
+		LastAppliedEventTime: lastAppliedTS,
+		LastBatchAppliedAt:   lastBatchStr,
+		InitialSync: SyncStatus{
+			Completed:               m.initialSyncCompleted.Load(),
+			ProgressPercent:         progress,
+			ClonedDocs:              m.clonedDocs.Load(),
+			EstimatedTotalDocs:      m.estimatedTotalDocs.Load(),
+			ClonedBytes:             clonedBytes,
+			EstimatedTotalBytes:     totalBytes,
+			ClonedSizeHuman:         ByteToHuman(clonedBytes),
+			EstimatedCloneSizeHuman: ByteToHuman(totalBytes),
+			StartedAt:               startStr,
+			EndedAt:                 endStr,
+			Duration:                duration,
+			CompletionLagSeconds:    0,
 		},
 	}
-	// If flow control is disabled in config, we can hide it or show enabled: false
-	if !config.Cfg.FlowControl.Enabled {
-		s.FlowControl = nil
+
+	if config.Cfg.FlowControl.Enabled {
+		output.FlowControl = &FCStatus{
+			Enabled:             true,
+			IsPaused:            m.fcIsPaused.Load(),
+			PauseReason:         m.fcReason.Load().(string),
+			CurrentQueuedOps:    int(m.fcQueuedOps.Load()),
+			CurrentResidentMB:   int(m.fcResidentMB.Load()),
+			CurrentWriterQueue:  int(m.fcWriterQueue.Load()),
+			NativeLagged:        m.fcNativeLagged.Load(),
+			NativeSustainerRate: int(m.fcNativeSustainer.Load()),
+		}
 	}
-	return json.MarshalIndent(s, "", "    ")
+
+	return output
+}
+
+func parseInt64(v interface{}) int64 {
+	if v == nil {
+		return 0
+	}
+	switch val := v.(type) {
+	case int:
+		return int64(val)
+	case int32:
+		return int64(val)
+	case int64:
+		return val
+	case float64:
+		return int64(val)
+	default:
+		return 0
+	}
 }

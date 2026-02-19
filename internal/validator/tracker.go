@@ -4,37 +4,53 @@ import (
 	"sync"
 )
 
-// InFlightTracker keeps track of document IDs that are currently being processed
-// by the CDC stream. If an ID is "Dirty", it cannot be safely validated.
 type InFlightTracker struct {
-	mu       sync.RWMutex
-	dirtyIDs map[string]bool
+	mu           sync.RWMutex
+	dirtyIDs     map[string]bool
+	clearedCount int // Track operations to trigger periodic resets
 }
 
-// NewInFlightTracker creates a new tracker instance
 func NewInFlightTracker() *InFlightTracker {
 	return &InFlightTracker{
 		dirtyIDs: make(map[string]bool),
 	}
 }
 
-// MarkDirty is called by the CDC Worker whenever it processes an event for an ID
 func (t *InFlightTracker) MarkDirty(id string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.dirtyIDs[id] = true
 }
 
-// IsDirty checks if an ID was modified recently
 func (t *InFlightTracker) IsDirty(id string) bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.dirtyIDs[id]
 }
 
-// ClearDirty resets the state for a specific ID (used before validation starts)
 func (t *InFlightTracker) ClearDirty(id string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
 	delete(t.dirtyIDs, id)
+	t.clearedCount++
+
+	// Reset if we've done significant work, even if not perfectly empty.
+	// This prevents the map's internal buckets from staying bloated forever.
+	if t.clearedCount > 50000 {
+		if len(t.dirtyIDs) < 100 { // Only reset when relatively quiet
+			newMap := make(map[string]bool)
+			for k, v := range t.dirtyIDs {
+				newMap[k] = v
+			}
+			t.dirtyIDs = newMap
+			t.clearedCount = 0
+		}
+	}
+}
+func (t *InFlightTracker) Flush() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.dirtyIDs = make(map[string]bool)
+	t.clearedCount = 0
 }

@@ -3,7 +3,8 @@ package flow
 import (
 	"context"
 	"fmt"
-	"net/url" // <--- Added import
+	"math"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,20 +21,27 @@ import (
 type Manager struct {
 	targetClient     *mongo.Client
 	monitoredClients []*mongo.Client
+	nodeNames        map[*mongo.Client]string
 	isPaused         atomic.Bool
 	stopChan         chan struct{}
 	statusMgr        *status.Manager
 	user             string
 	password         string
+
+	currentQueuedOps  atomic.Int64
+	currentResidentMB atomic.Int64
+	currentWTTickets  atomic.Int64
 }
 
 func NewManager(targetClient *mongo.Client, statusMgr *status.Manager, user, password string) *Manager {
 	return &Manager{
-		targetClient: targetClient,
-		stopChan:     make(chan struct{}),
-		statusMgr:    statusMgr,
-		user:         user,
-		password:     password,
+		targetClient:     targetClient,
+		monitoredClients: []*mongo.Client{},
+		nodeNames:        make(map[*mongo.Client]string),
+		stopChan:         make(chan struct{}),
+		statusMgr:        statusMgr,
+		user:             user,
+		password:         password,
 	}
 }
 
@@ -41,12 +49,14 @@ func (m *Manager) Start() {
 	if !config.Cfg.FlowControl.Enabled {
 		return
 	}
-	logging.PrintInfo("[FlowControl] Started. Monitoring target database health...", 0)
+	logging.PrintInfo("[FlowControl] Started. Establishing dedicated control channels...", 0)
 
-	// 1. Discover Shards (if connected to Mongos)
 	if err := m.discoverCluster(); err != nil {
-		logging.PrintWarning(fmt.Sprintf("[FlowControl] Shard discovery failed: %v. Will only monitor the connected node.", err), 0)
+		logging.PrintWarning(fmt.Sprintf("[FlowControl] Shard discovery failed: %v. Monitoring limited to connected node.", err), 0)
 		m.monitoredClients = []*mongo.Client{m.targetClient}
+		m.nodeNames[m.targetClient] = m.getRealNodeName(m.targetClient, "Primary/Mongos")
+	} else {
+		logging.PrintInfo(fmt.Sprintf("[FlowControl] Discovery complete. Monitoring %d node(s).", len(m.monitoredClients)), 0)
 	}
 
 	go m.monitorLoop()
@@ -56,7 +66,7 @@ func (m *Manager) Stop() {
 	close(m.stopChan)
 	for _, client := range m.monitoredClients {
 		if client != m.targetClient {
-			client.Disconnect(context.Background())
+			_ = client.Disconnect(context.Background())
 		}
 	}
 }
@@ -70,12 +80,61 @@ func (m *Manager) Wait() {
 	}
 }
 
-// discoverCluster checks if we are on a mongos and connects to shards if needed
-func (m *Manager) discoverCluster() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+func (m *Manager) WaitIfPaused() {
+	if !config.Cfg.FlowControl.Enabled {
+		return
+	}
+
+	// 1. Fast Path: If not paused, return immediately (zero allocation)
+	if !m.isPaused.Load() {
+		return
+	}
+
+	// 2. Slow Path: We are paused.
+	// Log the event once so we know why the reader stopped.
+	logging.PrintInfo("[CDC] Reader paused due to Flow Control (Target Overload)...", 0)
+
+	// Use a ticker to check the state periodically.
+	// We check every 500ms because the monitor updates the state every 1000ms.
+	// This balances responsiveness with CPU usage.
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for m.isPaused.Load() {
+		<-ticker.C
+	}
+
+	// 3. Resumed
+	logging.PrintInfo("[CDC] Reader resumed. Target is healthy.", 0)
+}
+
+// GetStatus returns the current state.
+func (m *Manager) GetStatus() (bool, int, int) {
+	return m.isPaused.Load(), int(m.currentQueuedOps.Load()), int(m.currentResidentMB.Load())
+}
+
+func (m *Manager) getRealNodeName(client *mongo.Client, fallback string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	// 1. Check if we are connected to a Mongos
+	var hello bson.M
+	if err := client.Database("admin").RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&hello); err == nil {
+		if me, ok := hello["me"].(string); ok && me != "" {
+			return me
+		}
+	}
+	return fallback
+}
+
+func (m *Manager) discoverCluster() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	m.monitoredClients = append(m.monitoredClients, m.targetClient)
+	realName := m.getRealNodeName(m.targetClient, "Entry Node (Mongos)")
+	m.nodeNames[m.targetClient] = realName
+	logging.PrintInfo(fmt.Sprintf("[FlowControl] Verified Monitor 1: %s (Type: Entry)", realName), 0)
+
 	var helloResult bson.M
 	if err := m.targetClient.Database("admin").RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&helloResult); err != nil {
 		return err
@@ -83,13 +142,12 @@ func (m *Manager) discoverCluster() error {
 
 	msg, _ := helloResult["msg"].(string)
 	if msg != "isdbgrid" {
-		m.monitoredClients = []*mongo.Client{m.targetClient}
+		logging.PrintInfo("[FlowControl] Target is Standalone/ReplicaSet (Not Sharded).", 0)
 		return nil
 	}
 
 	logging.PrintInfo("[FlowControl] Sharded Cluster (mongos) detected. Auto-discovering backend shards...", 0)
 
-	// 2. Query config.shards
 	cursor, err := m.targetClient.Database("config").Collection("shards").Find(ctx, bson.D{})
 	if err != nil {
 		return fmt.Errorf("failed to query config.shards: %w", err)
@@ -104,9 +162,6 @@ func (m *Manager) discoverCluster() error {
 		return fmt.Errorf("failed to decode shards: %w", err)
 	}
 
-	m.monitoredClients = append(m.monitoredClients, m.targetClient)
-
-	// 3. Connect to each shard
 	for _, shard := range shards {
 		parts := strings.Split(shard.Host, "/")
 		if len(parts) < 2 {
@@ -115,51 +170,78 @@ func (m *Manager) discoverCluster() error {
 		rsName := parts[0]
 		hosts := parts[1]
 
-		// FIX: Use url.QueryEscape to handle special characters in passwords safely
 		safeUser := url.QueryEscape(m.user)
 		safePass := url.QueryEscape(m.password)
 
-		// Explicitly enforce SCRAM-SHA-256 to match modern defaults and avoid negotiation errors
-		shardURI := fmt.Sprintf("mongodb://%s:%s@%s/?replicaSet=%s&authSource=admin&authMechanism=SCRAM-SHA-256",
-			safeUser, safePass, hosts, rsName)
+		queryParams := url.Values{}
+		queryParams.Set("replicaSet", rsName)
+		queryParams.Set("authSource", "admin")
+		queryParams.Set("authMechanism", "SCRAM-SHA-256")
 
-		if config.Cfg.Mongo.TLS {
-			shardURI += "&tls=true"
-			if config.Cfg.Mongo.TlsAllowInvalidHostnames {
-				shardURI += "&tlsAllowInvalidHostnames=true"
-			}
-			if config.Cfg.Mongo.CaFile != "" {
-				shardURI += fmt.Sprintf("&tlsCAFile=%s", config.Cfg.Mongo.CaFile)
+		if config.Cfg.Mongo.ExtraParams != "" {
+			extra, err := url.ParseQuery(config.Cfg.Mongo.ExtraParams)
+			if err == nil {
+				for k, v := range extra {
+					if k != "replicaSet" && k != "authSource" && k != "tls" {
+						for _, val := range v {
+							queryParams.Add(k, val)
+						}
+					}
+				}
 			}
 		}
+
+		if config.Cfg.Mongo.TLS {
+			queryParams.Set("tls", "true")
+			if config.Cfg.Mongo.TlsAllowInvalidHostnames {
+				queryParams.Set("tlsAllowInvalidHostnames", "true")
+			}
+			if config.Cfg.Mongo.CaFile != "" {
+				queryParams.Set("tlsCAFile", config.Cfg.Mongo.CaFile)
+			}
+		}
+
+		shardURI := fmt.Sprintf("mongodb://%s:%s@%s/?%s",
+			safeUser, safePass, hosts, queryParams.Encode())
 
 		clientOpts := options.Client().ApplyURI(shardURI).SetDirect(false)
 		shardClient, err := mongo.Connect(clientOpts)
 		if err != nil {
-			logging.PrintWarning(fmt.Sprintf("[FlowControl] Failed to connect to shard %s: %v. It will be unmonitored.", shard.ID, err), 0)
+			logging.PrintWarning(fmt.Sprintf("[FlowControl] Failed to connect to shard %s: %v", shard.ID, err), 0)
 			continue
 		}
 
-		// Quick Ping
-		pingCtx, pingCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := shardClient.Ping(pingCtx, nil); err != nil {
 			logging.PrintWarning(fmt.Sprintf("[FlowControl] Shard %s unreachable: %v. Skipping.", shard.ID, err), 0)
-			shardClient.Disconnect(context.Background())
+			_ = shardClient.Disconnect(context.Background())
 			pingCancel()
 			continue
 		}
 		pingCancel()
 
-		logging.PrintInfo(fmt.Sprintf("[FlowControl] Added monitor for shard: %s", shard.ID), 0)
+		shardRealName := m.getRealNodeName(shardClient, fmt.Sprintf("Shard-%s", shard.ID))
+		logging.PrintInfo(fmt.Sprintf("[FlowControl] Verified Monitor: %s (Shard: %s)", shardRealName, shard.ID), 0)
+
 		m.monitoredClients = append(m.monitoredClients, shardClient)
+		m.nodeNames[shardClient] = shardRealName
 	}
 
 	return nil
 }
 
 func (m *Manager) monitorLoop() {
+	// Perform an initial health check immediately before starting the ticker
 	m.checkHealth()
-	ticker := time.NewTicker(time.Duration(config.Cfg.FlowControl.CheckIntervalMS) * time.Millisecond)
+
+	interval := config.Cfg.FlowControl.CheckIntervalMS
+
+	// Enforce a sane minimum to prevent tight loops (e.g., 100ms).
+	if interval < 100 {
+		interval = 1000 // Default to 1 second if config is missing or too dangerous
+	}
+
+	ticker := time.NewTicker(time.Duration(interval) * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -177,8 +259,17 @@ func (m *Manager) checkHealth() {
 	defer cancel()
 
 	var maxQueuedOps int
+	var maxActiveClients int
 	var maxResidentMB int
+	var maxLatencyMs int64
 
+	var maxWriterQueue int
+	var isFlowControlLagged bool
+	var maxSustainerRate int
+
+	minWTTicketsAvailable := math.MaxInt
+
+	var latencyErr error
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
@@ -187,59 +278,204 @@ func (m *Manager) checkHealth() {
 		go func(c *mongo.Client) {
 			defer wg.Done()
 
-			var raw bson.Raw
-			if err := c.Database("admin").RunCommand(ctx, bson.D{{Key: "serverStatus", Value: 1}}).Decode(&raw); err != nil {
-				return
-			}
-
-			lockVal := raw.Lookup("globalLock", "currentQueue", "total")
-			qOps := getIntFromRaw(lockVal)
-
-			memVal := raw.Lookup("mem", "resident")
-			resMB := getIntFromRaw(memVal)
-
+			nodeName := "Unknown"
 			mu.Lock()
-			if qOps > maxQueuedOps {
-				maxQueuedOps = qOps
-			}
-			if resMB > maxResidentMB {
-				maxResidentMB = resMB
+			if name, ok := m.nodeNames[c]; ok {
+				nodeName = name
 			}
 			mu.Unlock()
+
+			start := time.Now()
+			var raw bson.Raw
+			err := c.Database("admin").RunCommand(ctx, bson.D{{Key: "serverStatus", Value: 1}}).Decode(&raw)
+			latency := time.Since(start).Milliseconds()
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			if err != nil {
+				if strings.Contains(err.Error(), "connecting to a sharded cluster improperly") {
+					return
+				}
+				latencyErr = err
+				maxLatencyMs = 9999
+				if config.Cfg.Logging.Level == "debug" {
+					logging.PrintWarning(fmt.Sprintf("[FlowControl DEBUG] Node: %s | Status: FAILED (%v)", nodeName, err), 0)
+				}
+			} else {
+				if latency > maxLatencyMs {
+					maxLatencyMs = latency
+				}
+
+				// 1. Global Lock
+				lockVal := raw.Lookup("globalLock", "currentQueue", "total")
+				qOps := getIntFromRaw(lockVal)
+
+				writerVal := raw.Lookup("globalLock", "currentQueue", "writers")
+				wOps := getIntFromRaw(writerVal)
+
+				activeVal := raw.Lookup("globalLock", "activeClients", "total")
+				activeClients := getIntFromRaw(activeVal)
+
+				// 2. Memory
+				memVal := raw.Lookup("mem", "resident")
+				resMB := getIntFromRaw(memVal)
+
+				// 3. WiredTiger Tickets
+				wtStr := "N/A"
+				wtVal := raw.Lookup("wiredTiger", "concurrentTransactions", "write", "available")
+				if wtVal.Type != bson.Type(0) {
+					wtAvailable := getIntFromRaw(wtVal)
+					wtStr = fmt.Sprintf("%d", wtAvailable)
+					if wtAvailable < minWTTicketsAvailable {
+						minWTTicketsAvailable = wtAvailable
+					}
+				}
+
+				// 4. Native Flow Control Checks
+				fcLagged := false
+				fcSustainer := 0
+
+				fcVal := raw.Lookup("flowControl")
+				if fcVal.Type != bson.Type(0) {
+					isLaggedVal := raw.Lookup("flowControl", "isLagged")
+					if isLaggedVal.Type == bson.TypeBoolean {
+						fcLagged = isLaggedVal.Boolean()
+					}
+
+					susVal := raw.Lookup("flowControl", "sustainerRate")
+					if susVal.Type != bson.Type(0) {
+						fcSustainer = getIntFromRaw(susVal)
+					}
+				}
+
+				// Aggregation
+				if qOps > maxQueuedOps {
+					maxQueuedOps = qOps
+				}
+				if wOps > maxWriterQueue {
+					maxWriterQueue = wOps
+				}
+				if activeClients > maxActiveClients {
+					maxActiveClients = activeClients
+				}
+				if resMB > maxResidentMB {
+					maxResidentMB = resMB
+				}
+				if fcLagged {
+					isFlowControlLagged = true
+				}
+				if fcSustainer > maxSustainerRate {
+					maxSustainerRate = fcSustainer
+				}
+
+				fcStatus := "OK"
+				if fcLagged {
+					fcStatus = "LAGGED"
+				}
+
+				if config.Cfg.Logging.Level == "debug" {
+					logging.PrintInfo(fmt.Sprintf("[FlowControl DEBUG] Node: %s | Queue: %d (W:%d) | Mem: %d MB | FC: %s (Rate:%d) | WT: %s | Latency: %dms",
+						nodeName, qOps, wOps, resMB, fcStatus, fcSustainer, wtStr, latency), 0)
+				}
+			}
 		}(client)
 	}
 	wg.Wait()
 
+	m.currentQueuedOps.Store(int64(maxQueuedOps))
+	m.currentResidentMB.Store(int64(maxResidentMB))
+	m.currentWTTickets.Store(int64(minWTTicketsAvailable))
+
 	shouldPause := false
 	reason := ""
 
-	if limit := config.Cfg.FlowControl.TargetMaxQueuedOps; maxQueuedOps > limit {
-		shouldPause = true
-		reason = fmt.Sprintf("Cluster High Load: Max Queued Ops (%d) > Limit (%d)", maxQueuedOps, limit)
+	latencyThreshold := config.Cfg.FlowControl.LatencyThresholdMS
+	if latencyThreshold <= 0 {
+		latencyThreshold = 250
 	}
 
+	if maxLatencyMs > int64(latencyThreshold) {
+		shouldPause = true
+		reason = fmt.Sprintf("High Latency: %dms > %dms (Err: %v)", maxLatencyMs, latencyThreshold, latencyErr)
+	}
+
+	// --- 1. Native Flow Control Logic ---
+	if !shouldPause && isFlowControlLagged {
+		shouldPause = true
+		reason = "Native Flow Control: Replication Lag Detected (isLagged=true)"
+	}
+
+	// --- 2. Global Lock Queue Logic ---
+	if !shouldPause {
+		if limit := config.Cfg.FlowControl.TargetMaxQueuedOps; maxQueuedOps > limit {
+			shouldPause = true
+			reason = fmt.Sprintf("High Queue: %d > %d", maxQueuedOps, limit)
+		}
+	}
+
+	// --- 3. Active Clients Logic ---
+	if !shouldPause {
+		limit := config.Cfg.FlowControl.ActiveClientThreshold
+		if limit <= 0 {
+			limit = 50
+		}
+		if maxActiveClients > limit {
+			shouldPause = true
+			reason = fmt.Sprintf("High Active Clients: %d > %d", maxActiveClients, limit)
+		}
+	}
+
+	// --- 4. Memory Logic ---
 	if !shouldPause && config.Cfg.FlowControl.TargetMaxResidentMB > 0 {
 		limit := config.Cfg.FlowControl.TargetMaxResidentMB
 		if maxResidentMB > limit {
 			shouldPause = true
-			reason = fmt.Sprintf("Cluster High Memory: Max Resident (%d MB) > Limit (%d MB)", maxResidentMB, limit)
+			reason = fmt.Sprintf("High Memory: %dMB > %dMB", maxResidentMB, limit)
+		}
+	}
+
+	// --- 5. WiredTiger Logic ---
+	if !shouldPause {
+		limit := config.Cfg.FlowControl.MinWiredTigerTickets
+		if limit > 0 {
+			if minWTTicketsAvailable == math.MaxInt {
+				// skip
+			} else if minWTTicketsAvailable <= limit {
+				shouldPause = true
+				reason = fmt.Sprintf("Low WiredTiger Tickets: %d <= %d", minWTTicketsAvailable, limit)
+			}
 		}
 	}
 
 	if m.statusMgr != nil {
-		m.statusMgr.UpdateFlowControl(shouldPause, reason, maxQueuedOps, maxResidentMB)
+		m.statusMgr.UpdateFlowControl(
+			shouldPause,
+			reason,
+			maxQueuedOps,
+			maxResidentMB,
+			maxWriterQueue,
+			isFlowControlLagged,
+			maxSustainerRate,
+		)
 	}
 
 	if shouldPause {
 		if !m.isPaused.Load() {
 			logging.PrintWarning(fmt.Sprintf("[FlowControl] THROTTLING PAUSED: %s", reason), 0)
 			m.isPaused.Store(true)
+			if m.statusMgr != nil {
+				m.statusMgr.SetState("throttled", fmt.Sprintf("Flow Control Active: %s", reason))
+			}
 		}
 		time.Sleep(time.Duration(config.Cfg.FlowControl.PauseDurationMS) * time.Millisecond)
 	} else {
 		if m.isPaused.Load() {
 			logging.PrintInfo("[FlowControl] Throttling released. Cluster healthy.", 0)
 			m.isPaused.Store(false)
+			if m.statusMgr != nil {
+				m.statusMgr.SetState("running", "Change Data Capture")
+			}
 		}
 	}
 }

@@ -23,36 +23,31 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
-// Batch of documents read from the source
 type docBatch struct {
-	models []mongo.WriteModel
-	size   int64
-	first  bson.RawValue
-	last   bson.RawValue
+	docs  []bson.Raw
+	size  int64
+	first bson.RawValue
+	last  bson.RawValue
 }
 
-// keyRange defines a segment of a collection by its min and max _id
 type keyRange struct {
 	Min bson.RawValue
 	Max bson.RawValue
 }
 
-// Segmenter splits a collection into multiple keyRanges
 type Segmenter struct {
 	mcoll        *mongo.Collection
 	currentRange keyRange
-	segmentSize  int64 // in documents
+	segmentSize  int64 // number of documents
 	lock         sync.Mutex
 	initialMax   bson.RawValue
 }
 
-// Helper to create a RawValue for MinKey/MaxKey
 func getRawBound(val interface{}) bson.RawValue {
 	raw, _ := bson.Marshal(bson.D{{Key: "v", Value: val}})
 	return bson.Raw(raw).Lookup("v")
 }
 
-// shouldRetry determines if an error is transient and should be retried
 func shouldRetry(err error) bool {
 	if err == nil {
 		return false
@@ -70,12 +65,10 @@ func shouldRetry(err error) bool {
 	return false
 }
 
-// NewSegmenter creates a segmenter for a collection
 func NewSegmenter(ctx context.Context, mcoll *mongo.Collection, collInfo discover.CollectionInfo) (*Segmenter, error) {
 	segSize := config.Cfg.Cloner.SegmentSizeDocs
 	logging.PrintInfo(fmt.Sprintf("[%s] Initializing Segmenter. Configured Segment Size: %d", mcoll.Name(), segSize), 0)
 
-	// Use Logical Boundaries (MinKey -> MaxKey)
 	min := getRawBound(bson.MinKey{})
 	max := getRawBound(bson.MaxKey{})
 
@@ -116,7 +109,6 @@ func (s *Segmenter) findSegmentMaxKey(ctx context.Context, minKey, maxKey bson.R
 
 	var res *mongo.SingleResult
 
-	// Use Configured Retry Logic
 	maxRetries := config.Cfg.Cloner.NumRetries
 	retryInterval := time.Duration(config.Cfg.Cloner.RetryIntervalMS) * time.Millisecond
 
@@ -148,7 +140,6 @@ func (s *Segmenter) findSegmentMaxKey(ctx context.Context, minKey, maxKey bson.R
 	return raw.Lookup("_id"), nil
 }
 
-// Next returns the next segment to be processed.
 func (s *Segmenter) Next(ctx context.Context) (keyRange, error) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
@@ -189,116 +180,187 @@ func convertIndexes(indexes []discover.IndexInfo) []mongo.IndexModel {
 	return models
 }
 
+type ShardKeyPath struct {
+	Key  string
+	Path []string
+}
+
 type CopyManager struct {
 	sourceClient    *mongo.Client
 	targetClient    *mongo.Client
-	collInfo        discover.CollectionInfo
+	CollInfo        discover.CollectionInfo
 	statusMgr       *status.Manager
 	checkpointMgr   *checkpoint.Manager
 	checkpointDocID string
 	initialMaxKey   bson.RawValue
 	flowMgr         *flow.Manager
+	shardKeys       []string
+	shardKeyPaths   []ShardKeyPath
+	initialTS       bson.Timestamp
 }
 
-// Update: NewCopyManager now accepts flowMgr
 func NewCopyManager(source, target *mongo.Client, collInfo discover.CollectionInfo, statusMgr *status.Manager, checkpointMgr *checkpoint.Manager, checkpointDocID string, flowMgr *flow.Manager) *CopyManager {
 	return &CopyManager{
 		sourceClient:    source,
 		targetClient:    target,
-		collInfo:        collInfo,
+		CollInfo:        collInfo,
 		statusMgr:       statusMgr,
 		checkpointMgr:   checkpointMgr,
 		checkpointDocID: checkpointDocID,
 		flowMgr:         flowMgr,
+		shardKeys:       []string{},
+		shardKeyPaths:   []ShardKeyPath{},
 	}
 }
 
-func (cm *CopyManager) Do(ctx context.Context) (int64, bson.Timestamp, error) {
-	ns := cm.collInfo.Namespace
-	db := cm.collInfo.DB
-	coll := cm.collInfo.Coll
-	sourceCount := cm.collInfo.Count
+func (cm *CopyManager) Prepare(ctx context.Context) error {
+	ns := cm.CollInfo.Namespace
+	db := cm.CollInfo.DB
+	coll := cm.CollInfo.Coll
+	sourceCount := cm.CollInfo.Count
 	emptyTS := bson.Timestamp{}
 
-	logging.PrintInfo(fmt.Sprintf("[%s] Source collection has %d documents.", ns, sourceCount), 3)
+	logging.PrintInfo(fmt.Sprintf("[%s] Preparing collection. Source documents: %d", ns, sourceCount), 3)
 
-	if sourceCount == 0 {
-		logging.PrintInfo(fmt.Sprintf("[%s] Source collection is empty. Skipping.", ns), 3)
-		ts, err := topo.ClusterTime(ctx, cm.sourceClient)
+	// 1. Get Cluster Time
+	initialTS := emptyTS
+	existingTS, found := cm.checkpointMgr.GetResumeTimestamp(ctx, cm.checkpointDocID)
+	if !found {
+		newTS, err := topo.ClusterTime(ctx, cm.sourceClient)
 		if err != nil {
-			return 0, emptyTS, fmt.Errorf("failed to get cluster time for empty coll: %w", err)
+			return fmt.Errorf("failed to get T0: %w", err)
 		}
-		return 0, ts, nil
+		initialTS = newTS
+	} else {
+		initialTS = existingTS
 	}
+	cm.initialTS = initialTS
 
 	sourceColl := cm.sourceClient.Database(db).Collection(coll)
 	targetDB := cm.targetClient.Database(db)
 
-	initialTS := emptyTS
-	existingTS, found := cm.checkpointMgr.GetResumeTimestamp(ctx, cm.checkpointDocID)
+	// 2. Create Collection, Shard, Split, Distribute (Balancer is STOPPED inside here)
+	var indexModels []mongo.IndexModel
 
-	if !found {
-		newTS, err := topo.ClusterTime(ctx, cm.sourceClient)
-		if err != nil {
-			return 0, emptyTS, fmt.Errorf("failed to get initial cluster time (T0): %w", err)
-		}
-		initialTS = newTS
-		logging.PrintStep(fmt.Sprintf("[%s] Using local start time (T0): %v", ns, initialTS), 3)
+	if config.Cfg.Cloner.PostponeIndexCreation {
+		logging.PrintInfo(fmt.Sprintf("[%s] Index creation POSTPONED until after full load (Sharding/ID indexes will still be created).", ns), 0)
+		// Pass empty list. applySharding (inside the function below) will still create the required Shard Key index.
+		indexModels = []mongo.IndexModel{}
 	} else {
-		initialTS = existingTS
+		// Standard behavior: Pre-load all indexes before copying
+		indexModels = convertIndexes(cm.CollInfo.Indexes)
 	}
 
-	indexModels := convertIndexes(cm.collInfo.Indexes)
-
-	// --- FIX: Pass sourceColl as the 3rd argument ---
-	targetColl, err := indexer.CreateCollectionAndPreloadIndexes(ctx, targetDB, sourceColl, cm.collInfo, indexModels)
-	// ------------------------------------------------
+	_, err := indexer.CreateCollectionAndPreloadIndexes(ctx, targetDB, sourceColl, cm.CollInfo, indexModels)
 	if err != nil {
-		return 0, emptyTS, fmt.Errorf("failed to create collection and indexes: %w", err)
+		return fmt.Errorf("setup failed: %w", err)
 	}
+
+	// 3. Shard Key Discovery (for Copy Phase)
+	foundInConfig := false
+	for _, rule := range config.Cfg.Sharding {
+		if rule.Namespace == ns {
+			cm.shardKeys = rule.GetKeys()
+			if len(cm.shardKeys) > 0 {
+				foundInConfig = true
+			}
+			break
+		}
+	}
+	if !foundInConfig {
+		keys, err := discover.GetShardKey(ctx, cm.targetClient, ns)
+		if err == nil && len(keys) > 0 {
+			cm.shardKeys = keys
+		}
+	}
+
+	// 4. Pre-calculate ShardKeyPaths for fast string splitting during Fallback processing
+	cm.shardKeyPaths = make([]ShardKeyPath, 0, len(cm.shardKeys))
+	for _, key := range cm.shardKeys {
+		if key == "_id" {
+			continue
+		}
+		cm.shardKeyPaths = append(cm.shardKeyPaths, ShardKeyPath{
+			Key:  key,
+			Path: strings.Split(key, "."),
+		})
+	}
+
+	return nil
+}
+
+func (cm *CopyManager) Run(ctx context.Context) (int64, bson.Timestamp, error) {
+	ns := cm.CollInfo.Namespace
+	db := cm.CollInfo.DB
+	coll := cm.CollInfo.Coll
+
+	if cm.CollInfo.Count == 0 {
+		return 0, cm.initialTS, nil
+	}
+
+	sourceColl := cm.sourceClient.Database(db).Collection(coll)
+	targetColl := cm.targetClient.Database(db).Collection(coll)
 
 	logging.PrintStep(fmt.Sprintf("[%s] Starting parallel data load...", ns), 3)
 	docsWritten, err := cm.runDataPipeline(ctx, sourceColl, targetColl)
 	if err != nil {
-		return 0, emptyTS, fmt.Errorf("data pipeline failed: %w", err)
+		return 0, cm.initialTS, fmt.Errorf("data pipeline failed: %w", err)
 	}
 
 	// --- RECONCILIATION CHECK ---
-	if docsWritten < sourceCount {
-		diff := sourceCount - docsWritten
-		logging.PrintWarning(fmt.Sprintf("[%s] MISMATCH DETECTED! Source: %d, Copied: %d. Difference: %d. (Potential data loss due to unsupported types or connection errors)", ns, sourceCount, docsWritten, diff), 0)
-	} else if docsWritten > sourceCount {
-		diff := docsWritten - sourceCount
-		logging.PrintInfo(fmt.Sprintf("[%s] COPY SUCCESS (With Retries): Copied %d documents (Source: %d). %d duplicates processed safely.", ns, docsWritten, sourceCount, diff), 3)
+	if docsWritten < cm.CollInfo.Count {
+		diff := cm.CollInfo.Count - docsWritten
+		logging.PrintWarning(fmt.Sprintf("[%s] MISMATCH DETECTED! Source: %d, Copied: %d. Difference: %d.", ns, cm.CollInfo.Count, docsWritten, diff), 0)
 	} else {
 		logging.PrintSuccess(fmt.Sprintf("[%s] Full Load Verified: %d documents copied.", ns, docsWritten), 3)
 	}
 
-	finishTS, err := topo.ClusterTime(ctx, cm.sourceClient)
-	if err != nil {
-		return 0, emptyTS, fmt.Errorf("failed to get finish cluster time: %w", err)
-	}
-	logging.PrintSuccess(fmt.Sprintf("[%s] Data pipeline complete. Copied %d documents. Finish time: %v", ns, docsWritten, finishTS), 3)
+	logging.PrintSuccess(fmt.Sprintf("[%s] Data pipeline complete. Copied %d documents.", ns, docsWritten), 3)
 
 	if cm.checkpointMgr != nil {
-		cm.checkpointMgr.SaveCollectionCheckpoint(ctx, ns, initialTS)
+		cm.checkpointMgr.SaveCollectionCheckpoint(ctx, ns, cm.initialTS)
 	}
 
-	if err := indexer.FinalizeIndexes(ctx, targetColl, cm.collInfo.Indexes, ns); err != nil {
+	if err := indexer.FinalizeIndexes(ctx, targetColl, cm.CollInfo.Indexes, ns); err != nil {
 		logging.PrintError(fmt.Sprintf("[%s] Index finalization failed: %v", ns, err), 3)
 	}
 
-	return docsWritten, initialTS, nil
+	return docsWritten, cm.initialTS, nil
+}
+
+// buildFilter constructs the filter for a document based on Shard Keys and _id.
+func (cm *CopyManager) buildFilter(rawDoc bson.Raw) (bson.D, error) {
+	docID, err := rawDoc.LookupErr("_id")
+	if err != nil {
+		return nil, fmt.Errorf("missing _id")
+	}
+
+	// 1. Add Shard Keys first (Routing) using pre-calculated paths
+	var filter bson.D
+	if len(cm.shardKeyPaths) > 0 {
+		filter = make(bson.D, 0, len(cm.shardKeyPaths)+1)
+		for _, skp := range cm.shardKeyPaths {
+			if val, err := rawDoc.LookupErr(skp.Path...); err == nil {
+				filter = append(filter, bson.E{Key: skp.Key, Value: val})
+			}
+		}
+	} else {
+		filter = make(bson.D, 0, 1)
+	}
+
+	// 2. Append _id at the end (Targeting/Uniqueness)
+	filter = append(filter, bson.E{Key: "_id", Value: docID})
+
+	return filter, nil
 }
 
 func (cm *CopyManager) runDataPipeline(ctx context.Context, sourceColl, targetColl *mongo.Collection) (int64, error) {
-	ns := cm.collInfo.Namespace
+	ns := cm.CollInfo.Namespace
 	numReadWorkers := config.Cfg.Cloner.NumReadWorkers
 
 	// --- AUTO-DETECT LINEAR SCAN MODE ---
-	// If discovery flagged this collection, OR if user forced 1 worker via flag.
-	if cm.collInfo.UseLinearScan || numReadWorkers == 1 {
-		if cm.collInfo.UseLinearScan {
+	if cm.CollInfo.UseLinearScan || numReadWorkers == 1 {
+		if cm.CollInfo.UseLinearScan {
 			logging.PrintWarning(fmt.Sprintf("[%s] Auto-Switching to Linear Scan Mode (Unsafe Range Query Detected).", ns), 0)
 		} else {
 			logging.PrintWarning(fmt.Sprintf("[%s] Running in Linear Scan Mode (Forced by config).", ns), 0)
@@ -317,7 +379,7 @@ func (cm *CopyManager) runDataPipeline(ctx context.Context, sourceColl, targetCo
 	var docsWritten int64
 	insertWG.Add(config.Cfg.Cloner.NumInsertWorkers)
 	for i := 0; i < config.Cfg.Cloner.NumInsertWorkers; i++ {
-		go cm.insertWorker(errCtx, cancel, &insertWG, targetColl, docQueue, &docsWritten, ns, cm.statusMgr)
+		go cm.insertWorker(errCtx, cancel, &insertWG, targetColl, docQueue, &docsWritten, ns, cm.statusMgr, i)
 	}
 
 	// 2. Start Read Workers
@@ -333,7 +395,7 @@ func (cm *CopyManager) runDataPipeline(ctx context.Context, sourceColl, targetCo
 	}()
 
 	// 4. Start the Segmenter
-	segmenter, err := NewSegmenter(errCtx, sourceColl, cm.collInfo)
+	segmenter, err := NewSegmenter(errCtx, sourceColl, cm.CollInfo)
 	if err != nil {
 		close(segmentQueue)
 		close(docQueue)
@@ -378,7 +440,7 @@ func (cm *CopyManager) runDataPipeline(ctx context.Context, sourceColl, targetCo
 
 // runLinearScan bypasses the segmenter and range queries entirely
 func (cm *CopyManager) runLinearScan(ctx context.Context, sourceColl, targetColl *mongo.Collection) (int64, error) {
-	ns := cm.collInfo.Namespace
+	ns := cm.CollInfo.Namespace
 	docQueue := make(chan docBatch, config.Cfg.Cloner.NumInsertWorkers*2)
 
 	var insertWG sync.WaitGroup
@@ -388,19 +450,15 @@ func (cm *CopyManager) runLinearScan(ctx context.Context, sourceColl, targetColl
 	var docsWritten int64
 	insertWG.Add(config.Cfg.Cloner.NumInsertWorkers)
 	for i := 0; i < config.Cfg.Cloner.NumInsertWorkers; i++ {
-		go cm.insertWorker(errCtx, cancel, &insertWG, targetColl, docQueue, &docsWritten, ns, cm.statusMgr)
+		// Pass 'i' as workerID
+		go cm.insertWorker(errCtx, cancel, &insertWG, targetColl, docQueue, &docsWritten, ns, cm.statusMgr, i)
 	}
 
 	// Single linear read process
 	go func() {
 		defer close(docQueue)
 
-		// LINEAR SCAN: Natural Order (No Sort)
-		// This ensures the DB just streams documents in order.
-		// It avoids memory sorts and "mixed type" index failures entirely.
-		readOpts := options.Find().
-			SetBatchSize(int32(config.Cfg.Cloner.ReadBatchSize))
-			// NO SORT HERE. This is the fix for Linear Mode.
+		readOpts := options.Find().SetBatchSize(int32(config.Cfg.Cloner.ReadBatchSize))
 
 		cursor, err := sourceColl.Find(errCtx, bson.D{}, readOpts)
 		if err != nil {
@@ -411,7 +469,7 @@ func (cm *CopyManager) runLinearScan(ctx context.Context, sourceColl, targetColl
 		defer cursor.Close(errCtx)
 
 		batch := docBatch{
-			models: make([]mongo.WriteModel, 0, config.Cfg.Cloner.InsertBatchSize),
+			docs: make([]bson.Raw, 0, config.Cfg.Cloner.InsertBatchSize),
 		}
 		var firstID, lastID bson.RawValue
 
@@ -425,26 +483,21 @@ func (cm *CopyManager) runLinearScan(ctx context.Context, sourceColl, targetColl
 				continue
 			}
 
-			if len(batch.models) == 0 {
+			if len(batch.docs) == 0 {
 				firstID = docID
 			}
 			lastID = docID
 
-			model := mongo.NewReplaceOneModel().
-				SetFilter(bson.D{{Key: "_id", Value: docID}}).
-				SetReplacement(rawDoc).
-				SetUpsert(true)
-
-			batch.models = append(batch.models, model)
+			batch.docs = append(batch.docs, rawDoc)
 			batch.size += int64(len(rawDoc))
 
-			if len(batch.models) >= config.Cfg.Cloner.InsertBatchSize || batch.size >= config.Cfg.Cloner.InsertBatchBytes {
+			if len(batch.docs) >= config.Cfg.Cloner.InsertBatchSize || batch.size >= config.Cfg.Cloner.InsertBatchBytes {
 				batch.first = firstID
 				batch.last = lastID
 				select {
 				case docQueue <- batch:
 					batch = docBatch{
-						models: make([]mongo.WriteModel, 0, config.Cfg.Cloner.InsertBatchSize),
+						docs: make([]bson.Raw, 0, config.Cfg.Cloner.InsertBatchSize),
 					}
 					firstID = bson.RawValue{}
 				case <-errCtx.Done():
@@ -459,7 +512,7 @@ func (cm *CopyManager) runLinearScan(ctx context.Context, sourceColl, targetColl
 			return
 		}
 
-		if len(batch.models) > 0 {
+		if len(batch.docs) > 0 {
 			batch.first = firstID
 			batch.last = lastID
 			select {
@@ -527,7 +580,7 @@ func (cm *CopyManager) readWorker(
 
 		idFilter := bson.D{}
 		if !isMin {
-			idFilter = append(idFilter, bson.E{Key: "$gte", Value: segment.Min})
+			idFilter = append(idFilter, bson.E{Key: "$gt", Value: segment.Min})
 		}
 		if segment.Max.Value != nil && !isMax {
 			idFilter = append(idFilter, bson.E{Key: "$lte", Value: segment.Max})
@@ -568,7 +621,7 @@ func (cm *CopyManager) readWorker(
 			}
 
 			batch := docBatch{
-				models: make([]mongo.WriteModel, 0, config.Cfg.Cloner.InsertBatchSize),
+				docs: make([]bson.Raw, 0, config.Cfg.Cloner.InsertBatchSize),
 			}
 			var firstID, lastID bson.RawValue
 
@@ -582,27 +635,22 @@ func (cm *CopyManager) readWorker(
 					continue
 				}
 
-				if len(batch.models) == 0 {
+				if len(batch.docs) == 0 {
 					firstID = docID
 				}
 				lastID = docID
 
-				model := mongo.NewReplaceOneModel().
-					SetFilter(bson.D{{Key: "_id", Value: docID}}).
-					SetReplacement(rawDoc).
-					SetUpsert(true)
-
-				batch.models = append(batch.models, model)
+				batch.docs = append(batch.docs, rawDoc)
 				batch.size += int64(len(rawDoc))
 
-				if len(batch.models) >= config.Cfg.Cloner.InsertBatchSize || batch.size >= config.Cfg.Cloner.InsertBatchBytes {
+				if len(batch.docs) >= config.Cfg.Cloner.InsertBatchSize || batch.size >= config.Cfg.Cloner.InsertBatchBytes {
 					batch.first = firstID
 					batch.last = lastID
 					select {
 					case docQueue <- batch:
 						batch = docBatch{
-							models: make([]mongo.WriteModel, 0, config.Cfg.Cloner.InsertBatchSize),
-							size:   0,
+							docs: make([]bson.Raw, 0, config.Cfg.Cloner.InsertBatchSize),
+							size: 0,
 						}
 						firstID = bson.RawValue{} // Reset
 					case <-ctx.Done():
@@ -627,7 +675,7 @@ func (cm *CopyManager) readWorker(
 				return
 			}
 
-			if len(batch.models) > 0 {
+			if len(batch.docs) > 0 {
 				batch.first = firstID
 				batch.last = lastID
 				select {
@@ -651,7 +699,7 @@ func (cm *CopyManager) readWorker(
 	}
 }
 
-// insertWorker runs BulkWrite with ReplaceOneModels and Retry Logic
+// insertWorker runs InsertMany with Fallback to BulkWrite(Upsert)
 func (cm *CopyManager) insertWorker(
 	ctx context.Context,
 	cancel context.CancelFunc,
@@ -661,89 +709,144 @@ func (cm *CopyManager) insertWorker(
 	counter *int64,
 	ns string,
 	statusMgr *status.Manager,
+	workerID int,
 ) {
 	defer wg.Done()
 
-	bulkWriteOpts := options.BulkWrite().
-		SetOrdered(false).
-		SetBypassDocumentValidation(true)
+	insertOpts := options.InsertMany().SetOrdered(false).SetBypassDocumentValidation(true)
+	bulkWriteOpts := options.BulkWrite().SetOrdered(false).SetBypassDocumentValidation(true)
 
 	maxRetries := config.Cfg.Cloner.NumRetries
 	retryInterval := time.Duration(config.Cfg.Cloner.RetryIntervalMS) * time.Millisecond
 	writeTimeout := time.Duration(config.Cfg.Cloner.WriteTimeoutMS) * time.Millisecond
 
 	for batch := range queue {
-		if len(batch.models) == 0 {
+		if len(batch.docs) == 0 {
 			continue
 		}
 
-		var res *mongo.BulkWriteResult
-		var err error
 		var docCount int64
+		var err error
 
-		// --- RETRY LOOP ---
+		docsInterface := make([]interface{}, len(batch.docs))
+		for i, d := range batch.docs {
+			docsInterface[i] = d
+		}
+
+		success := false
 		for i := 1; i <= maxRetries; i++ {
 			if ctx.Err() != nil {
 				return
 			}
 
 			start := time.Now()
-
-			// Detach from parent cancel context for the specific write timeout
-			// This ensures a network hang doesn't block indefinitely,
-			// but we still respect overall app shutdown (handled by checking ctx.Err at top of loop)
 			writeCtx, writeCancel := context.WithTimeout(context.Background(), writeTimeout)
-			res, err = coll.BulkWrite(writeCtx, batch.models, bulkWriteOpts)
+			res, insertErr := coll.InsertMany(writeCtx, docsInterface, insertOpts)
 			writeCancel()
 
-			// Capture count even on partial success/failure
+			if insertErr == nil {
+				docCount = int64(len(res.InsertedIDs))
+
+				logging.LogFullLoadBatchOp(start, ns, docCount, batch.size, nil, workerID)
+
+				msg := fmt.Sprintf("[%s] Processed batch: %d inserted (InsertMany). (%s)", ns, docCount, humanize.Bytes(uint64(batch.size)))
+				if config.Cfg.Logging.Level == "debug" {
+					msg += fmt.Sprintf(" Range: [%v - %v]", batch.first, batch.last)
+				}
+				logging.PrintStep(msg, 4)
+
+				success = true
+				break
+			}
+
+			if shouldRetry(insertErr) {
+				logging.PrintWarning(fmt.Sprintf("[%s] InsertMany network error (attempt %d/%d): %v. Retrying...", ns, i, maxRetries, insertErr), 0)
+				time.Sleep(retryInterval)
+				continue
+			}
+
+			if mongo.IsDuplicateKeyError(insertErr) || strings.Contains(insertErr.Error(), "E11000") || strings.Contains(insertErr.Error(), "write errors") {
+				// We do NOT call LogFullLoadBatchOp with the error here because we don't want an ERROR entry in the JSON log.
+				// We proceed to fallback mode which will log a successful Upsert batch later.
+				logging.PrintFallback(fmt.Sprintf("[%s] Duplicate keys detected. Switching to Upsert mode for this batch.", ns), 0)
+				break
+			}
+
+			logging.PrintError(fmt.Sprintf("[%s] InsertMany Fatal Error: %v", ns, insertErr), 4)
+			cancel()
+			return
+		}
+
+		if success {
+			atomic.AddInt64(counter, docCount)
+			if statusMgr != nil {
+				statusMgr.AddClonedBytes(batch.size)
+				statusMgr.AddClonedDocs(docCount)
+			}
+			continue
+		}
+
+		// --- FALLBACK: UPSERT LOOP ---
+		models := make([]mongo.WriteModel, 0, len(batch.docs))
+		for _, rawDoc := range batch.docs {
+			filter, err := cm.buildFilter(rawDoc)
+			if err != nil {
+				logging.PrintError(fmt.Sprintf("[%s] Failed to build filter for fallback upsert: %v", ns, err), 0)
+				continue
+			}
+
+			model := mongo.NewReplaceOneModel().
+				SetFilter(filter).
+				SetReplacement(rawDoc).
+				SetUpsert(true)
+			models = append(models, model)
+		}
+
+		for i := 1; i <= maxRetries; i++ {
+			if ctx.Err() != nil {
+				return
+			}
+
+			start := time.Now()
+			writeCtx, writeCancel := context.WithTimeout(context.Background(), writeTimeout)
+			res, upsertErr := coll.BulkWrite(writeCtx, models, bulkWriteOpts)
+			writeCancel()
+
 			docCount = 0
 			if res != nil {
 				docCount = res.InsertedCount + res.UpsertedCount + res.MatchedCount
 			}
 
-			// Log the attempt duration
-			logging.LogFullLoadBatchOp(start, ns, docCount, batch.size, err)
+			// We log this as a success (err = nil) because even though it was a fallback,
+			// the batch was successfully processed by the system's idempotent logic.
+			logging.LogFullLoadBatchOp(start, ns, docCount, batch.size, nil, workerID)
 
-			if err == nil {
-				break // Success!
+			if upsertErr == nil {
+				msg := fmt.Sprintf("[%s] Processed batch: %d docs (Fallback/Upsert). (%s)", ns, docCount, humanize.Bytes(uint64(batch.size)))
+				logging.PrintStep(msg, 4)
+				success = true
+				break
 			}
 
-			// If it's a retryable error, wait and try again
-			if shouldRetry(err) {
-				logging.PrintWarning(fmt.Sprintf("[%s] BulkWrite error (attempt %d/%d): %v. Retrying...", ns, i, maxRetries, err), 0)
+			if shouldRetry(upsertErr) {
 				time.Sleep(retryInterval)
 				continue
 			}
 
-			// If it's not retryable (e.g. auth error, bad query), break immediately
+			err = upsertErr
 			break
 		}
 
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			// Fatal error after retries
-			logging.PrintError(fmt.Sprintf("[%s] BulkWrite failed: %v", ns, err), 4)
+		if !success {
+			logging.PrintError(fmt.Sprintf("[%s] BulkWrite Fallback failed: %v", ns, err), 4)
 			cancel()
 			return
 		}
 
 		atomic.AddInt64(counter, docCount)
-
 		if statusMgr != nil {
 			statusMgr.AddClonedBytes(batch.size)
-		}
-
-		// Success Log
-		elapsed := time.Duration(0)
-		if config.Cfg.Logging.Level == "debug" {
-			logging.PrintStep(fmt.Sprintf("[%s] Processed batch: %d inserted, %d replaced. (%s) in %s. Range: [%v - %v]",
-				ns, res.InsertedCount+res.UpsertedCount, res.ModifiedCount, humanize.Bytes(uint64(batch.size)), elapsed, batch.first, batch.last), 4)
-		} else {
-			logging.PrintStep(fmt.Sprintf("[%s] Processed batch: %d inserted, %d replaced. (%s)",
-				ns, res.InsertedCount+res.UpsertedCount, res.ModifiedCount, humanize.Bytes(uint64(batch.size))), 4)
+			statusMgr.AddClonedDocs(docCount)
 		}
 	}
 }

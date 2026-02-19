@@ -14,18 +14,32 @@ import (
 
 // ShardRule defines the sharding configuration for a specific collection
 type ShardRule struct {
-	Namespace        string `mapstructure:"namespace"`          // e.g. "db.collection"
-	ShardKey         string `mapstructure:"shard_key"`          // e.g. "field_1:1, field_2:hashed"
-	NumInitialChunks int    `mapstructure:"num_initial_chunks"` // Optional: Set specific number of chunks (Hashed only)
-	DisablePreSplit  bool   `mapstructure:"disable_presplit"`   // Optional: Skip source scanning (Fast start, but 1 chunk for Range)
+	Namespace          string `mapstructure:"namespace"`             // e.g. "db.collection"
+	ShardKey           string `mapstructure:"shard_key"`             // e.g. "field_1:1, field_2:hashed"
+	NumInitialChunks   int    `mapstructure:"num_initial_chunks"`    // Optional: Set specific number of chunks (Hashed only)
+	DisablePreSplit    bool   `mapstructure:"disable_presplit"`      // Optional: Skip source scanning
+	Unique             bool   `mapstructure:"unique_shard_key"`      // Optional: Enforce uniqueness on the shard key
+	PreSplitStrategy   string `mapstructure:"pre_split_strategy"`    // Options: "none", "composite_uuid_oid", "hex", "range_manual", "hashed_manual"
+	PreSplitChunkCount int    `mapstructure:"pre_split_chunk_count"` // Optional: explicit number of chunks to create
+	SplitType          string `mapstructure:"split_type"`            // "int64", "date", "string", "uuid", "objectid"
+	SplitMin           string `mapstructure:"split_min"`             // e.g., "1700000000000"
+	SplitMax           string `mapstructure:"split_max"`             // e.g., "1800000000000"
+	UUIDField          string `mapstructure:"uuid_field"`            // e.g. "lifecycleId"
+	OIDField           string `mapstructure:"oid_field"`             // e.g. "profileId"
+}
 
-	// Options: "none" (default), "scan", "composite_uuid_oid"
-	PreSplitStrategy string `mapstructure:"pre_split_strategy"`
-
-	// Explicitly define fields for the composite_uuid_oid strategy.
-	// We do NOT guess. You must specify which field is which.
-	UUIDField string `mapstructure:"uuid_field"` // e.g. "uuid_type"
-	OIDField  string `mapstructure:"oid_field"`  // e.g. "objectid_type"
+// GetKeys parses the ShardKey string (e.g., "a:1, b:hashed") and returns just the field names (e.g., ["a", "b"])
+func (s ShardRule) GetKeys() []string {
+	var keys []string
+	parts := strings.Split(s.ShardKey, ",")
+	for _, part := range parts {
+		// Split "key:type"
+		kv := strings.Split(strings.TrimSpace(part), ":")
+		if len(kv) >= 1 {
+			keys = append(keys, strings.TrimSpace(kv[0]))
+		}
+	}
+	return keys
 }
 
 // CDCConfig holds tuning parameters for Change Data Capture
@@ -79,44 +93,54 @@ type MigrationConfig struct {
 	StatusDocID                  string   `mapstructure:"status_doc_id"`
 	ValidationStatsCollection    string   `mapstructure:"validation_stats_collection"`
 	ValidationFailuresCollection string   `mapstructure:"validation_failures_collection"`
+	ValidationAuditCollection    string   `yaml:"validation_audit_collection"`
 	PIDFilePath                  string   `mapstructure:"pid_file_path"`
 	MaxConcurrentWorkers         int      `mapstructure:"max_concurrent_workers"`
+	DiscoveryTimeoutMS           int      `mapstructure:"discovery_timeout_ms"`
 	Destroy                      bool     `mapstructure:"destroy"`
+	DryRun                       bool     `mapstructure:"dry_run"`
 	EnvPrefix                    string   `mapstructure:"env_prefix"`
 	StatusHTTPPort               string   `mapstructure:"status_http_port"`
-	DryRun                       bool     `mapstructure:"dry_run"`
+	GoMemLimit                   string   `mapstructure:"go_mem_limit"` // e.g., "80%"
+	GoGC                         int      `mapstructure:"go_gc"`        // e.g., 50
 }
 
 // ClonerConfig holds full-load specific settings
 type ClonerConfig struct {
-	NumReadWorkers   int   `mapstructure:"num_read_workers"`
-	SegmentSizeDocs  int64 `mapstructure:"segment_size_docs"`
-	NumInsertWorkers int   `mapstructure:"num_insert_workers"`
-	InsertBatchSize  int   `mapstructure:"insert_batch_size"`
-	ReadBatchSize    int   `mapstructure:"read_batch_size"`
-	InsertBatchBytes int64 `mapstructure:"insert_batch_bytes"`
-	NumRetries       int   `mapstructure:"num_retries"`
-	RetryIntervalMS  int   `mapstructure:"retry_interval_ms"`
-	WriteTimeoutMS   int   `mapstructure:"write_timeout_ms"`
+	NumReadWorkers        int   `mapstructure:"num_read_workers"`
+	NumInsertWorkers      int   `mapstructure:"num_insert_workers"`
+	ReadBatchSize         int   `mapstructure:"read_batch_size"`
+	InsertBatchSize       int   `mapstructure:"insert_batch_size"`
+	InsertBatchBytes      int64 `mapstructure:"insert_batch_bytes"`
+	SegmentSizeDocs       int64 `mapstructure:"segment_size_docs"`
+	NumRetries            int   `mapstructure:"num_retries"`
+	RetryIntervalMS       int   `mapstructure:"retry_interval_ms"`
+	WriteTimeoutMS        int   `mapstructure:"write_timeout_ms"`
+	PostponeIndexCreation bool  `mapstructure:"postpone_index_creation"`
 }
 
 // ValidationConfig holds settings for online data validation
 type ValidationConfig struct {
-	Enabled              bool `mapstructure:"enabled"`
-	BatchSize            int  `mapstructure:"batch_size"`
-	RetryIntervalMS      int  `mapstructure:"retry_interval_ms"`
-	MaxValidationWorkers int  `mapstructure:"max_validation_workers"`
-	MaxRetries           int  `mapstructure:"max_retries"`
-	QueueSize            int  `mapstructure:"queue_size"`
+	Enabled                    bool `mapstructure:"enabled"`
+	BatchSize                  int  `mapstructure:"batch_size"`
+	RetryIntervalMS            int  `mapstructure:"retry_interval_ms"`
+	MaxValidationWorkers       int  `mapstructure:"max_validation_workers"`
+	MaxRetries                 int  `mapstructure:"max_retries"`
+	QueueSize                  int  `mapstructure:"queue_size"`
+	HotKeyCheckIntervalMinutes int  `yaml:"hot_key_check_interval_minutes"`
+	IdleCheckIntervalSeconds   int  `yaml:"idle_check_interval_seconds"`
 }
 
 // FlowControlConfig holds settings for adaptive throttling
 type FlowControlConfig struct {
-	Enabled             bool `mapstructure:"enabled"`
-	CheckIntervalMS     int  `mapstructure:"check_interval_ms"`
-	TargetMaxQueuedOps  int  `mapstructure:"target_max_queued_ops"`
-	TargetMaxResidentMB int  `mapstructure:"target_max_resident_mb"`
-	PauseDurationMS     int  `mapstructure:"pause_duration_ms"`
+	Enabled               bool `mapstructure:"enabled"`
+	CheckIntervalMS       int  `mapstructure:"check_interval_ms"`
+	TargetMaxQueuedOps    int  `mapstructure:"target_max_queued_ops"`
+	TargetMaxResidentMB   int  `mapstructure:"target_max_resident_mb"`
+	PauseDurationMS       int  `mapstructure:"pause_duration_ms"`
+	LatencyThresholdMS    int  `mapstructure:"latency_threshold_ms"`
+	ActiveClientThreshold int  `mapstructure:"active_client_threshold"`
+	MinWiredTigerTickets  int  `mapstructure:"min_wired_tiger_tickets"`
 }
 
 // Config holds all configuration for the application
@@ -139,9 +163,9 @@ var Cfg *Config
 func LoadConfig() {
 	// --- 1. Set Defaults ---
 	viper.SetDefault("logging.level", "info")
-	viper.SetDefault("logging.file_path", "logs/docStreamer.log")
-	viper.SetDefault("logging.ops_log_path", "logs/cdc.log")
-	viper.SetDefault("logging.full_load_log_path", "logs/full_load.log")
+	viper.SetDefault("logging.file_path", "docStreamer.log")
+	viper.SetDefault("logging.ops_log_path", "cdc.log")
+	viper.SetDefault("logging.full_load_log_path", "full_load.log")
 
 	viper.SetDefault("docdb.endpoint", "localhost")
 	viper.SetDefault("docdb.port", "27017")
@@ -173,17 +197,19 @@ func LoadConfig() {
 	viper.SetDefault("migration.dry_run", false)
 	viper.SetDefault("migration.env_prefix", "MIGRATION")
 	viper.SetDefault("migration.status_http_port", "8080")
+	viper.SetDefault("migration.discovery_timeout_ms", 120000) // Default 2 minutes
 
 	// Cloner Defaults
 	viper.SetDefault("cloner.num_read_workers", 4)
 	viper.SetDefault("cloner.num_insert_workers", 8)
 	viper.SetDefault("cloner.read_batch_size", 1000)
 	viper.SetDefault("cloner.insert_batch_size", 1000)
-	viper.SetDefault("cloner.insert_batch_bytes", 48*1024*1024)
+	viper.SetDefault("cloner.insert_batch_bytes", 16*1024*1024)
 	viper.SetDefault("cloner.segment_size_docs", 10000)
 	viper.SetDefault("cloner.num_retries", 5)
 	viper.SetDefault("cloner.retry_interval_ms", 1000)
 	viper.SetDefault("cloner.write_timeout_ms", 30000)
+	viper.SetDefault("cloner.postpone_index_creation", false)
 
 	// CDC Defaults
 	viper.SetDefault("cdc.batch_size", 1000)
@@ -205,9 +231,12 @@ func LoadConfig() {
 	// Flow control Defaults
 	viper.SetDefault("flow_control.enabled", true)
 	viper.SetDefault("flow_control.check_interval_ms", 1000)
-	viper.SetDefault("flow_control.target_max_queued_ops", 50) // Conservative default
-	viper.SetDefault("flow_control.target_max_resident_mb", 0) // 0 = disabled
+	viper.SetDefault("flow_control.target_max_queued_ops", 50)
+	viper.SetDefault("flow_control.target_max_resident_mb", 0)
 	viper.SetDefault("flow_control.pause_duration_ms", 500)
+	viper.SetDefault("flow_control.latency_threshold_ms", 250)
+	viper.SetDefault("flow_control.active_client_threshold", 20)
+	viper.SetDefault("flow_control.min_wired_tiger_tickets", 0) // 0 disables it
 
 	// --- 2. Read config file ---
 	viper.SetConfigName("config")
@@ -244,6 +273,27 @@ func LoadConfig() {
 		log.Fatalf("Fatal error unmarshaling config: %v\n", err)
 	}
 
+	// Safety fallbacks
+	if Cfg.Cloner.InsertBatchBytes == 0 {
+		Cfg.Cloner.InsertBatchBytes = 16 * 1024 * 1024
+	}
+
+	if Cfg.Validation.HotKeyCheckIntervalMinutes == 0 {
+		Cfg.Validation.HotKeyCheckIntervalMinutes = 5
+	}
+
+	if Cfg.Validation.IdleCheckIntervalSeconds == 0 {
+		Cfg.Validation.IdleCheckIntervalSeconds = 5
+	}
+
+	if Cfg.CDC.MaxAwaitTimeMS == 0 {
+		Cfg.CDC.MaxAwaitTimeMS = 1000
+	}
+
+	if Cfg.FlowControl.PauseDurationMS == 0 {
+		Cfg.FlowControl.PauseDurationMS = 500
+	}
+
 	viper.WatchConfig()
 	viper.OnConfigChange(func(e fsnotify.Event) {
 		log.Printf("Config file changed: %s. Reloading...", e.Name)
@@ -277,7 +327,6 @@ func (c *Config) BuildDocDBURI(user, password string) string {
 		addQueryParam(&params, "tlsCAFile", c.DocDB.CaFile)
 	} else {
 		addQueryParam(&params, "tls", "false")
-		// We do not add tlsCAFile if tls is false
 	}
 
 	if useTunnel {
@@ -307,6 +356,7 @@ func (c *Config) BuildDocDBURI(user, password string) string {
 
 func (c *Config) BuildMongoURI(user, password string) string {
 	params := url.Values{}
+	params.Add("retryWrites", "false")
 	if c.Mongo.TLS {
 		addQueryParam(&params, "tls", "true")
 		if c.Mongo.CaFile != "" {

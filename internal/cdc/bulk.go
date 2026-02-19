@@ -1,122 +1,270 @@
 package cdc
 
 import (
-	"fmt"
+	"context"
 	"strings"
-	"sync"
 
-	"github.com/Percona-Lab/percona-docstreamer/internal/logging"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
-// Batch holds the data for a flush operation
-// It contains the WriteModels for Mongo AND the IDs for the Validator
 type Batch struct {
-	Models []mongo.WriteModel
-	IDs    []string
-	LastTS bson.Timestamp // Max timestamp in this batch
+	Models     []mongo.WriteModel
+	Keys       []bson.D
+	LastTS     bson.Timestamp
+	Inserts    int64
+	Updates    int64
+	Deletes    int64
+	EventCount int64
 }
 
-// BulkWriter handles buffering changes
+type ShardKeyInfo struct {
+	Key  string
+	Path []string
+}
+
+type ShardKeyProvider func(ctx context.Context, ns string) ([]string, error)
+
 type BulkWriter struct {
 	targetClient *mongo.Client
 	batchSize    int
-	// Map namespace -> Batch
-	batches map[string]*Batch
-	lock    sync.Mutex
+	batches      map[string]*Batch
+	keyProvider  ShardKeyProvider
 }
 
-// NewBulkWriter creates a new bulk writer
-func NewBulkWriter(target *mongo.Client, batchSize int) *BulkWriter {
+func NewBulkWriter(target *mongo.Client, batchSize int, provider ShardKeyProvider) *BulkWriter {
 	return &BulkWriter{
 		targetClient: target,
 		batchSize:    batchSize,
 		batches:      make(map[string]*Batch),
-		lock:         sync.Mutex{},
+		keyProvider:  provider,
 	}
 }
 
-// AddEvent adds a change event to the buffer.
-func (b *BulkWriter) AddEvent(event *ChangeEvent) bool {
+func (b *BulkWriter) getShardKeyInfo(ns string) ([]ShardKeyInfo, error) {
+	keys, err := b.keyProvider(context.Background(), ns)
+	if err != nil {
+		return nil, err
+	}
+
+	info := make([]ShardKeyInfo, len(keys))
+	for i, key := range keys {
+		info[i] = ShardKeyInfo{
+			Key:  key,
+			Path: strings.Split(key, "."),
+		}
+	}
+	return info, nil
+}
+
+func GetNestedValue(doc interface{}, path []string) (interface{}, bool) {
+	if doc == nil {
+		return nil, false
+	}
+	current := doc
+	for _, part := range path {
+		switch v := current.(type) {
+		case bson.M:
+			if val, exists := v[part]; exists {
+				current = val
+			} else {
+				return nil, false
+			}
+		case map[string]interface{}:
+			if val, exists := v[part]; exists {
+				current = val
+			} else {
+				return nil, false
+			}
+		case bson.D:
+			found := false
+			for _, e := range v {
+				if e.Key == part {
+					current = e.Value
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil, false
+			}
+		default:
+			return nil, false
+		}
+	}
+	return current, true
+}
+
+func (b *BulkWriter) createFilter(ns string, event *ChangeEvent) (bson.D, error) {
+	shardKeys, err := b.getShardKeyInfo(ns)
+	if err != nil {
+		return nil, err
+	}
+
+	filter := make(bson.D, 0, len(shardKeys)+1)
+
+	for _, sk := range shardKeys {
+		if sk.Key == "_id" {
+			continue
+		}
+		if val, ok := GetNestedValue(event.FullDocument, sk.Path); ok {
+			filter = append(filter, bson.E{Key: sk.Key, Value: val})
+		} else if val, ok := GetNestedValue(event.DocumentKey, sk.Path); ok {
+			filter = append(filter, bson.E{Key: sk.Key, Value: val})
+		}
+	}
+
+	if idVal, ok := event.DocumentKey["_id"]; ok {
+		filter = append(filter, bson.E{Key: "_id", Value: idVal})
+	}
+	return filter, nil
+}
+
+// AddEvent adds an event to the batch.
+func (b *BulkWriter) AddEvent(event *ChangeEvent) (bool, bool, error) {
+	ns := event.Ns()
+	filter, err := b.createFilter(ns, event)
+	if err != nil {
+		return false, false, err
+	}
+
+	if b.batches[ns] == nil {
+		batch := &Batch{
+			Models: []mongo.WriteModel{},
+			Keys:   []bson.D{},
+		}
+		b.batches[ns] = batch
+	}
+
+	batch := b.batches[ns]
 	var model mongo.WriteModel
 
-	// Extract ID string safely for validation later
-	var docID string
-	if val, ok := event.DocumentKey["_id"]; ok {
-		if oid, ok := val.(bson.ObjectID); ok {
-			docID = oid.Hex()
-		} else {
-			docID = fmt.Sprintf("%v", val)
+	// --- Shard Key Update Detection ---
+	isShardKeyUpdated := false
+	if event.OperationType == Update && event.UpdateFields != nil {
+		if updated, ok := event.UpdateFields["updatedFields"]; ok && updated != nil {
+			shardKeys, err := b.getShardKeyInfo(ns)
+			if err != nil {
+				return false, false, err
+			}
+
+			switch v := updated.(type) {
+			case bson.M:
+				for _, sk := range shardKeys {
+					if _, exists := v[sk.Key]; exists {
+						isShardKeyUpdated = true
+						break
+					}
+				}
+			case bson.D:
+				for _, sk := range shardKeys {
+					for _, e := range v {
+						if e.Key == sk.Key || strings.HasPrefix(e.Key, sk.Key+".") {
+							isShardKeyUpdated = true
+							break
+						}
+					}
+				}
+			}
 		}
 	}
 
 	switch event.OperationType {
 	case Insert:
-		model = mongo.NewReplaceOneModel().
-			SetFilter(bson.D{{Key: "_id", Value: event.DocumentKey["_id"]}}).
-			SetReplacement(event.FullDocument).
-			SetUpsert(true)
-	case Update, Replace:
-		model = mongo.NewReplaceOneModel().
-			SetFilter(bson.D{{Key: "_id", Value: event.DocumentKey["_id"]}}).
-			SetReplacement(event.FullDocument).
-			SetUpsert(true)
-	case Delete:
-		model = mongo.NewDeleteOneModel().
-			SetFilter(bson.D{{Key: "_id", Value: event.DocumentKey["_id"]}})
-	default:
-		logging.PrintWarning(fmt.Sprintf("Unsupported operation type: %s. Skipping.", event.OperationType), 0)
-		return false
-	}
-
-	ns := event.Ns()
-	b.lock.Lock()
-	if b.batches[ns] == nil {
-		b.batches[ns] = &Batch{
-			Models: []mongo.WriteModel{},
-			IDs:    []string{},
+		if event.FullDocument != nil {
+			model = mongo.NewReplaceOneModel().SetFilter(filter).SetReplacement(event.FullDocument).SetUpsert(true)
+			batch.Inserts++
 		}
+	case Replace:
+		if event.FullDocument != nil {
+			model = mongo.NewReplaceOneModel().SetFilter(filter).SetReplacement(event.FullDocument).SetUpsert(true)
+			batch.Updates++
+		}
+	case Update:
+		if isShardKeyUpdated && event.FullDocument != nil {
+			// Split Shard Key Update
+			delFilter := bson.D{}
+			shardKeys, _ := b.getShardKeyInfo(ns)
+
+			// Build delete filter using ONLY DocumentKey
+			for _, sk := range shardKeys {
+				if val, ok := GetNestedValue(event.DocumentKey, sk.Path); ok {
+					delFilter = append(delFilter, bson.E{Key: sk.Key, Value: val})
+				}
+			}
+			if idVal, ok := event.DocumentKey["_id"]; ok {
+				delFilter = append(delFilter, bson.E{Key: "_id", Value: idVal})
+			}
+
+			// Queue Delete + Insert
+			delModel := mongo.NewDeleteOneModel().SetFilter(delFilter)
+			insModel := mongo.NewInsertOneModel().SetDocument(event.FullDocument)
+
+			batch.Models = append(batch.Models, delModel, insModel)
+			batch.Keys = append(batch.Keys, delFilter, filter)
+			batch.Updates++
+			batch.EventCount++
+
+			if event.ClusterTime.T > batch.LastTS.T ||
+				(event.ClusterTime.T == batch.LastTS.T && event.ClusterTime.I > batch.LastTS.I) {
+				batch.LastTS = event.ClusterTime
+			}
+			return true, len(batch.Models) >= b.batchSize, nil
+
+		} else if event.UpdateFields != nil {
+			updateDoc := bson.D{}
+			if updated, ok := event.UpdateFields["updatedFields"]; ok && updated != nil {
+				isEmpty := false
+				if m, isM := updated.(bson.M); isM && len(m) == 0 {
+					isEmpty = true
+				} else if d, isD := updated.(bson.D); isD && len(d) == 0 {
+					isEmpty = true
+				}
+				if !isEmpty {
+					updateDoc = append(updateDoc, bson.E{Key: "$set", Value: updated})
+				}
+			}
+			if removed, ok := event.UpdateFields["removedFields"].(bson.A); ok && len(removed) > 0 {
+				unsetDoc := bson.D{}
+				for _, f := range removed {
+					if fieldStr, ok := f.(string); ok {
+						unsetDoc = append(unsetDoc, bson.E{Key: fieldStr, Value: ""})
+					}
+				}
+				if len(unsetDoc) > 0 {
+					updateDoc = append(updateDoc, bson.E{Key: "$unset", Value: unsetDoc})
+				}
+			}
+
+			if len(updateDoc) > 0 {
+				model = mongo.NewUpdateOneModel().SetFilter(filter).SetUpdate(updateDoc).SetUpsert(false)
+				batch.Updates++
+			} else if event.FullDocument != nil {
+				model = mongo.NewReplaceOneModel().SetFilter(filter).SetReplacement(event.FullDocument).SetUpsert(true)
+				batch.Updates++
+			}
+		}
+	case Delete:
+		model = mongo.NewDeleteOneModel().SetFilter(filter)
+		batch.Deletes++
 	}
 
-	b.batches[ns].Models = append(b.batches[ns].Models, model)
-	if docID != "" {
-		b.batches[ns].IDs = append(b.batches[ns].IDs, docID)
+	if model != nil {
+		batch.Models = append(batch.Models, model)
+		batch.Keys = append(batch.Keys, filter)
+		batch.EventCount++
+		if event.ClusterTime.T > batch.LastTS.T ||
+			(event.ClusterTime.T == batch.LastTS.T && event.ClusterTime.I > batch.LastTS.I) {
+			batch.LastTS = event.ClusterTime
+		}
+		return true, len(batch.Models) >= b.batchSize, nil
 	}
 
-	// --- Track the latest timestamp in this batch ---
-	if event.ClusterTime.T > b.batches[ns].LastTS.T ||
-		(event.ClusterTime.T == b.batches[ns].LastTS.T && event.ClusterTime.I > b.batches[ns].LastTS.I) {
-		b.batches[ns].LastTS = event.ClusterTime
-	}
-
-	size := len(b.batches[ns].Models)
-	b.lock.Unlock()
-
-	return size >= b.batchSize
+	return false, len(batch.Models) >= b.batchSize, nil
 }
 
-// ExtractBatches clears the buffer and returns all buffered batches
-// This replaces the old Flush() method, moving the write logic to the Manager
 func (b *BulkWriter) ExtractBatches() map[string]*Batch {
-	b.lock.Lock()
-	defer b.lock.Unlock()
-
-	if len(b.batches) == 0 {
-		return nil
-	}
-
-	currentBatches := b.batches
-	b.batches = make(map[string]*Batch) // Reset
-
-	return currentBatches
-}
-
-// splitNamespace helper
-func splitNamespace(ns string) (string, string) {
-	parts := strings.SplitN(ns, ".", 2)
-	if len(parts) < 2 {
-		return parts[0], ""
-	}
-	return parts[0], parts[1]
+	current := b.batches
+	b.batches = make(map[string]*Batch)
+	return current
 }

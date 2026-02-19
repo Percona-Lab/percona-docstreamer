@@ -34,6 +34,7 @@ import (
 	"github.com/Percona-Lab/percona-docstreamer/internal/dbops"
 	"github.com/Percona-Lab/percona-docstreamer/internal/discover"
 	"github.com/Percona-Lab/percona-docstreamer/internal/flow"
+	"github.com/Percona-Lab/percona-docstreamer/internal/indexer"
 	"github.com/Percona-Lab/percona-docstreamer/internal/logging"
 	"github.com/Percona-Lab/percona-docstreamer/internal/pid"
 	"github.com/Percona-Lab/percona-docstreamer/internal/status"
@@ -41,11 +42,8 @@ import (
 	"github.com/Percona-Lab/percona-docstreamer/internal/validator"
 )
 
-// Declare the version variable.
-// The Makefile will override this value during build.
 var version = "1"
 
-// --- Helper function for password prompt ---
 func getPassword(prompt string) (string, error) {
 	fmt.Print(prompt)
 	bytePassword, err := term.ReadPassword(int(syscall.Stdin))
@@ -56,7 +54,6 @@ func getPassword(prompt string) (string, error) {
 	return strings.TrimSpace(string(bytePassword)), nil
 }
 
-// --- Helper function for 'yes' confirmation ---
 func getConfirmation(prompt string) (bool, error) {
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Print(prompt)
@@ -79,13 +76,11 @@ docStreamer %s `, version),
 		DisableDefaultCmd: true,
 	},
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
-		// Do not run setup logic for the help command
 		if cmd.Name() == "help" {
 			return
 		}
 		config.LoadConfig()
 
-		// Check for debug flag and override config if set
 		debug, _ := cmd.Flags().GetBool("debug")
 		if debug {
 			config.Cfg.Logging.Level = "debug"
@@ -102,7 +97,6 @@ docStreamer %s `, version),
 	},
 }
 
-// startAction contains the core logic for starting the migration.
 func startAction(cmd *cobra.Command, args []string) {
 	logging.PrintPhase("1", "VALIDATION")
 	docdbUser := viper.GetString("docdb.user")
@@ -135,9 +129,7 @@ func startAction(cmd *cobra.Command, args []string) {
 
 	logging.PrintStep("Connecting to source DocumentDB...", 0)
 	clientOpts := options.Client().ApplyURI(docdbURI)
-	// --- Conditionally apply InsecureSkipVerify ---
-	// If TLS is ON and we need to skip hostname validation (e.g. tunneling),
-	// we must force the driver to use a custom TLS config.
+
 	if config.Cfg.DocDB.TLS && config.Cfg.DocDB.TlsAllowInvalidHostnames {
 		clientOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
 	}
@@ -157,9 +149,7 @@ func startAction(cmd *cobra.Command, args []string) {
 
 	logging.PrintStep("Connecting to target MongoDB...", 0)
 	mongoClientOpts := options.Client().ApplyURI(mongoURI)
-	// --- Conditionally apply InsecureSkipVerify ---
-	// If TLS is ON and we need to skip hostname validation (e.g. tunneling),
-	// we must force the driver to use a custom TLS config.
+
 	if config.Cfg.Mongo.TLS && config.Cfg.Mongo.TlsAllowInvalidHostnames {
 		mongoClientOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
 	}
@@ -228,7 +218,6 @@ func startAction(cmd *cobra.Command, args []string) {
 		hiddenargs = append(hiddenargs, "--destroy")
 	}
 
-	// Pass debug flag to the child process if it was set
 	debug, _ := cmd.Flags().GetBool("debug")
 	if debug {
 		hiddenargs = append(hiddenargs, "--debug")
@@ -236,12 +225,19 @@ func startAction(cmd *cobra.Command, args []string) {
 
 	runCmd := exec.Command(executable, hiddenargs...)
 	runCmd.SysProcAttr = &syscall.SysProcAttr{
-		Setsid: true, // Detach
+		Setsid: true,
 	}
 
-	// Inherit the current environment
 	runCmd.Env = os.Environ()
-	// Append credentials explicitly
+	memLimitBytes := config.ResolveGoMemLimit()
+	runCmd.Env = append(runCmd.Env, fmt.Sprintf("GOMEMLIMIT=%s", memLimitBytes))
+
+	gogc := config.Cfg.Migration.GoGC
+	if gogc == 0 {
+		gogc = 50
+	}
+	runCmd.Env = append(runCmd.Env, fmt.Sprintf("GOGC=%d", gogc))
+
 	runCmd.Env = append(runCmd.Env, fmt.Sprintf("DOCDB_USER=%s", docdbUser))
 	runCmd.Env = append(runCmd.Env, fmt.Sprintf("MONGO_USER=%s", mongoUser))
 	runCmd.Env = append(runCmd.Env, fmt.Sprintf("DOCDB_PASS=%s", docdbPass))
@@ -253,11 +249,8 @@ func startAction(cmd *cobra.Command, args []string) {
 	}
 	logging.PrintSuccess(fmt.Sprintf("Application started in background with PID: %d", runCmd.Process.Pid), 0)
 
-	// --- Zombie & Exit Detection ---
-	// Create a channel that closes when the child process exits.
 	processExitChan := make(chan struct{})
 	go func() {
-		// Wait ensures the zombie is removed if it exits while we are still parent.
 		runCmd.Wait()
 		close(processExitChan)
 	}()
@@ -265,15 +258,13 @@ func startAction(cmd *cobra.Command, args []string) {
 	logFile, err := os.Open(config.Cfg.Logging.FilePath)
 	var initialOffset int64 = 0
 	if err == nil {
-		initialOffset, _ = logFile.Seek(0, 2) // Go to end of existing logs
+		initialOffset, _ = logFile.Seek(0, 2)
 		logFile.Close()
 	}
 
-	// Monitor via API and Logs
 	monitorStartup(config.Cfg.Logging.FilePath, initialOffset, runCmd.Process.Pid, config.Cfg.Migration.StatusHTTPPort, processExitChan)
 }
 
-// stopAction encapsulates the logic to signal the app to stop and tail the logs until it exits.
 func stopAction(phaseTitle string) error {
 	logging.PrintPhase("6", phaseTitle)
 
@@ -282,7 +273,6 @@ func stopAction(phaseTitle string) error {
 		return fmt.Errorf("could not read PID file. Is the application running")
 	}
 
-	// 1. Open log file before stopping to catch shutdown logs
 	logFile, err := os.Open(config.Cfg.Logging.FilePath)
 	if err == nil {
 		logFile.Seek(0, 2)
@@ -293,13 +283,11 @@ func stopAction(phaseTitle string) error {
 		}
 	}()
 
-	// 2. Send Stop Signal
 	if err := pid.Stop(); err != nil {
 		return err
 	}
 	logging.PrintSuccess("Stop signal sent.", 0)
 
-	// 3. Tail logs until exit
 	if logFile != nil {
 		reader := bufio.NewReader(logFile)
 		for {
@@ -313,7 +301,6 @@ func stopAction(phaseTitle string) error {
 			}
 
 			if !pid.IsRunning(pidVal) {
-				// Drain remainder
 				for {
 					line, err := reader.ReadString('\n')
 					if err == nil {
@@ -355,7 +342,6 @@ var restartCmd = &cobra.Command{
 	Short: "Restarts the application",
 	Long:  `Stops the running application (if any) and starts it again.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		// 1. Check if running and Stop
 		pidVal, err := pid.Read()
 		if err == nil && pid.IsRunning(pidVal) {
 			if err := stopAction("STOPPING FOR RESTART"); err != nil {
@@ -363,25 +349,20 @@ var restartCmd = &cobra.Command{
 				os.Exit(1)
 			}
 			logging.PrintSuccess("Application stopped.", 0)
-			// Brief pause to ensure OS releases resources
 			time.Sleep(1 * time.Second)
 		} else {
 			logging.PrintInfo("Application is not running. Proceeding to start.", 0)
 		}
-
-		// 2. Start
 		startAction(cmd, args)
 	},
 }
 
-// monitorStartup tails logs AND polls the status endpoint for readiness
 func monitorStartup(logPath string, offset int64, pidVal int, port string, exitChan chan struct{}) {
 	if port == "" {
 		port = "8080"
 	}
 	statusURL := fmt.Sprintf("http://localhost:%s/status", port)
 
-	// Give the app a moment to create/write to the file
 	time.Sleep(500 * time.Millisecond)
 
 	file, err := os.Open(logPath)
@@ -393,15 +374,12 @@ func monitorStartup(logPath string, offset int64, pidVal int, port string, exitC
 	file.Seek(offset, 0)
 	reader := bufio.NewReader(file)
 
-	// Polling ticker for HTTP check
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
-		// --- Check if process has exited ---
 		select {
 		case <-exitChan:
-			// Process has died or exited. Read final logs and quit.
 			for {
 				line, err := reader.ReadString('\n')
 				if err == nil {
@@ -415,23 +393,20 @@ func monitorStartup(logPath string, offset int64, pidVal int, port string, exitC
 		default:
 		}
 
-		// 1. Read and print new logs
 		for {
 			line, err := reader.ReadString('\n')
 			if err == nil {
 				fmt.Print(line)
 			} else {
-				break // End of current logs
+				break
 			}
 		}
 
-		// 2. Check if process crashed (PID check fallback)
 		if !pid.IsRunning(pidVal) {
 			logging.PrintError(("Process exited unexpectedly. Check logs for details."), 0)
 			return
 		}
 
-		// 3. Poll HTTP Status
 		select {
 		case <-ticker.C:
 			resp, err := http.Get(statusURL)
@@ -439,12 +414,10 @@ func monitorStartup(logPath string, offset int64, pidVal int, port string, exitC
 				defer resp.Body.Close()
 				var s status.StatusOutput
 				if json.NewDecoder(resp.Body).Decode(&s) == nil {
-					// Check for healthy states
 					if s.OK && s.State == "running" {
 						logging.PrintSuccess(fmt.Sprintf("Application is healthy (State: %s).", s.State), 0)
 						return
 					}
-					// Check for error state
 					if s.State == "error" {
 						logging.PrintError(fmt.Sprintf("Application reported an error: %s", s.Info), 0)
 						os.Exit(1)
@@ -452,7 +425,6 @@ func monitorStartup(logPath string, offset int64, pidVal int, port string, exitC
 				}
 			}
 		default:
-			// Don't block waiting for ticker
 			time.Sleep(200 * time.Millisecond)
 		}
 	}
@@ -478,18 +450,26 @@ var statusCmd = &cobra.Command{
 			os.Exit(1)
 		}
 		defer resp.Body.Close()
+
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			fmt.Printf("Failed to read status response: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Println("--- docStreamer Status (Live) ---")
-		fmt.Printf("PID: %d (Querying %s)\n", pidVal, url)
-		fmt.Println(string(body))
+
+		var data status.StatusOutput
+		if err := json.Unmarshal(body, &data); err != nil {
+			// Fallback if not valid JSON
+			fmt.Println(string(body))
+		} else {
+			pretty, _ := json.MarshalIndent(data, "", "    ")
+			fmt.Println("--- docStreamer Status (Live) ---")
+			fmt.Printf("PID: %d (Querying %s)\n", pidVal, url)
+			fmt.Println(string(pretty))
+		}
 	},
 }
 
-// Internal run command (hidden)
 var runCmd = &cobra.Command{
 	Use:    "run",
 	Hidden: true,
@@ -498,7 +478,6 @@ var runCmd = &cobra.Command{
 	},
 }
 
-// Run the migration
 func runMigrationProcess(cmd *cobra.Command, args []string) {
 	if err := pid.Write(); err != nil {
 		logging.PrintError(fmt.Sprintf("Failed to write PID file: %v", err), 0)
@@ -509,7 +488,6 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	defer cancel()
 
 	var statusManager *status.Manager
-	// We need to declare apiServer here so the signal handler closure can access it
 	var apiServer *api.Server
 
 	sigChan := make(chan os.Signal, 1)
@@ -517,31 +495,49 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	go func() {
 		sig := <-sigChan
 		logging.PrintWarning(fmt.Sprintf("Received signal: %v. Initiating graceful shutdown...", sig), 0)
-		logging.PrintInfo("!!! PLEASE WAIT: Flushing final CDC batches to destination...", 0)
-		logging.PrintInfo("!!! DO NOT FORCE QUIT (Ctrl+C), or data may be lost.", 0)
+		logging.PrintInfo("!!! DO NOT FORCE QUIT (Ctrl+C). Waiting for workers to finish and flush data...", 0)
 
 		if statusManager != nil {
-			statusManager.SetState("stopping", "Flushing pending events... Please wait.")
+			statusManager.SetState("stopping", "Initiating shutdown. Waiting for workers...")
 			statusManager.Persist(context.Background())
 		}
 
-		// --- SHUTDOWN WATCHDOG ---
-		// If the app is still running after 15 seconds, force exit to avoid hanging forever.
-		go func() {
-			time.Sleep(15 * time.Second)
-			logging.PrintError("Shutdown timed out. Forcing exit.", 0)
-			pid.Clear()
-			os.Exit(1)
-		}()
-
-		// Gracefully stop the new API server WITH TIMEOUT
 		if apiServer != nil {
-			stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer stopCancel()
 			apiServer.Stop(stopCtx)
 		}
 
 		cancel()
+
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		startShutdown := time.Now()
+		const maxWait = 300 * time.Second
+
+		for range ticker.C {
+			elapsed := time.Since(startShutdown).Round(time.Second)
+
+			applied := "N/A"
+			if statusManager != nil {
+				applied = fmt.Sprintf("%d", statusManager.GetEventsApplied())
+			}
+
+			msg := fmt.Sprintf("Still shutting down... (%s elapsed). Events Applied: %s", elapsed, applied)
+			logging.PrintInfo(fmt.Sprintf(">>> %s", msg), 0)
+
+			if statusManager != nil {
+				statusManager.SetState("stopping", msg)
+				statusManager.Persist(context.Background())
+			}
+
+			if elapsed > maxWait {
+				logging.PrintError("Shutdown timeout exceeded. Force exiting to prevent hang.", 0)
+				pid.Clear()
+				os.Exit(1)
+			}
+		}
 	}()
 
 	docdbUser, _ := cmd.Flags().GetString("docdb-user")
@@ -569,267 +565,186 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	docdbURI := config.Cfg.BuildDocDBURI(docdbUser, docdbPass)
 	mongoURI := config.Cfg.BuildMongoURI(mongoUser, mongoPass)
 
-	// --- Use conditional TLS logic for Source (DocumentDB) ---
-	clientOpts := options.Client().ApplyURI(docdbURI)
-	if config.Cfg.DocDB.TLS && config.Cfg.DocDB.TlsAllowInvalidHostnames {
-		clientOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
-	}
-	sourceClient, err := mongo.Connect(clientOpts)
-
-	if err != nil {
-		logging.PrintError(err.Error(), 0)
-		return
-	}
-	// --- Disconnect with timeout ---
-	defer func() {
-		dCtx, dCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer dCancel()
-		if err := sourceClient.Disconnect(dCtx); err != nil {
-			logging.PrintWarning(fmt.Sprintf("Source disconnect warning: %v", err), 0)
-		}
-	}()
-
-	// --- Use conditional TLS logic for Target (MongoDB) ---
-	mongoClientOpts := options.Client().ApplyURI(mongoURI)
+	metaOpts := options.Client().ApplyURI(mongoURI).SetAppName("docStreamer-Metadata")
 	if config.Cfg.Mongo.TLS && config.Cfg.Mongo.TlsAllowInvalidHostnames {
-		mongoClientOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
+		metaOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
 	}
-	targetClient, err := mongo.Connect(mongoClientOpts)
-
+	targetClient, err := mongo.Connect(metaOpts)
 	if err != nil {
-		logging.PrintError(err.Error(), 0)
+		logging.PrintError(fmt.Sprintf("Metadata client error: %v", err), 0)
 		return
 	}
+	defer targetClient.Disconnect(context.Background())
 
-	// --- Disconnect with timeout ---
-	defer func() {
-		dCtx, dCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer dCancel()
-		if err := targetClient.Disconnect(dCtx); err != nil {
-			logging.PrintWarning(fmt.Sprintf("Target disconnect warning: %v", err), 0)
-		}
-	}()
-
-	// --- 1. CHECKPOINT MANAGER & CLEANUP ---
 	checkpointManager := checkpoint.NewManager(targetClient)
 	resumeAt, found := checkpointManager.GetResumeTimestamp(ctx, config.Cfg.Migration.CheckpointDocID)
 
-	// Declared outside to prevent shadowing and persist discovery data if destroy is True
 	var collectionsToMigrate []discover.CollectionInfo
 
 	if destroy {
 		logging.PrintPhase("3", "DISCOVERY (for Destroy)")
-		collectionsToMigrate, err = discover.DiscoverCollections(ctx, sourceClient)
+		discOpts := options.Client().ApplyURI(docdbURI).SetAppName("docStreamer-Discovery")
+		if config.Cfg.DocDB.TLS && config.Cfg.DocDB.TlsAllowInvalidHostnames {
+			discOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
+		}
+		discClient, _ := mongo.Connect(discOpts)
+		collectionsToMigrate, err = discover.DiscoverCollections(ctx, discClient)
+		discClient.Disconnect(context.Background())
+
 		if err != nil {
 			logging.PrintError(err.Error(), 0)
-			return
-		}
-		if ctx.Err() != nil {
 			return
 		}
 		dbsFromSource := extractDBNames(collectionsToMigrate)
 		logging.PrintPhase("DESTROY", "Dropping target databases...")
 		dbops.DropAllDatabases(ctx, targetClient, dbsFromSource)
 
-		// Explicitly drop metadata DB here to prevent partial resume detection later
 		logging.PrintPhase("DESTROY", "Dropping metadata database...")
 		if err := targetClient.Database(config.Cfg.Migration.MetadataDB).Drop(ctx); err != nil {
-			logging.PrintWarning(fmt.Sprintf("Failed to drop metadata DB during destroy: %v", err), 0)
+			logging.PrintWarning(fmt.Sprintf("Failed to drop metadata DB: %v", err), 0)
 		}
-
 		found = false
 	}
 
-	// --- Cleanup or Partial Resume ---
 	var startAt bson.Timestamp
 	var anchorFound bool
 
 	if !found {
-		// We don't have a global checkpoint (completed full load).
-		// Check if we have an Anchor (partial full load).
 		startAt, anchorFound = checkpointManager.GetAnchorTimestamp(ctx)
-
 		if anchorFound {
 			logging.PrintInfo(fmt.Sprintf("Found partial migration state (Anchor T0: %v). Resuming Full Load...", startAt), 0)
 		} else {
 			logging.PrintInfo("No valid global checkpoint or anchor found. Starting fresh.", 0)
-			logging.PrintInfo("Cleaning up stale metadata (Status, Checkpoints, Validation)...", 0)
-
-			// Drop the entire metadata database to ensure a clean slate
-			err := targetClient.Database(config.Cfg.Migration.MetadataDB).Drop(ctx)
-			if err != nil {
-				logging.PrintWarning(fmt.Sprintf("Failed to drop metadata DB: %v", err), 0)
-			} else {
-				logging.PrintSuccess("Metadata cleanup complete.", 0)
-			}
 		}
 	}
 
-	// --- 2. Initialize Shared Components ---
 	tracker := validator.NewInFlightTracker()
-	valStore := validator.NewStore(targetClient)
-
-	apiServer = api.NewServer(config.Cfg.Migration.StatusHTTPPort)
-	// Initialize Status Manager BEFORE Flow Manager
 	statusManager = status.NewManager(targetClient, false)
 
-	// --- FLOW CONTROL ---
-	// Pass mongoUser and mongoPass so we can connect to shards if discovered
+	if err := statusManager.LoadAndMerge(ctx); err != nil {
+		logging.PrintInfo(fmt.Sprintf("Status load skipped: %v", err), 0)
+	}
+
 	flowManager := flow.NewManager(targetClient, statusManager, mongoUser, mongoPass)
 	flowManager.Start()
 	defer flowManager.Stop()
 
-	validationManager := validator.NewManager(sourceClient, targetClient, tracker, valStore, statusManager)
+	valStore := validator.NewStore(targetClient, flowManager, statusManager)
+
+	apiServer = api.NewServer(config.Cfg.Migration.StatusHTTPPort)
+
+	valSrcOpts := options.Client().ApplyURI(docdbURI).SetAppName("docStreamer-Validator-Source")
+	if config.Cfg.DocDB.TLS && config.Cfg.DocDB.TlsAllowInvalidHostnames {
+		valSrcOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
+	}
+	valDstOpts := options.Client().ApplyURI(mongoURI).SetAppName("docStreamer-Validator-Target")
+	if config.Cfg.Mongo.TLS && config.Cfg.Mongo.TlsAllowInvalidHostnames {
+		valDstOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
+	}
+	valSourceClient, _ := mongo.Connect(valSrcOpts)
+	valTargetClient, _ := mongo.Connect(valDstOpts)
+	defer valSourceClient.Disconnect(context.Background())
+	defer valTargetClient.Disconnect(context.Background())
+
+	validationManager := validator.NewManager(valSourceClient, valTargetClient, tracker, valStore, statusManager, flowManager)
 	defer validationManager.Close()
 
-	// --- 3. Register API Routes ---
 	apiServer.RegisterRoute("/status", statusManager.StatusHandler)
 	apiServer.RegisterRoute("/validate", validationManager.HandleValidateRequest)
 	apiServer.RegisterRoute("/validate/adhoc", validationManager.HandleAdHocValidation)
-	apiServer.RegisterRoute("/validate/retry", validationManager.HandleRetryFailures)
 	apiServer.RegisterRoute("/validate/stats", validationManager.HandleGetStats)
+	apiServer.RegisterRoute("/validate/retry", validationManager.HandleRetryFailures)
 	apiServer.RegisterRoute("/validate/reset", validationManager.HandleReset)
+	apiServer.RegisterRoute("/validate/failures", validationManager.HandleGetFailures)
+	apiServer.RegisterRoute("/validate/queue", validationManager.HandleGetQueueStatus)
+	apiServer.RegisterRoute("/scan", validationManager.HandleScan)
 
 	apiServer.Start()
 
-	statusManager.SetState("connecting", "Connections established. Pinging...")
-
-	if err = sourceClient.Ping(ctx, readpref.Primary()); err != nil {
-		statusManager.SetError(err.Error())
-		logging.PrintError(err.Error(), 0)
-		return
-	}
-	if err = targetClient.Ping(ctx, readpref.Primary()); err != nil {
-		statusManager.SetError(err.Error())
-		logging.PrintError(err.Error(), 0)
-		return
-	}
-
-	// --- 4. EXECUTION LOGIC ---
-
 	if !found {
-		// Phase 1: DISCOVERY
-		if !anchorFound {
-			t0, err := topo.ClusterTime(ctx, sourceClient)
-			if err != nil {
-				statusManager.SetError(err.Error())
-				logging.PrintError(err.Error(), 0)
-				return
-			}
-			startAt = t0
-			logging.PrintInfo(fmt.Sprintf("Captured global T0 (Pre-Discovery): %v", startAt), 0)
+		statusManager.SetInitialSyncStart(time.Now().UTC())
 
-			// Save Anchor immediately to enable resuming later
+		flSrcOpts := options.Client().ApplyURI(docdbURI).SetAppName("docStreamer-FullLoad-Source")
+		if config.Cfg.DocDB.TLS && config.Cfg.DocDB.TlsAllowInvalidHostnames {
+			flSrcOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
+		}
+		flDstOpts := options.Client().ApplyURI(mongoURI).SetAppName("docStreamer-FullLoad-Target")
+		if config.Cfg.Mongo.TLS && config.Cfg.Mongo.TlsAllowInvalidHostnames {
+			flDstOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
+		}
+		sourceClient, _ := mongo.Connect(flSrcOpts)
+		targetWriterClient, _ := mongo.Connect(flDstOpts)
+		defer sourceClient.Disconnect(context.Background())
+		defer targetWriterClient.Disconnect(context.Background())
+
+		if !anchorFound {
+			t0, _ := topo.ClusterTime(ctx, sourceClient)
+			startAt = t0
 			checkpointManager.SaveAnchorTimestamp(ctx, startAt)
 		}
 
 		logging.PrintPhase("3", "DISCOVERY")
-		statusManager.SetState("discovering", "Discovering collections to migrate...")
-		if !destroy {
-			collectionsToMigrate, err = discover.DiscoverCollections(ctx, sourceClient)
-			if err != nil {
-				statusManager.SetError(err.Error())
-				logging.PrintError(err.Error(), 0)
-				return
-			}
-		}
+		statusManager.SetState("discovering", "Discovering collections...")
+		collectionsToMigrate, _ = discover.DiscoverCollections(ctx, sourceClient)
 
-		if ctx.Err() != nil {
-			logging.PrintWarning("Migration stopped during discovery.", 0)
-			return
-		}
-
-		// Phase 2: FULL DATA LOAD
 		if len(collectionsToMigrate) > 0 {
-			completedColls, err := checkpointManager.GetCompletedCollections(ctx)
-			if err != nil {
-				logging.PrintWarning(fmt.Sprintf("Failed to fetch completed checkpoints: %v", err), 0)
-			}
+			completedColls, _ := checkpointManager.GetCompletedCollections(ctx)
+			statusManager.ResetProgress()
 
 			var toRun []discover.CollectionInfo
 			for _, coll := range collectionsToMigrate {
 				if completedColls[coll.Namespace] {
-					logging.PrintInfo(fmt.Sprintf("Skipping already copied collection: %s", coll.Namespace), 0)
+					statusManager.AddEstimatedBytes(coll.Size)
+					statusManager.AddEstimatedDocs(coll.Count)
+					statusManager.AddClonedBytes(coll.Size)
+					statusManager.AddClonedDocs(coll.Count)
 				} else {
 					toRun = append(toRun, coll)
 					statusManager.AddEstimatedBytes(coll.Size)
+					statusManager.AddEstimatedDocs(coll.Count)
 				}
 			}
 
 			if len(toRun) > 0 {
 				logging.PrintPhase("4", "FULL DATA LOAD")
-				statusManager.SetState("running", "Initial Sync (Full Load)")
-
-				_, err = launchFullLoadWorkers(ctx, sourceClient, targetClient, toRun, statusManager, checkpointManager, flowManager)
-				if err != nil {
-					if err != context.Canceled {
-						statusManager.SetError(err.Error())
-						logging.PrintError(err.Error(), 0)
-					}
-					return
-				}
-
-				if ctx.Err() != nil {
-					logging.PrintWarning("Migration stopped during Full Load.", 0)
-					return
-				}
-				logging.PrintSuccess("All full load workers complete.", 0)
-			} else {
-				logging.PrintPhase("4", "FULL DATA LOAD (SKIPPED - ALL DONE)")
+				statusManager.SetState("running", "Initial Sync")
+				launchFullLoadWorkers(ctx, sourceClient, targetWriterClient, toRun, statusManager, checkpointManager, flowManager)
 			}
 		}
 
-		// --- SAVE RESUME TIMESTAMP (T0) ---
+		statusManager.SetInitialSyncEnd(time.Now().UTC())
 		checkpointManager.SaveResumeTimestamp(ctx, config.Cfg.Migration.CheckpointDocID, startAt)
-		logging.PrintInfo(fmt.Sprintf("Saved global resume timestamp: %v", startAt), 0)
-
 		checkpointManager.DeleteAnchorTimestamp(ctx)
-
-		statusManager.SetCloneCompleted()
-
-		// Calculate lag for status
-		now := bson.Timestamp{T: uint32(time.Now().Unix()), I: 0}
-		lag := int64(now.T) - int64(startAt.T)
-		if lag < 0 {
-			lag = 0
-		}
-		statusManager.SetInitialSyncCompleted(lag)
+		statusManager.SetInitialSyncCompleted(0)
 		statusManager.Persist(ctx)
 
 	} else {
 		logging.PrintPhase("3", "DISCOVERY (SKIPPED)")
 		logging.PrintPhase("4", "FULL DATA LOAD (SKIPPED)")
-
-		// --- Load Status and Validate Integrity ---
-		if err := statusManager.LoadAndMerge(ctx); err != nil {
-			logging.PrintWarning(fmt.Sprintf("Failed to load previous status: %v", err), 0)
-		}
-
-		// If we have a global checkpoint (Full Load Done),
-		// but status says otherwise, warn the user.
-		if !statusManager.IsCloneCompleted() {
-			logging.PrintWarning("Integrity Check: Global Checkpoint exists (Full Load Done), but Status metadata indicates incomplete.", 0)
-			logging.PrintWarning("This implies a previous crash during the final commit phase.", 0)
-			logging.PrintInfo("Proceeding with CDC based on Global Checkpoint (fail-open).", 0)
-		}
-
 		startAt = resumeAt
-		statusManager.SetCloneCompleted()
-
 		statusManager.SetInitialSyncCompleted(0)
-	}
-
-	if ctx.Err() != nil {
-		logging.PrintWarning("Migration stopped before CDC start.", 0)
-		return
 	}
 
 	logging.PrintPhase("5", "CONTINUOUS SYNC (CDC)")
 	statusManager.SetState("running", "Change Data Capture")
 
+	cdcSrcOpts := options.Client().ApplyURI(docdbURI).SetAppName("docStreamer-CDC-Watcher")
+	if config.Cfg.DocDB.TLS && config.Cfg.DocDB.TlsAllowInvalidHostnames {
+		cdcSrcOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
+	}
+	cdcDstOpts := options.Client().ApplyURI(mongoURI).SetAppName("docStreamer-CDC-Writer")
+	if config.Cfg.Mongo.TLS && config.Cfg.Mongo.TlsAllowInvalidHostnames {
+		cdcDstOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
+	}
+
+	cdcSourceClient, _ := mongo.Connect(cdcSrcOpts)
+	cdcTargetClient, _ := mongo.Connect(cdcDstOpts)
+	defer cdcSourceClient.Disconnect(context.Background())
+	defer cdcTargetClient.Disconnect(context.Background())
+
 	cdcManager := cdc.NewManager(
-		sourceClient,
-		targetClient,
+		cdcSourceClient,
+		cdcTargetClient,
 		config.Cfg.Migration.CheckpointDocID,
 		startAt,
 		checkpointManager,
@@ -841,7 +756,6 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	)
 
 	cdcManager.Start(ctx)
-
 	logging.PrintInfo("CDC process stopped. Exiting.", 0)
 }
 
@@ -858,45 +772,72 @@ func extractDBNames(collections []discover.CollectionInfo) []string {
 }
 
 func launchFullLoadWorkers(ctx context.Context, source, target *mongo.Client, collections []discover.CollectionInfo, statusMgr *status.Manager, checkpointMgr *checkpoint.Manager, flowMgr *flow.Manager) (bson.Timestamp, error) {
-	jobs := make(chan discover.CollectionInfo, len(collections))
-	for _, c := range collections {
-		jobs <- c
+	copiers := make([]*cloner.CopyManager, len(collections))
+	for i, coll := range collections {
+		copiers[i] = cloner.NewCopyManager(source, target, coll, statusMgr, checkpointMgr, config.Cfg.Migration.CheckpointDocID, flowMgr)
 	}
-	close(jobs)
-	resultsChan := make(chan error, len(collections))
-	var wg sync.WaitGroup
+
 	workerCount := config.Cfg.Migration.MaxConcurrentWorkers
-	logging.PrintStep(fmt.Sprintf("Starting collection worker pool with %d concurrent workers...", workerCount), 0)
+	logging.PrintPhase("4a", "FULL LOAD: PREPARATION")
+	indexer.StopBalancer(ctx, target)
+
+	for _, cm := range copiers {
+		if ctx.Err() != nil {
+			return bson.Timestamp{}, ctx.Err()
+		}
+		cm.Prepare(ctx)
+	}
+
+	logging.PrintStep("Preparation complete. Restarting MongoDB Balancer...", 0)
+	indexer.StartBalancer(ctx, target)
+	logging.PrintPhase("4b", "FULL LOAD: DATA COPY")
+
+	poolCtx, poolCancel := context.WithCancel(ctx)
+	defer poolCancel()
+
+	runQueue := make(chan *cloner.CopyManager, len(copiers))
+	for _, cm := range copiers {
+		runQueue <- cm
+	}
+	close(runQueue)
+
+	resultsChan := make(chan error, len(copiers))
+	var wg sync.WaitGroup
+	wg.Add(workerCount)
+
 	for i := 0; i < workerCount; i++ {
-		wg.Add(1)
-		go func(workerID int) {
+		go func(id int) {
 			defer wg.Done()
-			for collInfo := range jobs {
-				if ctx.Err() != nil {
+			for cm := range runQueue {
+				if poolCtx.Err() != nil {
 					return
 				}
-				ns := collInfo.Namespace
-				logging.PrintStep(fmt.Sprintf("[Worker %d] Starting full load for %s", workerID, ns), 0)
-				copier := cloner.NewCopyManager(source, target, collInfo, statusMgr, checkpointMgr, config.Cfg.Migration.CheckpointDocID, flowMgr)
-				docCount, _, err := copier.Do(ctx)
+				ns := cm.CollInfo.Namespace
+				logging.PrintStep(fmt.Sprintf("[Worker %d] Starting Copy for %s", id, ns), 0)
+
 				start := time.Now()
-				logging.LogFullLoadOp(start, ns, docCount, err)
+				count, _, err := cm.Run(poolCtx)
+				logging.LogFullLoadOp(start, ns, count, err, id)
 				resultsChan <- err
+
 				if err != nil {
-					logging.PrintError(fmt.Sprintf("[%s] Full load FAILED: %v", ns, err), 0)
+					logging.PrintError(fmt.Sprintf("[%s] Copy FAILED: %v", ns, err), 0)
+					poolCancel()
 				} else {
-					logging.PrintSuccess(fmt.Sprintf("[%s] Full load COMPLETED: %d docs", ns, docCount), 0)
+					logging.PrintSuccess(fmt.Sprintf("[%s] Copy COMPLETED: %d docs", ns, count), 0)
 				}
 			}
 		}(i)
 	}
 	wg.Wait()
 	close(resultsChan)
+
 	for err := range resultsChan {
 		if err != nil {
 			return bson.Timestamp{}, err
 		}
 	}
+
 	return bson.Timestamp{}, nil
 }
 

@@ -26,8 +26,8 @@ type CollectionInfo struct {
 	Coll          string
 	Count         int64
 	Indexes       []IndexInfo
-	Size          int64 // Size in bytes
-	UseLinearScan bool  // Flag to force linear scan if range queries are unsafe
+	Size          int64
+	UseLinearScan bool
 }
 
 // indexDecoded is a helper to correctly decode index definitions
@@ -37,6 +37,45 @@ type indexDecoded struct {
 	Unique                  bool        `bson:"unique,omitempty"`
 	ExpireAfterSeconds      *int32      `bson:"expireAfterSeconds,omitempty"`
 	PartialFilterExpression interface{} `bson:"partialFilterExpression,omitempty"`
+}
+
+// GetShardKey attempts to find the configured shard key for a namespace
+// by querying the target cluster's "config" database.
+// Returns an empty slice if the collection is not sharded or if an error occurs.
+func GetShardKey(ctx context.Context, client *mongo.Client, ns string) ([]string, error) {
+	// The "config.collections" collection stores metadata for all sharded collections.
+	// The _id is the namespace (e.g. "db.collection").
+	filter := bson.D{{Key: "_id", Value: ns}, {Key: "dropped", Value: false}}
+
+	// We verify if we are connected to a mongos by checking the config db
+	configColl := client.Database("config").Collection("collections")
+
+	// Use a short timeout to avoid blocking indefinitely if permissions are missing
+	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	var result struct {
+		Key bson.D `bson:"key"`
+	}
+
+	err := configColl.FindOne(checkCtx, filter).Decode(&result)
+	if err != nil {
+		// ErrNoDocuments means the collection is NOT sharded.
+		if err == mongo.ErrNoDocuments {
+			return nil, nil
+		}
+		// Any other error (auth, network, not a sharded cluster) -> assume not sharded
+		// but return the error for logging purposes.
+		return nil, err
+	}
+
+	// Extract keys in order
+	var keys []string
+	for _, elem := range result.Key {
+		keys = append(keys, elem.Key)
+	}
+
+	return keys, nil
 }
 
 // DiscoverCollections scans the source and finds all collections to migrate
@@ -71,8 +110,8 @@ func DiscoverCollections(ctx context.Context, client *mongo.Client) ([]Collectio
 		db := client.Database(dbName)
 		collInfos, err := discoverCollectionsInDB(ctx, db, excludeColls)
 		if err != nil {
-			logging.PrintWarning(fmt.Sprintf("Failed to scan DB %s: %v", dbName, err), 0)
-			continue
+			// Propagate error to stop migration if discovery fails
+			return nil, fmt.Errorf("failed to scan DB %s: %w", dbName, err)
 		}
 		totalCollections += int64(len(collInfos))
 		collections = append(collections, collInfos...)
@@ -103,8 +142,9 @@ func discoverCollectionsInDB(ctx context.Context, db *mongo.Database, excludeCol
 
 		info, err := getCollectionInfo(ctx, db, collName)
 		if err != nil {
-			logging.PrintWarning(fmt.Sprintf("Failed to get info for %s.%s: %v", db.Name(), collName, err), 0)
-			continue
+			// Return error instead of continuing.
+			// If we cannot inspect a collection, we cannot safely migrate it.
+			return nil, fmt.Errorf("failed to get info for %s.%s: %w", db.Name(), collName, err)
 		}
 
 		scanType := "Range Scan"
@@ -208,7 +248,13 @@ func checkRangeQuerySafety(ctx context.Context, coll *mongo.Collection, estCount
 
 func getCollectionInfo(ctx context.Context, db *mongo.Database, collName string) (CollectionInfo, error) {
 	coll := db.Collection(collName)
-	checkCtx, cancel := context.WithTimeout(ctx, 15*time.Second) // Increased timeout for sampling
+
+	// Use configurable timeout from config.yaml
+	timeoutMS := config.Cfg.Migration.DiscoveryTimeoutMS
+	if timeoutMS <= 0 {
+		timeoutMS = 120000 // Default to 2 minutes if not set or invalid
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMS)*time.Millisecond)
 	defer cancel()
 
 	count, err := coll.EstimatedDocumentCount(checkCtx)
@@ -280,7 +326,7 @@ func getCollectionInfo(ctx context.Context, db *mongo.Database, collName string)
 		useLinear = true
 		reason = "Missing _id index"
 	} else {
-		// Safety Check (Head + Tail + Random Samples)
+		// Safety Check
 		useLinear, reason = checkRangeQuerySafety(checkCtx, coll, count)
 	}
 

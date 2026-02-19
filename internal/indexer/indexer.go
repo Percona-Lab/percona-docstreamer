@@ -2,11 +2,8 @@ package indexer
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
-	"math"
 	"strings"
-	"time"
 
 	"github.com/Percona-Lab/percona-docstreamer/internal/config"
 	"github.com/Percona-Lab/percona-docstreamer/internal/discover"
@@ -16,410 +13,12 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
-// ShardInfo holds basic shard details
-type ShardInfo struct {
-	ID   string `bson:"_id"`
-	Host string `bson:"host"`
-}
-
-// ChunkInfo holds metadata for moving chunks
-type ChunkInfo struct {
-	Min   bson.RawValue `bson:"min"`
-	Max   bson.RawValue `bson:"max"`
-	Shard string        `bson:"shard"`
-}
-
-// Balancer Management
-func stopBalancer(ctx context.Context, client *mongo.Client) {
-	logging.PrintInfo("Stopping Balancer to perform manual splits/moves...", 0)
-	err := client.Database("admin").RunCommand(ctx, bson.D{{Key: "balancerStop", Value: 1}}).Err()
-	if err != nil {
-		logging.PrintWarning(fmt.Sprintf("Failed to stop balancer: %v", err), 0)
-	}
-}
-
-func startBalancer(ctx context.Context, client *mongo.Client) {
-	logging.PrintInfo("Restarting Balancer...", 0)
-	err := client.Database("admin").RunCommand(ctx, bson.D{{Key: "balancerStart", Value: 1}}).Err()
-	if err != nil {
-		logging.PrintWarning(fmt.Sprintf("Failed to start balancer: %v", err), 0)
-	}
-}
-
-// getShardList retrieves the list of shards from the target cluster
-func getShardList(ctx context.Context, client *mongo.Client) ([]string, error) {
-	var result struct {
-		Shards []ShardInfo `bson:"shards"`
-	}
-	err := client.Database("admin").RunCommand(ctx, bson.D{{Key: "listShards", Value: 1}}).Decode(&result)
-	if err != nil {
-		return nil, err
-	}
-	ids := make([]string, len(result.Shards))
-	for i, s := range result.Shards {
-		ids[i] = s.ID
-	}
-	return ids, nil
-}
-
-// getCollectionUUID retrieves the UUID for a namespace from the config database.
-func getCollectionUUID(ctx context.Context, client *mongo.Client, ns string) (bson.RawValue, error) {
-	var result struct {
-		UUID bson.RawValue `bson:"uuid"`
-	}
-	err := client.Database("config").Collection("collections").FindOne(ctx, bson.D{{Key: "_id", Value: ns}}).Decode(&result)
-	if err != nil {
-		return bson.RawValue{}, err
-	}
-	return result.UUID, nil
-}
-
-// distributeChunks implements Phase 2: Distributing Chunks Round-Robin
-func distributeChunks(ctx context.Context, targetClient *mongo.Client, ns string, shards []string) {
-	if len(shards) < 2 {
-		logging.PrintInfo(fmt.Sprintf("[%s] Skipped distribution (only %d shard available).", ns, len(shards)), 0)
-		return
-	}
-
-	logging.PrintStep(fmt.Sprintf("[%s] Starting Phase 2: Chunk Distribution (Round-Robin across %d shards)...", ns, len(shards)), 0)
-
-	collUUID, err := getCollectionUUID(ctx, targetClient, ns)
-	if err != nil {
-		logging.PrintWarning(fmt.Sprintf("[%s] Failed to get collection UUID: %v. Cannot distribute chunks.", ns, err), 0)
-		return
-	}
-
-	filter := bson.D{{Key: "uuid", Value: collUUID}}
-	opts := options.Find().SetSort(bson.D{{Key: "min", Value: 1}})
-
-	cursor, err := targetClient.Database("config").Collection("chunks").Find(ctx, filter, opts)
-	if err != nil {
-		logging.PrintWarning(fmt.Sprintf("[%s] Failed to list chunks: %v", ns, err), 0)
-		return
-	}
-	defer cursor.Close(ctx)
-
-	var chunks []ChunkInfo
-	if err := cursor.All(ctx, &chunks); err != nil {
-		logging.PrintWarning(fmt.Sprintf("[%s] Failed to decode chunks: %v", ns, err), 0)
-		return
-	}
-
-	logging.PrintInfo(fmt.Sprintf("[%s] Found %d chunks to distribute.", ns, len(chunks)), 0)
-
-	moves := 0
-	errors := 0
-
-	for i, chunk := range chunks {
-		targetShard := shards[i%len(shards)]
-
-		if chunk.Shard != targetShard {
-			cmd := bson.D{
-				{Key: "moveChunk", Value: ns},
-				{Key: "find", Value: chunk.Min},
-				{Key: "to", Value: targetShard},
-			}
-
-			success := false
-			for attempt := 1; attempt <= 3; attempt++ {
-				err := targetClient.Database("admin").RunCommand(ctx, cmd).Err()
-				if err == nil {
-					success = true
-					break
-				}
-				if strings.Contains(err.Error(), "already") {
-					success = true
-					break
-				}
-				time.Sleep(500 * time.Millisecond)
-			}
-
-			if success {
-				moves++
-				if moves%20 == 0 {
-					logging.PrintInfo(fmt.Sprintf("[%s] Moved %d chunks...", ns, moves), 0)
-				}
-			} else {
-				errors++
-			}
-		}
-	}
-
-	logging.PrintSuccess(fmt.Sprintf("[%s] Distribution complete. Moved: %d, Errors: %d", ns, moves, errors), 0)
-}
-
-// parseShardKeyNames extracts field names from a shard key string (e.g., "uuid:1, oid:1" -> ["uuid", "oid"])
-func parseShardKeyNames(shardKey string) []string {
-	var names []string
-	parts := strings.Split(shardKey, ",")
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		// Split on ":" to separate field name from type (1, -1, hashed)
-		kv := strings.Split(part, ":")
-		if len(kv) > 0 {
-			names = append(names, strings.TrimSpace(kv[0]))
-		}
-	}
-	return names
-}
-
-// preSplitCompositeUUID implements the deterministic splitting logic
-// It validates fields against the shard key order and supports UUID, OID, or both.
-func preSplitCompositeUUID(ctx context.Context, targetClient *mongo.Client, ns, shardKeyStr, uuidField, oidField string) {
-	// 1. Get ordered list of keys from ShardKey string
-	orderedKeys := parseShardKeyNames(shardKeyStr)
-	if len(orderedKeys) == 0 {
-		logging.PrintWarning(fmt.Sprintf("[%s] Cannot run composite pre-split: No keys found in %s", ns, shardKeyStr), 0)
-		return
-	}
-
-	// 2. Strict Validation: User MUST provide fields in config
-	if uuidField == "" && oidField == "" {
-		logging.PrintError(fmt.Sprintf("[%s] Composite pre-split enabled but 'uuid_field' and 'oid_field' are MISSING in config. We will NOT guess. Please configure them.", ns), 0)
-		return
-	}
-
-	// 3. Verify that configured fields actually exist in the shard key
-	if uuidField != "" {
-		found := false
-		for _, k := range orderedKeys {
-			if k == uuidField {
-				found = true
-				break
-			}
-		}
-		if !found {
-			logging.PrintError(fmt.Sprintf("[%s] Configured UUID field '%s' not found in shard key '%s'. Skipping split.", ns, uuidField, shardKeyStr), 0)
-			return
-		}
-	}
-	if oidField != "" {
-		found := false
-		for _, k := range orderedKeys {
-			if k == oidField {
-				found = true
-				break
-			}
-		}
-		if !found {
-			logging.PrintError(fmt.Sprintf("[%s] Configured OID field '%s' not found in shard key '%s'. Skipping split.", ns, oidField, shardKeyStr), 0)
-			return
-		}
-	}
-
-	logging.PrintStep(fmt.Sprintf("[%s] Starting Deterministic Pre-Split (Strategy: composite_uuid_oid). UUID='%s', OID='%s'", ns, uuidField, oidField), 0)
-
-	adminDB := targetClient.Database("admin")
-	splitCount := 0
-	errCount := 0
-
-	hexDigits := []string{"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"}
-
-	// === Phase 1A: Split the "Null" Zone ===
-	// Logic: UUID is null (if it exists), OID iterates 0-F.
-	// Only valid if we have both fields.
-	if uuidField != "" && oidField != "" {
-		logging.PrintInfo(fmt.Sprintf("[%s] Phase 1A: Splitting NULL zone...", ns), 0)
-
-		for _, digit := range hexDigits {
-			oidHex := digit + "00000000000000000000000"
-			oid, err := bson.ObjectIDFromHex(oidHex)
-			if err != nil {
-				continue
-			}
-
-			// Construct Middle Point respecting Order of keys in Shard Key
-			middle := bson.D{}
-			for _, k := range orderedKeys {
-				if k == uuidField {
-					middle = append(middle, bson.E{Key: k, Value: nil})
-				} else if k == oidField {
-					middle = append(middle, bson.E{Key: k, Value: oid})
-				} else {
-					// For any other keys (if compound has 3+ keys), use MinKey
-					middle = append(middle, bson.E{Key: k, Value: bson.MinKey{}})
-				}
-			}
-
-			if err := adminDB.RunCommand(ctx, bson.D{{Key: "split", Value: ns}, {Key: "middle", Value: middle}}).Err(); err == nil {
-				splitCount++
-			} else {
-				errCount++
-			}
-		}
-	} else if oidField != "" && uuidField == "" {
-		// Single OID Key or OID is primary
-		logging.PrintInfo(fmt.Sprintf("[%s] Splitting OID zone (0-F)...", ns), 0)
-		for _, digit := range hexDigits {
-			oidHex := digit + "00000000000000000000000"
-			oid, err := bson.ObjectIDFromHex(oidHex)
-			if err != nil {
-				continue
-			}
-			middle := bson.D{}
-			for _, k := range orderedKeys {
-				if k == oidField {
-					middle = append(middle, bson.E{Key: k, Value: oid})
-				} else {
-					middle = append(middle, bson.E{Key: k, Value: bson.MinKey{}})
-				}
-			}
-			if err := adminDB.RunCommand(ctx, bson.D{{Key: "split", Value: ns}, {Key: "middle", Value: middle}}).Err(); err == nil {
-				splitCount++
-			} else {
-				errCount++
-			}
-		}
-	}
-
-	// === Phase 1B: Split the "UUID" Zone ===
-	// Logic: UUID iterates 00-FF, OID is MinKey (if exists).
-	if uuidField != "" {
-		logging.PrintInfo(fmt.Sprintf("[%s] Phase 1B: Splitting UUID zone (00-FF)...", ns), 0)
-
-		for _, i := range hexDigits {
-			for _, j := range hexDigits {
-				prefix := i + j
-				if prefix == "00" {
-					continue
-				}
-
-				uuidHex := prefix + "000000000000000000000000000000"
-				uuidBytes, err := hex.DecodeString(uuidHex)
-				if err != nil {
-					continue
-				}
-				uuidVal := bson.Binary{Data: uuidBytes, Subtype: 0x04}
-
-				middle := bson.D{}
-				for _, k := range orderedKeys {
-					if k == uuidField {
-						middle = append(middle, bson.E{Key: k, Value: uuidVal})
-					} else {
-						// OID or others -> MinKey
-						middle = append(middle, bson.E{Key: k, Value: bson.MinKey{}})
-					}
-				}
-
-				if err := adminDB.RunCommand(ctx, bson.D{{Key: "split", Value: ns}, {Key: "middle", Value: middle}}).Err(); err == nil {
-					splitCount++
-					if splitCount%50 == 0 {
-						logging.PrintInfo(fmt.Sprintf("[%s] Created %d splits...", ns, splitCount), 0)
-					}
-				} else {
-					errCount++
-				}
-			}
-		}
-	}
-
-	logging.PrintSuccess(fmt.Sprintf("[%s] Deterministic split complete. Created %d chunks.", ns, splitCount), 0)
-}
-
-// preSplitRangeSharding calculates split points by SAMPLING the source.
-func preSplitRangeSharding(ctx context.Context, targetClient *mongo.Client, sourceColl *mongo.Collection, ns string, keyDoc bson.D, collInfo discover.CollectionInfo) {
-	const targetChunkSize = 128 * 1024 * 1024 // 128MB
-	totalSize := collInfo.Size
-
-	if totalSize == 0 && collInfo.Count > 0 {
-		totalSize = collInfo.Count * 1024
-	}
-	if totalSize == 0 {
-		return
-	}
-
-	numChunks := int(math.Ceil(float64(totalSize) / float64(targetChunkSize)))
-	if numChunks <= 1 {
-		logging.PrintInfo(fmt.Sprintf("[%s] Data size (%d bytes) fits in one chunk. Skipping pre-split.", ns, totalSize), 0)
-		return
-	}
-
-	logging.PrintInfo(fmt.Sprintf("[%s] Phase 1: Pre-splitting. Estimated %d chunks for %d bytes.", ns, numChunks, totalSize), 0)
-
-	docStep := collInfo.Count / int64(numChunks)
-	if docStep == 0 {
-		docStep = 1
-	}
-
-	// Project only shard keys to save bandwidth
-	projection := bson.D{}
-	for _, k := range keyDoc {
-		projection = append(projection, bson.E{Key: k.Key, Value: 1})
-	}
-
-	// Use a large batch size for efficiency
-	opts := options.Find().
-		SetSort(keyDoc).
-		SetProjection(projection).
-		SetBatchSize(10000)
-
-	logging.PrintStep(fmt.Sprintf("[%s] Scanning source for split points (Step: %d docs)...", ns, docStep), 0)
-
-	// SINGLE PASS SCAN
-	cursor, err := sourceColl.Find(ctx, bson.D{}, opts)
-	if err != nil {
-		logging.PrintWarning(fmt.Sprintf("[%s] Failed to start scan: %v", ns, err), 0)
-		return
-	}
-	defer cursor.Close(ctx)
-
-	counter := int64(0)
-	splitCount := 0
-	targetSplits := numChunks - 1
-
-	for cursor.Next(ctx) {
-		counter++
-
-		// Check if we hit a split interval
-		if counter%docStep == 0 && splitCount < targetSplits {
-			var rawDoc bson.Raw
-			rawDoc = cursor.Current
-
-			// Extract split point from the raw document
-			splitPoint := bson.D{}
-			isValid := true
-			for _, elem := range keyDoc {
-				val, err := rawDoc.LookupErr(elem.Key)
-				if err == nil {
-					splitPoint = append(splitPoint, bson.E{Key: elem.Key, Value: val})
-				} else {
-					isValid = false
-					break
-				}
-			}
-
-			if isValid {
-				// Execute Split
-				splitCmd := bson.D{
-					{Key: "split", Value: ns},
-					{Key: "middle", Value: splitPoint},
-				}
-				// Ignore errors (e.g. duplicate split), just log warning if critical
-				if err := targetClient.Database("admin").RunCommand(ctx, splitCmd).Err(); err == nil {
-					splitCount++
-				}
-			}
-		}
-	}
-
-	if err := cursor.Err(); err != nil {
-		logging.PrintWarning(fmt.Sprintf("[%s] Scan cursor error: %v", ns, err), 0)
-	}
-
-	logging.PrintSuccess(fmt.Sprintf("[%s] Created %d splits (scanned %d docs).", ns, splitCount, counter), 0)
-}
-
-// isCollectionSharded checks if the collection is already sharded
 func isCollectionSharded(ctx context.Context, client *mongo.Client, ns string) bool {
 	filter := bson.D{{Key: "_id", Value: ns}}
 	err := client.Database("config").Collection("collections").FindOne(ctx, filter).Err()
 	return err == nil
 }
 
-// applySharding handles the full sharding setup process
 func applySharding(ctx context.Context, targetClient *mongo.Client, sourceColl *mongo.Collection, dbName, ns string, collInfo discover.CollectionInfo) {
 	var rule *config.ShardRule
 	for _, r := range config.Cfg.Sharding {
@@ -428,202 +27,145 @@ func applySharding(ctx context.Context, targetClient *mongo.Client, sourceColl *
 			break
 		}
 	}
-
 	if rule == nil {
 		return
 	}
 
 	if isCollectionSharded(ctx, targetClient, ns) {
-		logging.PrintInfo(fmt.Sprintf("[%s] Collection is already sharded. Skipping setup.", ns), 0)
+		logging.PrintInfo(fmt.Sprintf("[%s] Already sharded. Skipping setup.", ns), 0)
 		return
 	}
 
-	logging.PrintInfo(fmt.Sprintf("[%s] Sharding rule found: %s", ns, rule.ShardKey), 0)
+	logging.PrintInfo(fmt.Sprintf("[%s] Sharding setup start: %s", ns, rule.ShardKey), 0)
 
-	stopBalancer(ctx, targetClient)
-	defer startBalancer(ctx, targetClient)
-
-	// 1. Enable Sharding on DB
-	targetClient.Database("admin").RunCommand(ctx, bson.D{{Key: "enableSharding", Value: dbName}})
-
-	// 2. Parse Key
+	// 2. Prepare Keys
 	keyDoc := bson.D{}
 	isHashed := false
-	parts := strings.Split(rule.ShardKey, ",")
-
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
+	for _, part := range strings.Split(rule.ShardKey, ",") {
+		kv := strings.Split(strings.TrimSpace(part), ":")
+		if len(kv) < 1 {
 			continue
 		}
-		if strings.Contains(part, ":") {
-			subParts := strings.Split(part, ":")
-			fieldName := strings.TrimSpace(subParts[0])
-			fieldType := strings.ToLower(strings.TrimSpace(subParts[1]))
-			if fieldType == "hashed" {
-				keyDoc = append(keyDoc, bson.E{Key: fieldName, Value: "hashed"})
-				isHashed = true
-			} else if fieldType == "-1" {
-				keyDoc = append(keyDoc, bson.E{Key: fieldName, Value: -1})
-			} else {
-				keyDoc = append(keyDoc, bson.E{Key: fieldName, Value: 1})
-			}
+		k, v := kv[0], "1"
+		if len(kv) > 1 {
+			v = strings.ToLower(kv[1])
+		}
+
+		if v == "hashed" {
+			keyDoc = append(keyDoc, bson.E{Key: k, Value: "hashed"})
+			isHashed = true
+		} else if v == "-1" {
+			keyDoc = append(keyDoc, bson.E{Key: k, Value: -1})
 		} else {
-			keyDoc = append(keyDoc, bson.E{Key: part, Value: 1})
+			keyDoc = append(keyDoc, bson.E{Key: k, Value: 1})
 		}
 	}
 
-	logging.PrintInfo(fmt.Sprintf("[%s] Ensuring shard key index exists: %v", ns, keyDoc), 0)
-	_, err := targetClient.Database(dbName).Collection(collInfo.Coll).Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys:    keyDoc,
-		Options: options.Index().SetName("shard_key_index_auto"),
+	isHashedPrefix := false
+	if len(keyDoc) > 0 {
+		if strVal, ok := keyDoc[0].Value.(string); ok && strVal == "hashed" {
+			isHashedPrefix = true
+		}
+	}
+
+	// 3. Create Index
+	// Use keyDoc directly. Do NOT append _id here.
+	indexKey := make(bson.D, len(keyDoc))
+	copy(indexKey, keyDoc)
+
+	targetClient.Database("admin").RunCommand(ctx, bson.D{{Key: "enableSharding", Value: dbName}})
+	targetClient.Database(dbName).Collection(collInfo.Coll).Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    indexKey,
+		Options: options.Index().SetName("shard_key_index_auto").SetUnique(rule.Unique),
 	})
-	if err != nil {
-		logging.PrintWarning(fmt.Sprintf("[%s] Warning: Failed to pre-create shard key index (proceeding to shard): %v", ns, err), 0)
+
+	// 4. Shard Collection
+	cmd := bson.D{{Key: "shardCollection", Value: ns}, {Key: "key", Value: keyDoc}}
+	if rule.Unique {
+		cmd = append(cmd, bson.E{Key: "unique", Value: true})
 	}
 
-	// 3. Shard Collection
-	cmd := bson.D{
-		{Key: "shardCollection", Value: ns},
-		{Key: "key", Value: keyDoc},
-	}
-
-	// Handle NumInitialChunks (Usually only valid for Hashed sharding)
-	var numChunks int64
-	if rule.NumInitialChunks > 0 {
-		numChunks = int64(rule.NumInitialChunks)
-		logging.PrintInfo(fmt.Sprintf("[%s] Using configured NumInitialChunks: %d", ns, numChunks), 0)
-	} else {
-		// Default Calculation based on size
-		const chunkSize = 128 * 1024 * 1024
-		totalSize := collInfo.Size
-		if totalSize == 0 {
-			totalSize = collInfo.Count * 1024
+	if isHashedPrefix || (isHashed && len(keyDoc) == 1) {
+		if rule.PreSplitStrategy == "hashed_manual" {
+			cmd = append(cmd, bson.E{Key: "numInitialChunks", Value: 1})
+			logging.PrintInfo(fmt.Sprintf("[%s] Hashed Manual: Forcing 1 initial chunk.", ns), 0)
+		} else {
+			shards, _ := getShardList(ctx, targetClient)
+			numChunks := int64(2)
+			if len(shards) > 0 {
+				numChunks = int64(len(shards) * 2)
+			}
+			if rule.NumInitialChunks > 0 {
+				numChunks = int64(rule.NumInitialChunks)
+			}
+			cmd = append(cmd, bson.E{Key: "numInitialChunks", Value: numChunks})
 		}
-		numChunks = int64(math.Ceil(float64(totalSize) / float64(chunkSize)))
-		if numChunks < 2 {
-			numChunks = 2
-		}
-	}
-
-	if isHashed && len(keyDoc) == 1 {
-		cmd = append(cmd, bson.E{Key: "numInitialChunks", Value: numChunks})
-		logging.PrintInfo(fmt.Sprintf("[%s] Hashed Sharding: Pre-allocating %d chunks.", ns, numChunks), 0)
 	}
 
 	if err := targetClient.Database("admin").RunCommand(ctx, cmd).Err(); err != nil {
-		logging.PrintError(fmt.Sprintf("[%s] Failed to shard collection: %v", ns, err), 0)
+		logging.PrintError(fmt.Sprintf("[%s] Shard command failed: %v", ns, err), 0)
 		return
 	}
-	logging.PrintSuccess(fmt.Sprintf("[%s] Collection successfully sharded.", ns), 0)
 
-	// 4. Pre-Split (Range) and Distribute (All)
-	shards, err := getShardList(ctx, targetClient)
-	if err == nil {
-		if !isHashed {
-			// Check strategy
-			if rule.PreSplitStrategy == "composite_uuid_oid" {
-				// PASS THE CONFIGURED FIELDS from config. We do NOT guess.
-				preSplitCompositeUUID(ctx, targetClient, ns, rule.ShardKey, rule.UUIDField, rule.OIDField)
-			} else if rule.DisablePreSplit {
-				logging.PrintWarning(fmt.Sprintf("[%s] Pre-splitting disabled by config. Target will have 1 chunk (Hot Shard detected).", ns), 0)
-			} else {
-				// Default fallback to scanning
-				preSplitRangeSharding(ctx, targetClient, sourceColl, ns, keyDoc, collInfo)
-			}
-		}
+	// 5. Pre-Splitting & Distribution
+	ApplyPreSplit(ctx, targetClient, ns, rule, collInfo)
+
+	shards, _ := getShardList(ctx, targetClient)
+	if len(shards) > 0 {
 		distributeChunks(ctx, targetClient, ns, shards)
-	} else {
-		logging.PrintWarning(fmt.Sprintf("[%s] Could not list shards: %v. Skipping distribution.", ns, err), 0)
 	}
 }
 
-// CreateCollectionAndPreloadIndexes handles initial setup
 func CreateCollectionAndPreloadIndexes(ctx context.Context, targetDB *mongo.Database, sourceColl *mongo.Collection, collInfo discover.CollectionInfo, indexes []mongo.IndexModel) (*mongo.Collection, error) {
 	ns := collInfo.Namespace
-
-	logging.PrintInfo(fmt.Sprintf("[%s] Creating target collection...", ns), 0)
-	if err := targetDB.CreateCollection(ctx, collInfo.Coll); err != nil {
-		if !mongo.IsDuplicateKeyError(err) && !strings.Contains(err.Error(), "already exists") {
-			return nil, fmt.Errorf("failed to create collection %s: %w", ns, err)
-		}
-	}
-
+	targetDB.CreateCollection(ctx, collInfo.Coll)
 	targetColl := targetDB.Collection(collInfo.Coll)
 
-	// Create Indexes BEFORE Sharding ---
-	// This ensures that the shard key index (if it exists on source) is created
-	// before we attempt to shard the collection.
 	if len(indexes) > 0 {
-		logging.PrintInfo(fmt.Sprintf("[%s] Starting creation of %d indexes...", ns, len(indexes)), 0)
-		start := time.Now()
-		names, err := targetColl.Indexes().CreateMany(ctx, indexes)
+		logging.PrintInfo(fmt.Sprintf("[%s] Pre-loading %d indexes...", ns, len(indexes)), 0)
+		_, err := targetColl.Indexes().CreateMany(ctx, indexes)
 		if err != nil {
-			// Do not fail here; proceed to sharding. Use logs to warn.
-			logging.PrintWarning(fmt.Sprintf("[%s] Failed to create indexes (will retry post-load): %v", ns, err), 0)
-		} else {
-			elapsed := time.Since(start)
-			logging.PrintInfo(fmt.Sprintf("[%s] Submitted %d indexes in %s: %v", ns, len(names), elapsed, names), 0)
+			logging.PrintWarning(fmt.Sprintf("[%s] Non-fatal index creation warning: %v", ns, err), 0)
 		}
 	}
 
-	// Apply Sharding (Now safe because indexes exist)
 	applySharding(ctx, targetDB.Client(), sourceColl, collInfo.DB, ns, collInfo)
-
 	return targetColl, nil
 }
 
-// FinalizeIndexes builds any indexes that failed during pre-load.
-// Accepts []discover.IndexInfo to access metadata (Name) which is hidden in v2 IndexModel builders.
 func FinalizeIndexes(ctx context.Context, targetColl *mongo.Collection, indexes []discover.IndexInfo, ns string) error {
-	if len(indexes) == 0 {
-		return nil
-	}
-
-	logging.PrintInfo(fmt.Sprintf("[%s] Finalizing %d indexes...", ns, len(indexes)), 0)
-	start := time.Now()
-
-	// List existing indexes to see which ones we still need
 	cursor, err := targetColl.Indexes().List(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to list existing indexes: %w", err)
-	}
-
-	existingIndexes := make(map[string]bool)
-	for cursor.Next(ctx) {
-		var index bson.M
-		if err := cursor.Decode(&index); err != nil {
-			return fmt.Errorf("failed to decode existing index: %w", err)
-		}
-		if name, ok := index["name"].(string); ok {
-			existingIndexes[name] = true
-		}
-	}
-
-	// Filter out any indexes that successfully built
-	indexesToBuild := []mongo.IndexModel{}
-	for _, idx := range indexes {
-		if !existingIndexes[idx.Name] {
-			model := mongo.IndexModel{
-				Keys:    idx.Key,
-				Options: options.Index().SetName(idx.Name).SetUnique(idx.Unique),
-			}
-			indexesToBuild = append(indexesToBuild, model)
-		}
-	}
-
-	if len(indexesToBuild) == 0 {
-		logging.PrintSuccess(fmt.Sprintf("[%s] All indexes confirmed.", ns), 0)
 		return nil
 	}
 
-	logging.PrintInfo(fmt.Sprintf("[%s] Creating %d missing indexes...", ns, len(indexesToBuild)), 0)
-	names, err := targetColl.Indexes().CreateMany(ctx, indexesToBuild)
-	if err != nil {
-		return fmt.Errorf("failed to create missing indexes: %w", err)
+	existing := make(map[string]bool)
+	for cursor.Next(ctx) {
+		var idx bson.M
+		if err := cursor.Decode(&idx); err == nil {
+			if name, ok := idx["name"].(string); ok {
+				existing[name] = true
+			}
+		}
 	}
 
-	elapsed := time.Since(start)
-	logging.PrintSuccess(fmt.Sprintf("[%s] Index finalization complete in %s. Created: %v", ns, elapsed, names), 0)
+	var missing []mongo.IndexModel
+	for _, idx := range indexes {
+		if !existing[idx.Name] {
+			missing = append(missing, mongo.IndexModel{
+				Keys:    idx.Key,
+				Options: options.Index().SetName(idx.Name).SetUnique(idx.Unique),
+			})
+		}
+	}
+
+	if len(missing) > 0 {
+		logging.PrintInfo(fmt.Sprintf("[%s] Finalizing %d missing indexes...", ns, len(missing)), 0)
+		_, err := targetColl.Indexes().CreateMany(ctx, missing)
+		if err != nil {
+			logging.PrintError(fmt.Sprintf("[%s] Failed to create final indexes: %v", ns, err), 0)
+			return err
+		}
+	}
 	return nil
 }
