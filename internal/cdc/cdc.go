@@ -329,13 +329,12 @@ func applyUpdate(doc bson.M, update interface{}) bson.M {
 		}
 	}
 
-	if setMap != nil {
-		for k, v := range setMap {
-			if !strings.Contains(k, ".") {
-				newDoc[k] = v
-			}
+	for k, v := range setMap {
+		if !strings.Contains(k, ".") {
+			newDoc[k] = v
 		}
 	}
+
 	return newDoc
 }
 
@@ -722,10 +721,22 @@ func (m *CDCManager) startFlushWorkers(ctx context.Context) {
 					start := time.Now()
 					flushedCount, ins, upd, del, namespaces, batchMaxTS, err := m.handleBulkWrite(ctx, batchMap)
 
-					m.watermark.Lock()
-					m.watermark.workerLastTS[workerID] = batchMaxTS
-					m.watermark.workerPending[workerID] -= eventCount
-					m.watermark.Unlock()
+					// Only advance watermark and metrics on SUCCESS.
+					// If it fails (e.g., context canceled on shutdown), the batch is not written
+					// and the checkpoint must be held back so these events replay on restart.
+					if err == nil {
+						m.watermark.Lock()
+						if batchMaxTS.T > 0 {
+							m.watermark.workerLastTS[workerID] = batchMaxTS
+						}
+						m.watermark.workerPending[workerID] -= eventCount
+						m.watermark.Unlock()
+
+						m.totalEventsApplied.Add(flushedCount)
+						m.totalInserted.Add(ins)
+						m.totalUpdated.Add(upd)
+						m.totalDeleted.Add(del)
+					}
 
 					logging.LogCDCOp(start, ins, upd, del, namespaces, err, workerID)
 					if err != nil {
@@ -1052,7 +1063,8 @@ func (m *CDCManager) handleDDL(ctx context.Context, event *ChangeEvent) {
 		if batch := writer.ExtractBatches(); len(batch) > 0 {
 			select {
 			case m.flushQueues[i] <- batch:
-			default:
+			case <-ctx.Done():
+				return
 			}
 		}
 	}

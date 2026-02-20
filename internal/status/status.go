@@ -265,6 +265,14 @@ func (m *Manager) SetInitialSyncCompleted(lagSeconds float64) {
 	m.initialSyncCompleted.Store(true)
 }
 
+func (m *Manager) IsCloneCompleted() bool {
+	return m.cloneCompleted.Load()
+}
+
+func (m *Manager) SetCloneCompleted() {
+	m.cloneCompleted.Store(true)
+}
+
 func (m *Manager) LoadAndMerge(ctx context.Context) error {
 	var doc bson.M
 	err := m.collection.FindOne(ctx, bson.D{{Key: "_id", Value: m.docID}}).Decode(&doc)

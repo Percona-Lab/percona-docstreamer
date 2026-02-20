@@ -587,7 +587,13 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		if config.Cfg.DocDB.TLS && config.Cfg.DocDB.TlsAllowInvalidHostnames {
 			discOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
 		}
-		discClient, _ := mongo.Connect(discOpts)
+
+		discClient, err := mongo.Connect(discOpts)
+		if err != nil {
+			logging.PrintError(fmt.Sprintf("Discovery client error: %v", err), 0)
+			return
+		}
+
 		collectionsToMigrate, err = discover.DiscoverCollections(ctx, discClient)
 		discClient.Disconnect(context.Background())
 
@@ -615,6 +621,14 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 			logging.PrintInfo(fmt.Sprintf("Found partial migration state (Anchor T0: %v). Resuming Full Load...", startAt), 0)
 		} else {
 			logging.PrintInfo("No valid global checkpoint or anchor found. Starting fresh.", 0)
+
+			logging.PrintInfo("Cleaning up stale metadata (Status, Checkpoints, Validation)...", 0)
+			err := targetClient.Database(config.Cfg.Migration.MetadataDB).Drop(ctx)
+			if err != nil {
+				logging.PrintWarning(fmt.Sprintf("Failed to drop metadata DB: %v", err), 0)
+			} else {
+				logging.PrintSuccess("Metadata cleanup complete.", 0)
+			}
 		}
 	}
 
@@ -641,8 +655,19 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	if config.Cfg.Mongo.TLS && config.Cfg.Mongo.TlsAllowInvalidHostnames {
 		valDstOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
 	}
-	valSourceClient, _ := mongo.Connect(valSrcOpts)
-	valTargetClient, _ := mongo.Connect(valDstOpts)
+
+	valSourceClient, err := mongo.Connect(valSrcOpts)
+	if err != nil {
+		logging.PrintError(fmt.Sprintf("Validator source client error: %v", err), 0)
+		return
+	}
+
+	valTargetClient, err := mongo.Connect(valDstOpts)
+	if err != nil {
+		logging.PrintError(fmt.Sprintf("Validator target client error: %v", err), 0)
+		return
+	}
+
 	defer valSourceClient.Disconnect(context.Background())
 	defer valTargetClient.Disconnect(context.Background())
 
@@ -672,23 +697,55 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		if config.Cfg.Mongo.TLS && config.Cfg.Mongo.TlsAllowInvalidHostnames {
 			flDstOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
 		}
-		sourceClient, _ := mongo.Connect(flSrcOpts)
-		targetWriterClient, _ := mongo.Connect(flDstOpts)
+
+		sourceClient, err := mongo.Connect(flSrcOpts)
+		if err != nil {
+			logging.PrintError(fmt.Sprintf("FullLoad source client error: %v", err), 0)
+			return
+		}
+
+		targetWriterClient, err := mongo.Connect(flDstOpts)
+		if err != nil {
+			logging.PrintError(fmt.Sprintf("FullLoad target client error: %v", err), 0)
+			return
+		}
+
 		defer sourceClient.Disconnect(context.Background())
 		defer targetWriterClient.Disconnect(context.Background())
 
 		if !anchorFound {
-			t0, _ := topo.ClusterTime(ctx, sourceClient)
+			t0, err := topo.ClusterTime(ctx, sourceClient)
+			if err != nil {
+				logging.PrintError(fmt.Sprintf("Failed to get cluster time: %v", err), 0)
+				return
+			}
 			startAt = t0
 			checkpointManager.SaveAnchorTimestamp(ctx, startAt)
 		}
 
 		logging.PrintPhase("3", "DISCOVERY")
 		statusManager.SetState("discovering", "Discovering collections...")
-		collectionsToMigrate, _ = discover.DiscoverCollections(ctx, sourceClient)
+
+		collectionsToMigrate, err = discover.DiscoverCollections(ctx, sourceClient)
+		if err != nil {
+			logging.PrintError(fmt.Sprintf("Failed to discover collections: %v", err), 0)
+			return
+		}
+
+		// Exit safely if stopped during discovery
+		if ctx.Err() != nil {
+			logging.PrintWarning("Migration stopped during discovery. Exiting.", 0)
+			return
+		}
 
 		if len(collectionsToMigrate) > 0 {
-			completedColls, _ := checkpointManager.GetCompletedCollections(ctx)
+			completedColls, err := checkpointManager.GetCompletedCollections(ctx)
+			// Do not continue if we can't read checkpoints. Abort to prevent data duplication.
+			if err != nil {
+				logging.PrintError(fmt.Sprintf("CRITICAL: Failed to fetch completed checkpoints: %v. Aborting to prevent data corruption.", err), 0)
+				return
+			}
+
 			statusManager.ResetProgress()
 
 			var toRun []discover.CollectionInfo
@@ -708,21 +765,58 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 			if len(toRun) > 0 {
 				logging.PrintPhase("4", "FULL DATA LOAD")
 				statusManager.SetState("running", "Initial Sync")
-				launchFullLoadWorkers(ctx, sourceClient, targetWriterClient, toRun, statusManager, checkpointManager, flowManager)
+
+				_, err := launchFullLoadWorkers(ctx, sourceClient, targetWriterClient, toRun, statusManager, checkpointManager, flowManager)
+
+				if err != nil {
+					if err == context.Canceled {
+						logging.PrintWarning("Migration stopped during Full Load. Exiting.", 0)
+					} else {
+						logging.PrintError(fmt.Sprintf("Full Load did not complete successfully: %v", err), 0)
+					}
+					return
+				}
+
+				if ctx.Err() != nil {
+					logging.PrintWarning("Migration stopped after Full Load. Exiting.", 0)
+					return
+				}
 			}
 		}
 
 		statusManager.SetInitialSyncEnd(time.Now().UTC())
 		checkpointManager.SaveResumeTimestamp(ctx, config.Cfg.Migration.CheckpointDocID, startAt)
 		checkpointManager.DeleteAnchorTimestamp(ctx)
-		statusManager.SetInitialSyncCompleted(0)
+
+		// Mark the clone as complete in the status manager when finishing successfully
+		statusManager.SetCloneCompleted()
+
+		now := bson.Timestamp{T: uint32(time.Now().Unix()), I: 0}
+		lag := int64(now.T) - int64(startAt.T)
+		if lag < 0 {
+			lag = 0
+		}
+		statusManager.SetInitialSyncCompleted(float64(lag))
 		statusManager.Persist(ctx)
 
 	} else {
 		logging.PrintPhase("3", "DISCOVERY (SKIPPED)")
 		logging.PrintPhase("4", "FULL DATA LOAD (SKIPPED)")
+
+		if !statusManager.IsCloneCompleted() {
+			logging.PrintWarning("Integrity Check: Global Checkpoint exists (Full Load Done), but Status metadata indicates incomplete.", 0)
+			logging.PrintInfo("Proceeding with CDC based on Global Checkpoint (fail-open).", 0)
+		}
+
 		startAt = resumeAt
+		statusManager.SetCloneCompleted()
 		statusManager.SetInitialSyncCompleted(0)
+	}
+
+	// Catch any shutdown signals that occurred during discovery, full load, or status initialization
+	if ctx.Err() != nil {
+		logging.PrintWarning("Migration stopped before CDC start. Exiting cleanly.", 0)
+		return
 	}
 
 	logging.PrintPhase("5", "CONTINUOUS SYNC (CDC)")
@@ -737,8 +831,18 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		cdcDstOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
 	}
 
-	cdcSourceClient, _ := mongo.Connect(cdcSrcOpts)
-	cdcTargetClient, _ := mongo.Connect(cdcDstOpts)
+	cdcSourceClient, err := mongo.Connect(cdcSrcOpts)
+	if err != nil {
+		logging.PrintError(fmt.Sprintf("CDC source client error: %v", err), 0)
+		return
+	}
+
+	cdcTargetClient, err := mongo.Connect(cdcDstOpts)
+	if err != nil {
+		logging.PrintError(fmt.Sprintf("CDC target client error: %v", err), 0)
+		return
+	}
+
 	defer cdcSourceClient.Disconnect(context.Background())
 	defer cdcTargetClient.Disconnect(context.Background())
 
