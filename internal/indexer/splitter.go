@@ -360,11 +360,29 @@ func preSplitRangeManual(ctx context.Context, targetClient *mongo.Client, ns str
 }
 
 func preSplitHashedManual(ctx context.Context, targetClient *mongo.Client, ns string, rule *config.ShardRule) {
-	keys := parseShardKeyNames(rule.ShardKey)
+	var keys []string
+	hashedIndex := -1
+
+	parts := strings.Split(rule.ShardKey, ",")
+	for i, part := range parts {
+		kv := strings.Split(strings.TrimSpace(part), ":")
+		if len(kv) > 0 {
+			keys = append(keys, strings.TrimSpace(kv[0]))
+			if len(kv) > 1 && strings.ToLower(strings.TrimSpace(kv[1])) == "hashed" {
+				hashedIndex = i
+			}
+		}
+	}
+
 	if len(keys) == 0 {
 		return
 	}
-	primaryKey := keys[0]
+
+	if hashedIndex == -1 {
+		hashedIndex = 0
+	}
+
+	primaryKey := keys[hashedIndex]
 
 	shards, _ := getShardList(ctx, targetClient)
 	numShards := int64(len(shards))
@@ -380,7 +398,7 @@ func preSplitHashedManual(ctx context.Context, targetClient *mongo.Client, ns st
 		targetChunks = 2
 	}
 
-	logging.PrintInfo(fmt.Sprintf("[%s] Hashed Split: Target Chunks = %d (Shards: %d)", ns, targetChunks, numShards), 0)
+	logging.PrintInfo(fmt.Sprintf("[%s] Hashed Split: Target Chunks = %d (Shards: %d) on field '%s'", ns, targetChunks, numShards, primaryKey), 0)
 
 	adminDB := targetClient.Database("admin")
 	var splitCount int32
@@ -399,9 +417,13 @@ func preSplitHashedManual(ctx context.Context, targetClient *mongo.Client, ns st
 		splitBig := new(big.Int).Add(minVal, offset)
 		splitVal := splitBig.Int64()
 
-		middle := bson.D{{Key: primaryKey, Value: splitVal}}
-		for j := 1; j < len(keys); j++ {
-			middle = append(middle, bson.E{Key: keys[j], Value: bson.MinKey{}})
+		middle := bson.D{}
+		for j := 0; j < len(keys); j++ {
+			if j == hashedIndex {
+				middle = append(middle, bson.E{Key: keys[j], Value: splitVal})
+			} else {
+				middle = append(middle, bson.E{Key: keys[j], Value: bson.MinKey{}})
+			}
 		}
 
 		wg.Add(1)
