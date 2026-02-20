@@ -52,14 +52,14 @@ type FCStatus struct {
 }
 
 type ValidationStats struct {
-	QueuedBatches  int64  `json:"queuedBatches"`
-	TotalChecked   int64  `json:"totalChecked"`
-	MismatchFound  int64  `json:"mismatchFound"`
-	MismatchFixed  int64  `json:"mismatchFixed"`
-	Pending        int64  `json:"pendingMismatches"`
-	HotKeysWaiting int64  `json:"hotKeysWaiting"`
-	SyncPercent    string `json:"syncPercent"`
-	LastValidated  string `json:"lastValidatedAt"`
+	QueuedBatches  int64   `json:"queuedBatches"`
+	TotalChecked   int64   `json:"totalChecked"`
+	MismatchFound  int64   `json:"mismatchFound"`
+	MismatchFixed  int64   `json:"mismatchFixed"`
+	Pending        int64   `json:"pendingMismatches"`
+	HotKeysWaiting int64   `json:"hotKeysWaiting"`
+	SyncPercent    float64 `json:"syncPercent"`
+	LastValidated  string  `json:"lastValidatedAt"`
 }
 
 type TSTime struct {
@@ -542,14 +542,13 @@ func (m *Manager) buildStatusOutput() StatusOutput {
 	vPending := m.valPending.Load()
 	vLast := m.valLastCheck.Load()
 
-	vPercentStr := "0.0%"
+	vPercent := 0.0
 	if vChecked > 0 {
 		validOrFixedCount := vChecked - vPending
 		if validOrFixedCount < 0 {
 			validOrFixedCount = 0
 		}
-		pct := (float64(validOrFixedCount) / float64(vChecked)) * 100.0
-		vPercentStr = fmt.Sprintf("%.1f%%", pct)
+		vPercent = (float64(validOrFixedCount) / float64(vChecked)) * 100.0
 	}
 
 	vLastStr := ""
@@ -610,7 +609,7 @@ func (m *Manager) buildStatusOutput() StatusOutput {
 			MismatchFixed:  vFixed,
 			Pending:        vPending,
 			HotKeysWaiting: m.valHotKeys.Load(),
-			SyncPercent:    vPercentStr,
+			SyncPercent:    vPercent,
 			LastValidated:  vLastStr,
 		},
 		LastSourceEventTime:  lastSourceTS,
