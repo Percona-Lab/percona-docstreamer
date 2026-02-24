@@ -192,7 +192,7 @@ func (s *Store) runOutcomeWorker() {
 		case <-ticker.C:
 			if len(batch) > 0 {
 				if s.flowMgr != nil {
-					if isPaused, _, _ := s.flowMgr.GetStatus(); isPaused {
+					if isPaused, _ := s.flowMgr.GetStatus(); isPaused {
 						continue
 					}
 				}

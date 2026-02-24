@@ -136,7 +136,6 @@ type FlowControlConfig struct {
 	Enabled               bool `mapstructure:"enabled"`
 	CheckIntervalMS       int  `mapstructure:"check_interval_ms"`
 	TargetMaxQueuedOps    int  `mapstructure:"target_max_queued_ops"`
-	TargetMaxResidentMB   int  `mapstructure:"target_max_resident_mb"`
 	PauseDurationMS       int  `mapstructure:"pause_duration_ms"`
 	LatencyThresholdMS    int  `mapstructure:"latency_threshold_ms"`
 	ActiveClientThreshold int  `mapstructure:"active_client_threshold"`
@@ -232,7 +231,6 @@ func LoadConfig() {
 	viper.SetDefault("flow_control.enabled", true)
 	viper.SetDefault("flow_control.check_interval_ms", 1000)
 	viper.SetDefault("flow_control.target_max_queued_ops", 50)
-	viper.SetDefault("flow_control.target_max_resident_mb", 0)
 	viper.SetDefault("flow_control.pause_duration_ms", 500)
 	viper.SetDefault("flow_control.latency_threshold_ms", 250)
 	viper.SetDefault("flow_control.active_client_threshold", 20)

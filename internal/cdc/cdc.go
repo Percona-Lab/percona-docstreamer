@@ -845,7 +845,7 @@ func (m *CDCManager) waitForFlow(ctx context.Context) {
 	}
 
 	for {
-		isPaused, _, _ := m.flowMgr.GetStatus()
+		isPaused, _ := m.flowMgr.GetStatus()
 		if !isPaused {
 			return
 		}

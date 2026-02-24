@@ -183,17 +183,6 @@ flow_control:
   # Default: 50
   target_max_queued_ops: 50
 
-  # Target Max Resident MB: The safety limit for Target RAM usage.
-  # Source Metric: db.serverStatus().mem.resident
-  # If the target's Resident Memory exceeds this value (in Megabytes), docStreamer will pause.
-  # This is critical for preventing OOM (Out of Memory) kills on the target host.
-  # SHARDED CLUSTERS NOTE:
-  # If the migration user exists on the backend shards, this setting PROTECTS THE SHARDS directly.
-  # If the user only exists on Mongos, this setting only protects the Mongos router.
-  # Set to 0 to disable memory-based throttling.
-  # Default: 0 (Disabled)
-  target_max_resident_mb: 0
-
   # Pause Duration: How long (in milliseconds) to sleep when an overload is detected.
   # The application will re-check the status after this duration.
   # Default: 500

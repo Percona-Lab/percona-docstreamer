@@ -175,7 +175,7 @@ func (vm *Manager) startBackgroundSweep() {
 
 	for {
 		if vm.flowMgr != nil {
-			paused, _, _ := vm.flowMgr.GetStatus()
+			paused, _ := vm.flowMgr.GetStatus()
 			if paused {
 				pauseDuration := config.Cfg.FlowControl.PauseDurationMS
 				if pauseDuration == 0 {
@@ -224,7 +224,7 @@ func (vm *Manager) RetryEligibleFailures() {
 	}
 
 	if vm.flowMgr != nil {
-		paused, _, _ := vm.flowMgr.GetStatus()
+		paused, _ := vm.flowMgr.GetStatus()
 		if paused {
 			return
 		}

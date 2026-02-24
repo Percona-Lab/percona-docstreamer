@@ -45,7 +45,6 @@ type FCStatus struct {
 	IsPaused            bool   `json:"isPaused"`
 	PauseReason         string `json:"pauseReason,omitempty"`
 	CurrentQueuedOps    int    `json:"currentQueuedOps"`
-	CurrentResidentMB   int    `json:"currentResidentMB"`
 	CurrentWriterQueue  int    `json:"currentWriterQueue"`
 	NativeLagged        bool   `json:"isReplicationLagged"`
 	NativeSustainerRate int    `json:"assignedRateLimit"`
@@ -119,7 +118,6 @@ type Manager struct {
 	fcIsPaused        atomic.Bool
 	fcReason          atomic.Value
 	fcQueuedOps       atomic.Int64
-	fcResidentMB      atomic.Int64
 	fcWriterQueue     atomic.Int64
 	fcNativeLagged    atomic.Bool
 	fcNativeSustainer atomic.Int64
@@ -150,11 +148,10 @@ func NewManager(client *mongo.Client, isSource bool) *Manager {
 	return m
 }
 
-func (m *Manager) UpdateFlowControl(paused bool, reason string, queuedOps, residentMB, writerQueue int, nativeLagged bool, nativeSustainer int) {
+func (m *Manager) UpdateFlowControl(paused bool, reason string, queuedOps, writerQueue int, nativeLagged bool, nativeSustainer int) {
 	m.fcIsPaused.Store(paused)
 	m.fcReason.Store(reason)
 	m.fcQueuedOps.Store(int64(queuedOps))
-	m.fcResidentMB.Store(int64(residentMB))
 	m.fcWriterQueue.Store(int64(writerQueue))
 	m.fcNativeLagged.Store(nativeLagged)
 	m.fcNativeSustainer.Store(int64(nativeSustainer))
@@ -367,9 +364,6 @@ func (m *Manager) LoadAndMerge(ctx context.Context) error {
 		if val, ok := fc["currentQueuedOps"]; ok {
 			m.fcQueuedOps.Store(parseInt64(val))
 		}
-		if val, ok := fc["currentResidentMB"]; ok {
-			m.fcResidentMB.Store(parseInt64(val))
-		}
 		if val, ok := fc["currentWriterQueue"]; ok {
 			m.fcWriterQueue.Store(parseInt64(val))
 		}
@@ -397,7 +391,6 @@ func (m *Manager) Persist(ctx context.Context) {
 		"isPaused":            m.fcIsPaused.Load(),
 		"pauseReason":         m.fcReason.Load().(string),
 		"currentQueuedOps":    m.fcQueuedOps.Load(),
-		"currentResidentMB":   m.fcResidentMB.Load(),
 		"currentWriterQueue":  m.fcWriterQueue.Load(),
 		"isReplicationLagged": m.fcNativeLagged.Load(),
 		"assignedRateLimit":   m.fcNativeSustainer.Load(),
@@ -637,7 +630,6 @@ func (m *Manager) buildStatusOutput() StatusOutput {
 			IsPaused:            m.fcIsPaused.Load(),
 			PauseReason:         m.fcReason.Load().(string),
 			CurrentQueuedOps:    int(m.fcQueuedOps.Load()),
-			CurrentResidentMB:   int(m.fcResidentMB.Load()),
 			CurrentWriterQueue:  int(m.fcWriterQueue.Load()),
 			NativeLagged:        m.fcNativeLagged.Load(),
 			NativeSustainerRate: int(m.fcNativeSustainer.Load()),

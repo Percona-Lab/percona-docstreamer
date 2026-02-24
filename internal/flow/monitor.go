@@ -28,9 +28,8 @@ type Manager struct {
 	user             string
 	password         string
 
-	currentQueuedOps  atomic.Int64
-	currentResidentMB atomic.Int64
-	currentWTTickets  atomic.Int64
+	currentQueuedOps atomic.Int64
+	currentWTTickets atomic.Int64
 }
 
 func NewManager(targetClient *mongo.Client, statusMgr *status.Manager, user, password string) *Manager {
@@ -109,8 +108,8 @@ func (m *Manager) WaitIfPaused() {
 }
 
 // GetStatus returns the current state.
-func (m *Manager) GetStatus() (bool, int, int) {
-	return m.isPaused.Load(), int(m.currentQueuedOps.Load()), int(m.currentResidentMB.Load())
+func (m *Manager) GetStatus() (bool, int) {
+	return m.isPaused.Load(), int(m.currentQueuedOps.Load())
 }
 
 func (m *Manager) getRealNodeName(client *mongo.Client, fallback string) string {
@@ -260,7 +259,6 @@ func (m *Manager) checkHealth() {
 
 	var maxQueuedOps int
 	var maxActiveClients int
-	var maxResidentMB int
 	var maxLatencyMs int64
 
 	var maxWriterQueue int
@@ -317,11 +315,7 @@ func (m *Manager) checkHealth() {
 				activeVal := raw.Lookup("globalLock", "activeClients", "total")
 				activeClients := getIntFromRaw(activeVal)
 
-				// 2. Memory
-				memVal := raw.Lookup("mem", "resident")
-				resMB := getIntFromRaw(memVal)
-
-				// 3. WiredTiger Tickets
+				// 2. WiredTiger Tickets
 				wtStr := "N/A"
 				wtVal := raw.Lookup("wiredTiger", "concurrentTransactions", "write", "available")
 				if wtVal.Type != bson.Type(0) {
@@ -332,7 +326,7 @@ func (m *Manager) checkHealth() {
 					}
 				}
 
-				// 4. Native Flow Control Checks
+				// 3. Native Flow Control Checks
 				fcLagged := false
 				fcSustainer := 0
 
@@ -359,9 +353,7 @@ func (m *Manager) checkHealth() {
 				if activeClients > maxActiveClients {
 					maxActiveClients = activeClients
 				}
-				if resMB > maxResidentMB {
-					maxResidentMB = resMB
-				}
+
 				if fcLagged {
 					isFlowControlLagged = true
 				}
@@ -375,8 +367,8 @@ func (m *Manager) checkHealth() {
 				}
 
 				if config.Cfg.Logging.Level == "debug" {
-					logging.PrintInfo(fmt.Sprintf("[FlowControl DEBUG] Node: %s | Queue: %d (W:%d) | Mem: %d MB | FC: %s (Rate:%d) | WT: %s | Latency: %dms",
-						nodeName, qOps, wOps, resMB, fcStatus, fcSustainer, wtStr, latency), 0)
+					logging.PrintInfo(fmt.Sprintf("[FlowControl DEBUG] Node: %s | Queue: %d (W:%d) | FC: %s (Rate:%d) | WT: %s | Latency: %dms",
+						nodeName, qOps, wOps, fcStatus, fcSustainer, wtStr, latency), 0)
 				}
 			}
 		}(client)
@@ -384,7 +376,6 @@ func (m *Manager) checkHealth() {
 	wg.Wait()
 
 	m.currentQueuedOps.Store(int64(maxQueuedOps))
-	m.currentResidentMB.Store(int64(maxResidentMB))
 	m.currentWTTickets.Store(int64(minWTTicketsAvailable))
 
 	shouldPause := false
@@ -426,16 +417,7 @@ func (m *Manager) checkHealth() {
 		}
 	}
 
-	// --- 4. Memory Logic ---
-	if !shouldPause && config.Cfg.FlowControl.TargetMaxResidentMB > 0 {
-		limit := config.Cfg.FlowControl.TargetMaxResidentMB
-		if maxResidentMB > limit {
-			shouldPause = true
-			reason = fmt.Sprintf("High Memory: %dMB > %dMB", maxResidentMB, limit)
-		}
-	}
-
-	// --- 5. WiredTiger Logic ---
+	// --- 4. WiredTiger Logic ---
 	if !shouldPause {
 		limit := config.Cfg.FlowControl.MinWiredTigerTickets
 		if limit > 0 {
@@ -453,7 +435,6 @@ func (m *Manager) checkHealth() {
 			shouldPause,
 			reason,
 			maxQueuedOps,
-			maxResidentMB,
 			maxWriterQueue,
 			isFlowControlLagged,
 			maxSustainerRate,

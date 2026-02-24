@@ -7,7 +7,7 @@ import (
 type InFlightTracker struct {
 	mu           sync.RWMutex
 	dirtyIDs     map[string]bool
-	clearedCount int // Track operations to trigger periodic resets
+	clearedCount int
 }
 
 func NewInFlightTracker() *InFlightTracker {
