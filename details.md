@@ -39,6 +39,19 @@ This is the initial snapshot stage.
  - Strict Boundaries: By enforcing exact boundaries, we ensure that every document falls into exactly one worker's queue, preventing type-sorting errors or skipped records.
  - New Data Handling: Documents inserted after the initial discovery (beyond the "Max Key") are not picked up by the Full Load workers. Instead, they are captured by the CDC Change Stream, which starts from $\mathbf{T_0}$ (the beginning of the migration). This guarantees that no data is missed ("zero data loss") while maintaining strict type safety during the copy phase.
 
+#### Automated Sharding Lifecycle
+
+If a collection is defined in the sharding configuration, docStreamer automates the entire setup before the data copy begins. This ensures the target environment is ready for high-velocity parallel writes.
+
+**1. Sharding Setup**
+The tool automatically enables sharding on the target database and creates the required shard key index. It then executes the `shardCollection` command with your defined key and uniqueness constraints.
+
+**2. Automated Pre-Splitting**
+To prevent "hot shards" during the Full Load, docStreamer applies a pre-split strategy (e.g., `hex`, `composite_uuid_oid`, or `manual`) to create multiple initial chunks across the shard key space before any data is inserted.
+
+**3. Round-Robin Distribution**
+After chunks are created, docStreamer performs a manual distribution cycle. It identifies every shard in the target cluster and moves chunks in a round-robin fashion until the collection is perfectly balanced across all available shards.
+
 ### 4. CDC (Continuous Sync)
 
 This phase starts immediately after the Full Load completes (or on startup if a valid checkpoint exists).
@@ -48,6 +61,13 @@ This phase starts immediately after the Full Load completes (or on startup if a 
 **Buffering & Flushing:** A processor listens for change events (inserts, updates, deletes, and supported DDLs). Events are buffered into a BulkWriter and flushed to the target in batches based on cdc.batch_size or cdc.batch_interval_ms.
 
 **Idempotency:** Because the CDC stream overlaps with the Full Load (covering the same time period), it handles duplicate keys gracefully by using Upsert/Replace operations. This ensures that the target data always converges to the latest state from the source.
+
+#### Optimized Index Management
+
+docStreamer allows you to prioritize write speed during the Full Load phase by deferring secondary index creation.
+
+* **Index Postponement**: If `cloner.postpone_index_creation` is enabled, only the `_id` and shard key indexes are created initially.
+* **Finalization Phase**: Once a collection's data copy is complete, the "Finalizer" runs. It compares the source indexes with the target, identifies missing secondary indexes, and creates them in the background before the collection transitions to CDC mode.
 
 ### 5. Continuous Data Validation
 
@@ -64,6 +84,15 @@ docStreamer includes active self-healing mechanisms to ensure statistics match r
 * Startup Reconciliation: On every process start, docStreamer automatically scans the validation collections to fix any drift in statistics caused by previous crashes or race conditions.
 * Idle Watchdog: A background process monitors the replication lag. When the system is idle (Lag $\approx$ 0s), it automatically re-queues known validation failures for a check. This clears out "false positives" that occurred because data was being updated during the initial validation check.
 
+#### Validation Self-Healing & Metrics
+
+The validation engine now distinguishes between different types of mismatches to provide a clearer picture of data health.
+
+* **Found vs. Fixed**:
+    * **Mismatch Found**: The count of unique documents that have failed a validation check at least once.
+    * **Mismatch Fixed**: The count of documents that previously failed but were later confirmed as valid after a CDC update or a re-check.
+* **Pending Mismatches**: This represents the actual number of active discrepancies currently stored in the metadata database.
+
 #### Status
 
 The status api provides the current validation status. You can see the live validation statistics by running the status command. Look for the validation block:
@@ -78,30 +107,14 @@ Output Example (Healthy) -- this is just the section pertinent to the validation
 ....
 .....
     "validation": {
-        "totalChecked": 15420,
-        "validCount": 15420,
-        "mismatchCount": 0,
+        "queuedBatches": 0,
+        "totalChecked": 3252342,
+        "mismatchFound": 21604,
+        "mismatchFixed": 21604,
+        "pendingMismatches": 0,
+        "hotKeysWaiting": 0,
         "syncPercent": 100,
-        "lastValidatedAt": "2023-10-27T10:05:00Z"
-    }
-```
-
-Output Example (Systemic Failure with Cap Reached):
-
-If docStreamer detects too many errors, it stops logging individual details to protect performance, but continues counting the total errors.
-
-```bash
-...
-....
-    "validation": {
-        "totalChecked": 50000,
-        "validCount": 45000,
-        "mismatchCount": 5000,
-        "syncPercent": 90.0,
-        "lastValidatedAt": "2023-10-27T10:05:00Z",
-        "warnings": [
-            "Failure sample limit reached (1000). Some mismatch details are not stored. Check logs/DB for full counts."
-        ]
+        "lastValidatedAt": "2026-02-24T21:32:56Z"
     }
 ```
 

@@ -315,12 +315,39 @@ You can modify any configuration through the [config.yaml](./config.yaml) file, 
 
 ### Sharding Configuration
 
-If you are migrating to a **Sharded MongoDB Cluster**, docStreamer can be configured to automatically shard the target collections. You can define specific rules for each collection in the `config.yaml`.
+If you are migrating to a **Sharded MongoDB Cluster**, docStreamer automatically manages the entire lifecycle of sharding target collections. When a namespace is defined in the `sharding` section of `config.yaml`, the tool executes the following steps:
 
-#### 1. Range Sharding (Default Behavior)
-By default, docStreamer uses Range Sharding. It performs a sampled scan of the source DocumentDB to calculate optimal split points.
+1.  **Enable Sharding**: Enables sharding on the target database.
+2.  **Index Creation**: Creates a shard key index based on your configuration.
+3.  **Collection Sharding**: Runs the `shardCollection` command with the specified key and uniqueness constraints.
+4.  **Pre-Splitting (Phase 1)**: Executes a custom split strategy to create initial chunks across the shard key space.
+5.  **Chunk Distribution (Phase 2)**: Performs a Round-Robin distribution by manually moving chunks across all discovered shards to ensure an immediate balanced state.
 
-> **Note:** For very large collections (100M+ documents), this scan can take a significant amount of time.
+#### Sharding Configuration Reference
+
+The following fields are available for each entry in the `sharding` list within `config.yaml`:
+
+| Field | Description |
+| :--- | :--- |
+| `namespace` | The full "db.collection" string (e.g., `Ind_1.users_1`). |
+| `shard_key` | The shard key pattern. Supports ranged (e.g., `a:1`) and hashed (e.g., `a:hashed`). |
+| `unique_shard_key` | Boolean to enforce uniqueness on the shard key (Default: `false`). |
+| `pre_split_strategy` | The method used to create initial chunks (see strategies below). |
+| `pre_split_chunk_count` | Explicit number of chunks to create for `range_manual` and `hashed_manual`. |
+| `num_initial_chunks` | For native MongoDB hashed sharding; sets `numInitialChunks` during the `shardCollection` command. |
+| `split_type` | Data type for `range_manual`: `int64`, `date`, `string`, `uuid`, or `objectid`. |
+| `split_min` / `split_max` | The lower and upper bounds used for the `range_manual` strategy. |
+| `uuid_field` / `oid_field` | Field names containing UUIDs or ObjectIDs for the `composite_uuid_oid` strategy. |
+| `disable_presplit` | If `true`, skips docStreamer's Phase 1 and Phase 2 manual splitting logic. |
+
+
+#### Available Pre-Split Strategies
+
+Choose a strategy based on your data distribution needs and shard key types:
+
+**1. Range Sharding (Default Behavior)**
+By default, if no `pre_split_strategy` is specified, docStreamer uses Range Sharding. It performs a sampled scan of the source DocumentDB to calculate optimal split points.
+* **Note**: For very large collections (100M+ documents), this scan can take a significant amount of time.
 
 ```yaml
 sharding:
@@ -328,44 +355,51 @@ sharding:
     shard_key: "email:1, rental_id:1"
 ```
 
-#### 2. Deterministic Pre-Splitting (Optimized for UUID/ObjectIDs)
-If your shard key consists of a **UUID** and/or **ObjectID**, you can skip the slow source scan and use a deterministic strategy. This calculates split points mathematically in seconds, creating a perfectly pre-split and balanced target instantly.
-
-**Supported Keys:**
-* **Composite:** UUID + ObjectID (any order)
-* **Single Field:** UUID Only or ObjectID Only
-
-**Configuration Requirements:**
-You **must** explicitly map your fields using `uuid_field` and `oid_field` so the tool knows exactly how to split the data.
-
-```yaml
-sharding:
-  - namespace: "my_db.users"
-    shard_key: "order_id:1, random_objectid:1"
-    
-    # Enable the optimized strategy
-    pre_split_strategy: "composite_uuid_oid"
-    
-    # REQUIRED MAPPINGS:
-    # These must match the field names in your shard_key above.
-    uuid_field: "order_id"   # The field containing UUIDs
-    oid_field: "random_objectid"      # The field containing ObjectIDs
-```
-
-#### 3. Hashed Sharding
-If you use Hashed Sharding, scanning the source is unnecessary. You can simply specify the number of chunks you want to pre-allocate.
+**2. `hashed_manual` (Custom Hashed Splitting)**
+* **How it works**: Bypasses MongoDB's default `numInitialChunks` logic by forcing 1 initial chunk and then manually splitting the 64-bit hashed range (from `MinInt64` to `MaxInt64`).
+* **Note**: docStreamer uses a middle-point calculation to programmatically define split points based on your `pre_split_chunk_count`.
 
 ```yaml
 sharding:
   - namespace: "my_db.orders"
     shard_key: "order_id:hashed"
-    
-    # Optional: Pre-allocate a specific number of empty chunks
-    num_initial_chunks: 2400
+    pre_split_strategy: "hashed_manual"
+    pre_split_chunk_count: 10 # Creates 10 evenly spaced chunks in the hash ring
 ```
 
-#### 4. Disable Pre-Splitting
-If you want to handle splitting manually or simply start with a single chunk (**Warning:** This creates a Hot Shard), you can disable the pre-splitting logic entirely.
+**3. `composite_uuid_oid` (Deterministic UUID/ObjectID)**
+* **How it works**: Designed for shard keys containing high-entropy IDs. It calculates split points mathematically using hex-digit prefixes (0-F) for ObjectID fields and 256 prefixes for UUID fields.
+* **Supported Keys**: Composite (UUID + ObjectID in any order) or Single Field (UUID Only/ObjectID Only).
+
+```yaml
+sharding:
+  - namespace: "my_db.users"
+    shard_key: "order_id:1, random_objectid:1"
+    pre_split_strategy: "composite_uuid_oid"
+    uuid_field: "order_id" # Must match field name in shard_key
+    oid_field: "random_objectid" # Must match field name in shard_key
+```
+
+**4. `range_manual` (Custom Ranged Splitting)**
+* **How it works**: Evenly divides the space between `split_min` and `split_max` into `pre_split_chunk_count` segments based on the `split_type`.
+* **Supported Types**: `int64`, `date` (ISO-8601/RFC3339), `uuid`, `objectid`, and `string`.
+
+```yaml
+sharding:
+  - namespace: "singleFieldShard.test"
+    shard_key: "entryTimestamp"
+    pre_split_strategy: "range_manual"
+    pre_split_chunk_count: 10
+    split_min: "1700000000000"
+    split_max: "2200000000000"
+    split_type: "int64"
+```
+
+**5. `hex` (Standard Hexadecimal Splitting)**
+* **How it works**: Creates 16 chunks based on the first character of the primary shard key field (0-9, a-f).
+
+**6. Disable Pre-Splitting**
+If you want to handle splitting manually or start with a single chunk (**Warning**: This can create a Hot Shard), you can disable the pre-splitting logic.
 
 ```yaml
 sharding:
@@ -373,6 +407,30 @@ sharding:
     shard_key: "created_at:1"
     disable_presplit: true
 ```
+
+### Index Management & Optimization
+
+Percona docStreamer handles index migration with specific optimizations to ensure high-velocity data ingestion.
+
+#### Postponing Index Creation
+A major bottleneck during the **Full Load** phase is the overhead of maintaining secondary indexes during bulk inserts. You can optimize this behavior in `config.yaml`:
+
+```yaml
+cloner:
+  # If True, only the _id and shard key indexes are created before the data load.
+  # All other secondary indexes are created AFTER the full load completes.
+  postpone_index_creation: true 
+```
+* **How it works**: When enabled, docStreamer creates the collection and only essential indexes (like the shard key) initially. Once the "Cloner" phase completes for a collection, the "Finalizer" identifies any missing indexes and creates them in the background before switching to CDC mode.
+
+#### Supported Index Types
+docStreamer automatically migrates most standard MongoDB index types, including Single Field, Compound, Multikey, and Geospatial indexes. However, some types require manual intervention:
+
+* **Automatically Migrated**: Standard B-tree indexes, unique indexes (if compatible with shard key), and geospatial indexes.
+* **Excluded/Skipped**:
+    * **Text Indexes**: These are not currently supported for automatic migration.
+    * **Partial Indexes**: These are skipped to prevent inconsistencies during the migration stream.
+    * **TTL Indexes**: These must be created manually on the destination to avoid premature data expiration during the sync process.
 
 ## 5. How to Use Percona docStreamer
 
@@ -667,6 +725,17 @@ Percona docStreamer generates three separate logs, each of the logs location and
 2. Full Load Log (`logs/full_load.log`): Dedicated to the initial full synchronization process. This log, together with the status endpoint, helps you monitor the progress of the initial sync.
 3. CDC Log (`logs/cdc.log`): Dedicated to Change Data Capture (CDC) operations. These operations begin only after the full sync is complete, so this log will remain empty until that point. Use it, along with the status endpoint, to track CDC progress.
 
+#### Logging Configuration
+
+The application generates specialized logs to help you monitor different stages of the migration. You can configure the log level and file paths in the `logging` section.
+
+| Setting | Default | Description |
+| :--- | :--- | :--- |
+| `level` | `info` | The verbosity of the logs (`debug`, `info`, `warn`, `error`). |
+| `file_path` | `logs/docStreamer.log` | The primary application log containing system status and errors. |
+| `ops_log_path` | `logs/cdc.log` | Dedicated log for Change Data Capture (CDC) operations and batch details. |
+| `full_load_log_path` | `logs/full_load.log` | Dedicated log for tracking the progress and batches of the initial full sync. |
+
 <details>
 <summary>Application log sample:</summary>
 
@@ -837,6 +906,7 @@ _  __  /_  __ \  ___/____ \_  __/_  ___/  _ \  __ `/_  __ `__ \  _ \_  ___/
 ```
 </details>
 
+
 ## 6. Performance & Optimization
 
 ### Full Load Optimization
@@ -919,6 +989,12 @@ You can tune these behaviors independently in the cloner and cdc sections of you
 | `cdc.retry_interval_ms` | How long to wait (in milliseconds) between retry attempts. default: 1000 |
 | `cdc.write_timeout_ms` | Max time (in ms) for a BulkWrite operation to complete. default: 30000 |
 
+#### Resource Management
+| Setting | Default | Description |
+| :--- | :--- | :--- |
+| `go_mem_limit` | `80%` | Sets a soft memory limit for the Go runtime (e.g., `80%` of host RAM or a fixed value like `4GiB`). |
+| `go_gc` | `50` | Sets the Garbage Collection target percentage. Lower values increase GC frequency, reducing memory usage at the cost of CPU. |
+| `network_compressors` | `zlib,snappy` | A comma-separated list of compressors to use for the MongoDB connection string. |
 
 ### Adaptive Flow Control (Throttling)
 
@@ -930,7 +1006,7 @@ While internal buffers (`queue_size`) protect the docStreamer application itself
 * **Replica Sets:** It monitors the single primary node.
 * **Sharded Clusters:** It automatically discovers the cluster topology via the `config` database and opens direct connections to **every backend shard**. It then aggregates metrics across the entire cluster. If *any* single shard becomes overloaded, docStreamer pauses the migration globally to let that shard recover.
 
-docStreamer monitors two specific health indicators:
+docStreamer monitors one specific health indicator:
 
 #### 1. Global Lock Queue (`flow_control.target_max_queued_ops`)
 
@@ -938,13 +1014,6 @@ docStreamer monitors two specific health indicators:
 * **Metric Source:** `db.serverStatus().globalLock.currentQueue.total`
 * **Scope:** **Cluster-Wide.** docStreamer checks this on the Mongos and **every backend shard**. It takes the *maximum* value found.
 * **Impact:** If *any* single node shows a queue higher than your limit (e.g., > 50), it is a definitive sign that the node is saturated (CPU or I/O bound). docStreamer pauses data fetching immediately.
-
-#### 2. Resident Memory (`flow_control.target_max_resident_mb`)
-
-* **What it measures:** The actual physical RAM usage of the `mongod` process in Megabytes.
-* **Metric Source:** `db.serverStatus().mem.resident`
-* **Scope:** **Cluster-Wide.** docStreamer checks this on the Mongos and **every backend shard**.
-* **Impact:** If you are migrating to a smaller instance or a container with strict memory limits, you can set this threshold (e.g., `8192` for 8GB). If *any* shard's memory usage exceeds this, docStreamer pauses. This is critical for preventing the Operating System from killing the database process due to OOM (Out of Memory).
 
 **Behavior when throttled:** When a threshold is breached on *any* node, you will see a warning in the logs identifying the specific issue:  
 `[WARN] [FlowControl] THROTTLING PAUSED: Cluster High Load: Max Queued Ops (150) > Limit (50)`
@@ -973,24 +1042,39 @@ Even with Flow Control enabled, we recommend tuning concurrency to prevent "burs
     * **Action:** Reduce `cloner.insert_batch_bytes` to **16MB** (16777216).
     * **Trade-off:** This slightly increases network chatter but significantly reduces the "memory spike" per write operation on the backend.
 
+#### Advanced Flow Control Settings
+
+In addition to monitoring lock queues, the Adaptive Flow Control mechanism uses several advanced parameters to ensure the target MongoDB cluster remains stable.
+
+| Setting | Default | Description |
+| :--- | :--- | :--- |
+| `check_interval_ms` | `1000` | How often (in milliseconds) the background monitor polls the target database status. |
+| `pause_duration_ms` | `500` | The duration docStreamer sleeps when a throttling threshold is breached before re-checking. |
+| `latency_threshold_ms` | `250` | The maximum acceptable latency for a `serverStatus` command. If exceeded, the system pauses to allow the target to recover. |
+| `active_client_threshold` | `50` | The maximum number of total concurrent active clients allowed on the target before throttling occurs. |
+| `min_wired_tiger_tickets` | `0` | The minimum number of available WiredTiger write tickets required. If it drops below this value, the system pauses. Set to `0` to disable. |
+
+
 ### Validation Optimization
 
 The data validation engine is highly configurable to balance performance impact against data integrity assurance. You can tune these settings via [config.yaml](./config.yaml) under the `validation` section.
 
 | Setting | Default | Description |
 |--------:|--------:|-------------|
-| enabled | true | Master switch for the validation engine. If false, final document verification after CDC writes are skipped. CDC is guaranteed to sync the documents; this is an optional additional validation check. |
-| batch_size | 100 | Network vs. Memory Trade-off. Controls how many document IDs are bundled into a single database lookup. Larger batches reduce network round-trips but increase memory usage. |
-| max_validation_workers | 4 | Concurrency Control. The number of parallel worker threads fetching and comparing documents. Increase this if you have spare CPU/Network capacity and notice validation lagging behind CDC. |
-| queue_size | 2000 | Buffer Capacity. The size of the channel buffering CDC events before validation. If the CDC writer is faster than the validator and this buffer fills up, validation requests will be dropped to prevent slowing down the replication stream. |
-| retry_interval_ms | 500 | Hot Key Handling. If a record fails validation because it is actively being modified (detected via dirty tracking), the validator waits this long before re-checking it. |
-| max_retries | 3 | Persistence. How many times to retry a "Hot Key" before giving up. After this many attempts, the record is marked as a mismatch/skipped to move on. |
+| `enabled` | `true` | Master switch for the validation engine. If false, final document verification after CDC writes are skipped. CDC is guaranteed to sync the documents; this is an optional additional validation check. |
+| `batch_size` | `100` | Network vs. Memory Trade-off. Controls how many document IDs are bundled into a single database lookup. Larger batches reduce network round-trips but increase memory usage. |
+| `max_validation_workers` | `4` | Concurrency Control. The number of parallel worker threads fetching and comparing documents. Increase this if you have spare CPU/Network capacity and notice validation lagging behind CDC. |
+| `queue_size` | `2000` | Buffer Capacity. The size of the channel buffering CDC events before validation. If the CDC writer is faster than the validator and this buffer fills up, validation requests will be dropped to prevent slowing down the replication stream. |
+| `retry_interval_ms` | `500` | Hot Key Handling. If a record fails validation because it is actively being modified (detected via dirty tracking), the validator waits this long before re-checking it. |
+| `max_retries` | `3` | Persistence. How many times to retry a "Hot Key" before giving up. After this many attempts, the record is marked as a mismatch/skipped to move on. |
+| `hot_key_check_interval_minutes` | `5` | The maximum time a "Hot Key" (a record failing validation due to active writes) stays in the queue before a re-check is forced. |
+| `idle_check_interval_seconds` | `5` | How often the system checks if CDC is "Idle." If idle for this duration, the system ignores the timer above and immediately re-checks all pending keys. |
+
 
 
 ## 7. Additional Documentation
 
 We have created a page dedicated to a more in [depth explanation of how Percona docStreamer works](./details.md) as well as a [frequently asked questions](./faq.md) page.
-
 
 ## 8. Important Notes & Limitations 
 
@@ -1008,9 +1092,11 @@ To ensure data integrity and prevent accidental data loss during migration, we r
 
 **CRITICAL WARNING** regarding Data Overwrites: Please be aware that if a document in your Source has the same _id as a document in your Destination, the Destination document will be overwritten immediately. This action is irreversible once the sync is performed.
 
-### Sharding support not tested
+### Sharding Support 
 
-Migration from DocumentDB sharded clusters has not been tested and therefore the behavior is unknown. Support for sharded DocumentDB clusters will be added in the future.
+Migration from sharded Amazon DocumentDB clusters has not been tested; therefore, the behavior in this scenario is currently unknown. Support for sharded DocumentDB clusters will be added in a future release.
+
+docStreamer does support migration from a non-sharded Amazon DocumentDB cluster to a new sharded MongoDB cluster. However, this process requires careful planning, and thorough testing is strongly recommended in a non-production environment prior to execution in production.
 
 ### DocumentDB Cursor Rate Limiting
 

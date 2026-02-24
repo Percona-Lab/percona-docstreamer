@@ -164,3 +164,88 @@ curl -X POST http://localhost:8080/validate/reset
 ```bash    
 curl -X POST http://localhost:8080/validate/reset?mode=erase
 ```
+
+## 3. Expanded Status Response
+
+The `/status` endpoint now provides granular metrics for CDC operations and the Flow Control system.
+
+**New Response Fields:**
+- `flowControl`:
+    - `isPaused`: Boolean indicating if docStreamer is currently throttling writes.
+    - `pauseReason`: The specific threshold (Queued Ops or Resident MB) that triggered the pause.
+    - `currentQueuedOps`: The highest global lock queue depth detected across the cluster.
+- `insertedDocs` / `updatedDocs` / `deletedDocs`: Individual counters for each operation type applied during CDC.
+- `validation.pendingMismatches`: The real-time count of document IDs currently flagged as out of sync.
+
+---
+
+## 4. Advanced Validation Endpoints
+
+### 4.1. Get Active Failures
+Retrieves a list of all document IDs currently recorded as validation mismatches.
+
+| Detail | Value |
+| :--- | :--- |
+| Path | `/validate/failures` |
+| Method | `GET` |
+
+```bash
+# Example Request
+curl -X GET http://localhost:8080/validate/failures
+```
+
+### 4.2. Get Queue Status
+Returns real-time metrics on the internal validation buffer and its backpressure state.
+
+| Detail | Value |
+| :--- | :--- |
+| Path | `/validate/queue` |
+| Method | `GET` |
+
+```bash
+# Example Response
+{
+    "queue_used": 150,
+    "queue_capacity": 2000,
+    "is_throttled": false,
+    "status_message": "Healthy"
+}
+```
+
+### 4.3. Trigger Collection Scan
+Triggers a full background scan of a collection to find mismatches or "orphans" (records that exist on the target but not the source).
+
+| Detail | Value |
+| :--- | :--- |
+| Path | `/validate/scan` |
+| Method | `POST` |
+
+**Request Body:**
+- `namespace`: The collection to scan (e.g., `db.users`).
+- `scan_type`: `"source"` (Standard check) or `"orphans"` (Finds extra records on target).
+
+```bash
+# Example: Orphan Scan
+curl -X POST http://localhost:8080/validate/scan \
+     -H "Content-Type: application/json" \
+     -d '{
+           "namespace": "inventory.products",
+           "scan_type": "orphans"
+         }'
+```
+
+### 4.4. Complex Shard Key Validation
+The `/validate/adhoc` endpoint now supports complex shard keys via the `keys` array.
+
+```bash
+# Example: Validating by Shard Key
+curl -X POST http://localhost:8080/validate/adhoc \
+     -H "Content-Type: application/json" \
+     -d '{
+           "namespace": "ecommerce.orders",
+           "keys": [
+               { "_id": "order_123", "region": "US" },
+               { "_id": "order_456", "region": "EU" }
+           ]
+         }'
+```

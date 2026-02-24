@@ -213,18 +213,9 @@ This ensures legitimate mismatches are not confused with race conditions.
 ---
 
 ## Q: Are indexes migrated, and when are they created?
-**A:** Yes. Indexes are created on the target **before** data loading for each collection.
+**A:** By default, indexes are created before data loading. However, you can now set `cloner.postpone_index_creation: true` to defer secondary index creation until after the full load is finished, which significantly increases write throughput.
 
-### Why Pre-Load Creation?
-- Enforces integrity constraints (e.g., unique indexes) from the start
-- Prevents corrupt or invalid data from entering the target
-
-### Performance
-- Slightly slower inserts due to index maintenance
-- Guarantees target schema matches source
-
-### Limitation
-Indexes created on the source **after** migration starts (during CDC) are **not** auto-copied and must be applied manually.
+Be aware that postponing index creation will delay CDC start, so make sure you have configured CDC on source with a long enough retention period.
 
 ---
 
@@ -285,13 +276,7 @@ While the architecture supports sharding, there are important caveats, particula
 ---
 
 ## Q: Can I migrate from a non sharded DocumentDB cluster to a sharded MongoDB cluster?
-**A:** Yes, please note that docStreamer does not perform sharding setup operations (such as enableSharding or shardCollection). You must configure the sharding topology manually before starting the migration.
-
-Recommended Workflow:
-
-1. Pre-Create and Shard: Before starting the migration, manually create your target databases and collections, and enable sharding with your desired shard keys.
-2. Start Migration: When docStreamer starts, it will detect that the collections already exist and skip the creation step.
-3. Data Loading: The tool will insert data through the mongos router, allowing MongoDB to automatically distribute the documents across shards based on your pre-configured setup.
+**A:** Yes. docStreamer now fully automates sharding. You only need to define the namespace and shard key in the sharding section of your config.yaml. The tool will enable sharding, create the shard-key index, perform pre-splitting, and distribute chunks across shards automatically.
 
 ---
 
