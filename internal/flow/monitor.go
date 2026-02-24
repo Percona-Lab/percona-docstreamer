@@ -455,7 +455,11 @@ func (m *Manager) checkHealth() {
 			logging.PrintInfo("[FlowControl] Throttling released. Cluster healthy.", 0)
 			m.isPaused.Store(false)
 			if m.statusMgr != nil {
-				m.statusMgr.SetState("running", "Change Data Capture")
+				if m.statusMgr.IsCloneCompleted() {
+					m.statusMgr.SetState("running", "Change Data Capture")
+				} else {
+					m.statusMgr.SetState("running", "Initial Sync")
+				}
 			}
 		}
 	}
