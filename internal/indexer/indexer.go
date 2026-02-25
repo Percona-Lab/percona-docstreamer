@@ -133,25 +133,82 @@ func CreateCollectionAndPreloadIndexes(ctx context.Context, targetDB *mongo.Data
 	return targetColl, nil
 }
 
+// func FinalizeIndexes(ctx context.Context, targetColl *mongo.Collection, indexes []discover.IndexInfo, ns string) error {
+// 	cursor, err := targetColl.Indexes().List(ctx)
+// 	if err != nil {
+// 		return nil
+// 	}
+
+// 	existing := make(map[string]bool)
+// 	for cursor.Next(ctx) {
+// 		var idx bson.M
+// 		if err := cursor.Decode(&idx); err == nil {
+// 			if name, ok := idx["name"].(string); ok {
+// 				existing[name] = true
+// 			}
+// 		}
+// 	}
+
+// 	var missing []mongo.IndexModel
+// 	for _, idx := range indexes {
+// 		if !existing[idx.Name] {
+// 			missing = append(missing, mongo.IndexModel{
+// 				Keys:    idx.Key,
+// 				Options: options.Index().SetName(idx.Name).SetUnique(idx.Unique),
+// 			})
+// 		}
+// 	}
+
+// 	if len(missing) > 0 {
+// 		logging.PrintInfo(fmt.Sprintf("[%s] Finalizing %d missing indexes...", ns, len(missing)), 0)
+// 		_, err := targetColl.Indexes().CreateMany(ctx, missing)
+// 		if err != nil {
+// 			logging.PrintError(fmt.Sprintf("[%s] Failed to create final indexes: %v", ns, err), 0)
+// 			return err
+// 		}
+// 	}
+// 	return nil
+// }
+
 func FinalizeIndexes(ctx context.Context, targetColl *mongo.Collection, indexes []discover.IndexInfo, ns string) error {
 	cursor, err := targetColl.Indexes().List(ctx)
 	if err != nil {
 		return nil
 	}
 
-	existing := make(map[string]bool)
-	for cursor.Next(ctx) {
-		var idx bson.M
-		if err := cursor.Decode(&idx); err == nil {
-			if name, ok := idx["name"].(string); ok {
-				existing[name] = true
+	// We decode to []bson.D to preserve the exact order of the index keys
+	var existingIndexes []bson.D
+	if err := cursor.All(ctx, &existingIndexes); err != nil {
+		return err
+	}
+
+	// Store existing index keys by their binary representation
+	existingKeys := make(map[string]bool)
+	for _, idxDoc := range existingIndexes {
+		for _, elem := range idxDoc {
+			if elem.Key == "key" {
+				if keyD, ok := elem.Value.(bson.D); ok {
+					keyBytes, _ := bson.Marshal(keyD)
+					existingKeys[string(keyBytes)] = true
+				}
 			}
 		}
 	}
 
 	var missing []mongo.IndexModel
 	for _, idx := range indexes {
-		if !existing[idx.Name] {
+		// 1. Explicitly skip the _id index (MongoDB handles this natively)
+		isId := false
+		if len(idx.Key) == 1 && idx.Key[0].Key == "_id" {
+			isId = true
+		}
+		if isId {
+			continue
+		}
+
+		// 2. Check if the index key already exists on the target
+		keyBytes, _ := bson.Marshal(idx.Key)
+		if !existingKeys[string(keyBytes)] {
 			missing = append(missing, mongo.IndexModel{
 				Keys:    idx.Key,
 				Options: options.Index().SetName(idx.Name).SetUnique(idx.Unique),
@@ -166,6 +223,9 @@ func FinalizeIndexes(ctx context.Context, targetColl *mongo.Collection, indexes 
 			logging.PrintError(fmt.Sprintf("[%s] Failed to create final indexes: %v", ns, err), 0)
 			return err
 		}
+		logging.PrintSuccess(fmt.Sprintf("[%s] Indexes finalized.", ns), 0)
+	} else {
+		logging.PrintSuccess(fmt.Sprintf("[%s] All required indexes already exist.", ns), 0)
 	}
 	return nil
 }

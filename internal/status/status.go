@@ -21,6 +21,9 @@ type StatusOutput struct {
 	State string `json:"state"`
 	Info  string `json:"info"`
 
+	MigrationFinalized bool          `json:"migrationFinalized"`
+	Indexing           IndexProgress `json:"indexing,omitempty"`
+
 	FlowControl *FCStatus `json:"flowControl,omitempty"`
 
 	// CDC Metrics
@@ -38,6 +41,14 @@ type StatusOutput struct {
 	LastAppliedEventTime TSTime          `json:"lastAppliedEventTime"`
 	LastBatchAppliedAt   string          `json:"lastBatchAppliedAt"`
 	InitialSync          SyncStatus      `json:"initialSync"`
+}
+
+type IndexProgress struct {
+	IsIndexing       bool   `json:"isIndexing"`
+	CurrentNamespace string `json:"currentNamespace"`
+	CompletedColls   int    `json:"completedCollections"`
+	TotalColls       int    `json:"totalCollections"`
+	Completed        bool   `json:"completed"`
 }
 
 type FCStatus struct {
@@ -113,6 +124,14 @@ type Manager struct {
 	// Flags
 	cloneCompleted       atomic.Bool
 	initialSyncCompleted atomic.Bool
+	migrationFinalized   atomic.Bool
+
+	// Index Tracking
+	isIndexing       atomic.Bool
+	idxCurrentNs     atomic.Value
+	idxCompletedColl atomic.Int64
+	idxTotalColl     atomic.Int64
+	idxFinished      atomic.Bool
 
 	// Flow Control State (In-Memory)
 	fcIsPaused        atomic.Bool
@@ -145,6 +164,7 @@ func NewManager(client *mongo.Client, isSource bool) *Manager {
 		startTime:  time.Now().UTC(),
 	}
 	m.fcReason.Store("")
+	m.idxCurrentNs.Store("") // Safely initialize empty string
 	return m
 }
 
@@ -190,6 +210,15 @@ func (m *Manager) SetError(err string) {
 	defer m.mu.Unlock()
 	m.state = "error"
 	m.info = err
+}
+
+func (m *Manager) SetIndexingProgress(isIndexing bool, currentNs string, completed, total int, finished bool) {
+	m.isIndexing.Store(isIndexing)
+	m.idxCurrentNs.Store(currentNs)
+	m.idxCompletedColl.Store(int64(completed))
+	m.idxTotalColl.Store(int64(total))
+	m.idxFinished.Store(finished)
+	go m.Persist(context.Background())
 }
 
 func (m *Manager) UpdateCDCStats(applied, inserted, updated, deleted int64, lastSourceTS bson.Timestamp) {
@@ -270,6 +299,14 @@ func (m *Manager) SetCloneCompleted() {
 	m.cloneCompleted.Store(true)
 }
 
+func (m *Manager) IsMigrationFinalized() bool {
+	return m.migrationFinalized.Load()
+}
+
+func (m *Manager) SetMigrationFinalized() {
+	m.migrationFinalized.Store(true)
+}
+
 func (m *Manager) LoadAndMerge(ctx context.Context) error {
 	var doc bson.M
 	err := m.collection.FindOne(ctx, bson.D{{Key: "_id", Value: m.docID}}).Decode(&doc)
@@ -323,6 +360,27 @@ func (m *Manager) LoadAndMerge(ctx context.Context) error {
 	}
 	if val, ok := doc["initialSyncCompleted"].(bool); ok {
 		m.initialSyncCompleted.Store(val)
+	}
+	if val, ok := doc["migrationFinalized"].(bool); ok {
+		m.migrationFinalized.Store(val)
+	}
+
+	if idx, ok := doc["indexing"].(bson.M); ok {
+		if val, ok := idx["isIndexing"].(bool); ok {
+			m.isIndexing.Store(val)
+		}
+		if val, ok := idx["currentNamespace"].(string); ok {
+			m.idxCurrentNs.Store(val)
+		}
+		if val, ok := idx["completedCollections"]; ok {
+			m.idxCompletedColl.Store(parseInt64(val))
+		}
+		if val, ok := idx["totalCollections"]; ok {
+			m.idxTotalColl.Store(parseInt64(val))
+		}
+		if val, ok := idx["completed"].(bool); ok {
+			m.idxFinished.Store(val)
+		}
 	}
 
 	m.mu.Lock()
@@ -386,6 +444,14 @@ func (m *Manager) Persist(ctx context.Context) {
 	end := m.initialSyncEnd
 	m.mu.RUnlock()
 
+	idxStatus := bson.M{
+		"isIndexing":           m.isIndexing.Load(),
+		"currentNamespace":     m.idxCurrentNs.Load().(string),
+		"completedCollections": m.idxCompletedColl.Load(),
+		"totalCollections":     m.idxTotalColl.Load(),
+		"completed":            m.idxFinished.Load(),
+	}
+
 	fcStatus := bson.M{
 		"enabled":             config.Cfg.FlowControl.Enabled,
 		"isPaused":            m.fcIsPaused.Load(),
@@ -421,7 +487,9 @@ func (m *Manager) Persist(ctx context.Context) {
 			"initialSyncCompleted":  m.initialSyncCompleted.Load(),
 			"initialSyncStart":      start,
 			"initialSyncEnd":        end,
+			"migrationFinalized":    m.migrationFinalized.Load(),
 			"flowControl":           fcStatus,
+			"indexing":              idxStatus,
 			"validation":            valStats,
 			"lastSourceEventTime":   m.lastSourceEventTime.Load(),
 			"lastAppliedEventTime":  m.lastAppliedEventTime.Load(),
@@ -585,9 +653,17 @@ func (m *Manager) buildStatusOutput() StatusOutput {
 	}
 
 	output := StatusOutput{
-		OK:                        state != "error",
-		State:                     state,
-		Info:                      info,
+		OK:                 state != "error",
+		State:              state,
+		Info:               info,
+		MigrationFinalized: m.migrationFinalized.Load(),
+		Indexing: IndexProgress{
+			IsIndexing:       m.isIndexing.Load(),
+			CurrentNamespace: m.idxCurrentNs.Load().(string),
+			CompletedColls:   int(m.idxCompletedColl.Load()),
+			TotalColls:       int(m.idxTotalColl.Load()),
+			Completed:        m.idxFinished.Load(),
+		},
 		TimeSinceLastEventSeconds: idleTime,
 		CDCLagSeconds:             cdcLag,
 		TotalEventsApplied:        m.eventsApplied.Load(),

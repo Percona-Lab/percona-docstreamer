@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -357,6 +358,228 @@ var restartCmd = &cobra.Command{
 	},
 }
 
+var indexCmd = &cobra.Command{
+	Use:   "index",
+	Short: "Triggers deferred index creation",
+	Run: func(cmd *cobra.Command, args []string) {
+		pidVal, err := pid.Read()
+		if err == nil && pid.IsRunning(pidVal) {
+			// App is running. Hit the API.
+			port := config.Cfg.Migration.StatusHTTPPort
+			if port == "" {
+				port = "8080"
+			}
+			url := fmt.Sprintf("http://localhost:%s/index", port)
+			resp, err := http.Post(url, "application/json", nil)
+			if err != nil {
+				logging.PrintError(fmt.Sprintf("Failed to contact application: %v", err), 0)
+				os.Exit(1)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode == 200 {
+				logging.PrintSuccess("Index creation triggered in the background process.", 0)
+			} else {
+				body, _ := io.ReadAll(resp.Body)
+				logging.PrintError(fmt.Sprintf("Failed to trigger index: %s", string(body)), 0)
+			}
+		} else {
+			// App is stopped. Start it and trigger async.
+			logging.PrintInfo("Application is not running. Starting in background to resume CDC and index...", 0)
+			go func() {
+				// Retry connection for up to 10 seconds while it starts
+				port := config.Cfg.Migration.StatusHTTPPort
+				if port == "" {
+					port = "8080"
+				}
+				url := fmt.Sprintf("http://localhost:%s/index", port)
+				for i := 0; i < 10; i++ {
+					time.Sleep(2 * time.Second)
+					if resp, err := http.Post(url, "application/json", nil); err == nil {
+						resp.Body.Close()
+						break
+					}
+				}
+			}()
+			startAction(cmd, args)
+		}
+	},
+}
+
+var finalizeCmd = &cobra.Command{
+	Use:   "finalize",
+	Short: "Stops CDC, applies indexes, and marks migration as finished",
+	Run: func(cmd *cobra.Command, args []string) {
+		pidVal, err := pid.Read()
+		if err == nil && pid.IsRunning(pidVal) {
+			// App is running. Tell it to shut down and index.
+			port := config.Cfg.Migration.StatusHTTPPort
+			if port == "" {
+				port = "8080"
+			}
+			url := fmt.Sprintf("http://localhost:%s/finalize", port)
+			resp, err := http.Post(url, "application/json", nil)
+			if err != nil {
+				logging.PrintError(fmt.Sprintf("Failed to contact application: %v", err), 0)
+				os.Exit(1)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode == 200 {
+				logging.PrintSuccess("Finalization signal sent to background process. Check logs for progress.", 0)
+			} else {
+				body, _ := io.ReadAll(resp.Body)
+				logging.PrintError(fmt.Sprintf("Failed to trigger finalize: %s", string(body)), 0)
+			}
+		} else {
+			// App is stopped. Just index and mark as finished.
+			logging.PrintInfo("Application is not running. Running offline finalization...", 0)
+			runCmd.Flags().Set("finalize-only", "true")
+			runMigrationProcess(runCmd, args)
+		}
+	},
+}
+
+// Helper to construct connections and run indexer logic
+// func createAllDeferredIndexes(ctx context.Context, docdbURI, mongoURI string, statusMgr *status.Manager) error {
+// 	discOpts := options.Client().ApplyURI(docdbURI).SetAppName("docStreamer-Discovery-Index")
+// 	if config.Cfg.DocDB.TLS && config.Cfg.DocDB.TlsAllowInvalidHostnames {
+// 		discOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
+// 	}
+// 	discClient, err := mongo.Connect(discOpts)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	defer discClient.Disconnect(ctx)
+
+// 	targetOpts := options.Client().ApplyURI(mongoURI).SetAppName("docStreamer-Index-Target")
+// 	if config.Cfg.Mongo.TLS && config.Cfg.Mongo.TlsAllowInvalidHostnames {
+// 		targetOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
+// 	}
+// 	targetClient, err := mongo.Connect(targetOpts)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	defer targetClient.Disconnect(ctx)
+
+// 	collectionsToMigrate, err := discover.DiscoverCollections(ctx, discClient)
+// 	if err != nil {
+// 		return err
+// 	}
+
+// 	var collsWithIndexes []discover.CollectionInfo
+// 	for _, coll := range collectionsToMigrate {
+// 		if len(coll.Indexes) > 0 {
+// 			collsWithIndexes = append(collsWithIndexes, coll)
+// 		}
+// 	}
+
+// 	totalColls := len(collsWithIndexes)
+// 	statusMgr.SetIndexingProgress(true, "Preparing...", 0, totalColls, false)
+
+// 	for i, collInfo := range collsWithIndexes {
+// 		statusMgr.SetIndexingProgress(true, collInfo.Namespace, i, totalColls, false)
+
+// 		targetColl := targetClient.Database(collInfo.DB).Collection(collInfo.Coll)
+
+// 		// --- Check existing indexes on the target ---
+// 		cursor, err := targetColl.Indexes().List(ctx)
+// 		if err != nil {
+// 			logging.PrintError(fmt.Sprintf("[%s] Failed to list existing target indexes: %v", collInfo.Namespace, err), 0)
+// 			continue
+// 		}
+
+// 		var existingIndexes []bson.M
+// 		if err := cursor.All(ctx, &existingIndexes); err != nil {
+// 			logging.PrintError(fmt.Sprintf("[%s] Failed to parse existing target indexes: %v", collInfo.Namespace, err), 0)
+// 			continue
+// 		}
+
+// 		// Store existing index names in a map for quick lookup
+// 		existingNames := make(map[string]bool)
+// 		for _, idx := range existingIndexes {
+// 			if name, ok := idx["name"].(string); ok {
+// 				existingNames[name] = true
+// 			}
+// 		}
+
+// 		// Filter out indexes that already exist
+// 		var missingIndexes []discover.IndexInfo
+// 		for _, idx := range collInfo.Indexes {
+// 			if !existingNames[idx.Name] {
+// 				missingIndexes = append(missingIndexes, idx)
+// 			}
+// 		}
+
+// 		// If all indexes are already there, skip this collection entirely
+// 		if len(missingIndexes) == 0 {
+// 			logging.PrintSuccess(fmt.Sprintf("[%s] All %d indexes already exist. Skipping.", collInfo.Namespace, len(collInfo.Indexes)), 0)
+// 			continue
+// 		}
+
+// 		logging.PrintStep(fmt.Sprintf("[%s] Building %d missing indexes (out of %d total)...", collInfo.Namespace, len(missingIndexes), len(collInfo.Indexes)), 0)
+
+// 		if err := indexer.FinalizeIndexes(ctx, targetColl, missingIndexes, collInfo.Namespace); err != nil {
+// 			logging.PrintError(fmt.Sprintf("[%s] Failed to finalize indexes: %v", collInfo.Namespace, err), 0)
+// 		} else {
+// 			logging.PrintSuccess(fmt.Sprintf("[%s] Indexes finalized.", collInfo.Namespace), 0)
+// 		}
+// 	}
+
+// 	statusMgr.SetIndexingProgress(false, "Done", totalColls, totalColls, true)
+// 	return nil
+// }
+
+// Helper to construct connections and run indexer logic
+func createAllDeferredIndexes(ctx context.Context, docdbURI, mongoURI string, statusMgr *status.Manager) error {
+	discOpts := options.Client().ApplyURI(docdbURI).SetAppName("docStreamer-Discovery-Index")
+	if config.Cfg.DocDB.TLS && config.Cfg.DocDB.TlsAllowInvalidHostnames {
+		discOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
+	}
+	discClient, err := mongo.Connect(discOpts)
+	if err != nil {
+		return err
+	}
+	defer discClient.Disconnect(ctx)
+
+	targetOpts := options.Client().ApplyURI(mongoURI).SetAppName("docStreamer-Index-Target")
+	if config.Cfg.Mongo.TLS && config.Cfg.Mongo.TlsAllowInvalidHostnames {
+		targetOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
+	}
+	targetClient, err := mongo.Connect(targetOpts)
+	if err != nil {
+		return err
+	}
+	defer targetClient.Disconnect(ctx)
+
+	collectionsToMigrate, err := discover.DiscoverCollections(ctx, discClient)
+	if err != nil {
+		return err
+	}
+
+	var collsWithIndexes []discover.CollectionInfo
+	for _, coll := range collectionsToMigrate {
+		if len(coll.Indexes) > 0 {
+			collsWithIndexes = append(collsWithIndexes, coll)
+		}
+	}
+
+	totalColls := len(collsWithIndexes)
+	statusMgr.SetIndexingProgress(true, "Preparing...", 0, totalColls, false)
+
+	for i, collInfo := range collsWithIndexes {
+		statusMgr.SetIndexingProgress(true, collInfo.Namespace, i, totalColls, false)
+		targetColl := targetClient.Database(collInfo.DB).Collection(collInfo.Coll)
+
+		logging.PrintStep(fmt.Sprintf("[%s] Checking %d source indexes...", collInfo.Namespace, len(collInfo.Indexes)), 0)
+
+		if err := indexer.FinalizeIndexes(ctx, targetColl, collInfo.Indexes, collInfo.Namespace); err != nil {
+			logging.PrintError(fmt.Sprintf("[%s] Failed to finalize indexes: %v", collInfo.Namespace, err), 0)
+		}
+	}
+
+	statusMgr.SetIndexingProgress(false, "Done", totalColls, totalColls, true)
+	return nil
+}
+
 func monitorStartup(logPath string, offset int64, pidVal int, port string, exitChan chan struct{}) {
 	if port == "" {
 		port = "8080"
@@ -487,6 +710,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	var triggerFinalize atomic.Bool
 	var statusManager *status.Manager
 	var apiServer *api.Server
 
@@ -565,6 +789,8 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	docdbURI := config.Cfg.BuildDocDBURI(docdbUser, docdbPass)
 	mongoURI := config.Cfg.BuildMongoURI(mongoUser, mongoPass)
 
+	finalizeOnly, _ := cmd.Flags().GetBool("finalize-only")
+
 	metaOpts := options.Client().ApplyURI(mongoURI).SetAppName("docStreamer-Metadata")
 	if config.Cfg.Mongo.TLS && config.Cfg.Mongo.TlsAllowInvalidHostnames {
 		metaOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
@@ -639,6 +865,28 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		logging.PrintInfo(fmt.Sprintf("Status load skipped: %v", err), 0)
 	}
 
+	if statusManager.IsMigrationFinalized() {
+		logging.PrintWarning("Migration has already been finalized. Please start a new migration if needed.", 0)
+		return
+	}
+
+	if finalizeOnly {
+		if !statusManager.IsCloneCompleted() {
+			logging.PrintError("Cannot finalize: Full Load is not complete.", 0)
+			os.Exit(1)
+		}
+		logging.PrintPhase("FINALIZE", "Creating deferred indexes...")
+		if err := createAllDeferredIndexes(context.Background(), docdbURI, mongoURI, statusManager); err != nil {
+			logging.PrintError(fmt.Sprintf("Index creation failed: %v", err), 0)
+			os.Exit(1)
+		}
+		statusManager.SetMigrationFinalized()
+		statusManager.SetState("completed", "Migration Finalized")
+		statusManager.Persist(context.Background())
+		logging.PrintSuccess("Migration Finalized successfully.", 0)
+		return
+	}
+
 	flowManager := flow.NewManager(targetClient, statusManager, mongoUser, mongoPass)
 	flowManager.Start()
 	defer flowManager.Stop()
@@ -683,6 +931,36 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	apiServer.RegisterRoute("/validate/failures", validationManager.HandleGetFailures)
 	apiServer.RegisterRoute("/validate/queue", validationManager.HandleGetQueueStatus)
 	apiServer.RegisterRoute("/scan", validationManager.HandleScan)
+
+	apiServer.RegisterRoute("/index", func(w http.ResponseWriter, r *http.Request) {
+		if !statusManager.IsCloneCompleted() {
+			http.Error(w, "Full sync is not complete", http.StatusBadRequest)
+			return
+		}
+		go func() {
+			logging.PrintPhase("INDEX", "Starting deferred index creation (CDC running in background)...")
+			if err := createAllDeferredIndexes(context.Background(), docdbURI, mongoURI, statusManager); err != nil {
+				logging.PrintError(fmt.Sprintf("Deferred index creation failed: %v", err), 0)
+			} else {
+				logging.PrintSuccess("Deferred index creation complete.", 0)
+			}
+		}()
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status": "indexing started in the background"}`))
+	})
+
+	apiServer.RegisterRoute("/finalize", func(w http.ResponseWriter, r *http.Request) {
+		if !statusManager.IsCloneCompleted() {
+			http.Error(w, "Full sync is not complete", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status": "finalization started"}`))
+
+		logging.PrintPhase("FINALIZE", "Stopping CDC to begin finalization...")
+		triggerFinalize.Store(true) // Flip the switch to trigger finalization
+		cancel()                    // Tell CDC to stop safely
+	})
 
 	apiServer.Start()
 
@@ -751,6 +1029,8 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 			var toRun []discover.CollectionInfo
 			for _, coll := range collectionsToMigrate {
 				if completedColls[coll.Namespace] {
+					logging.PrintInfo(fmt.Sprintf("[%s] Full load already complete. Skipping data copy (will resume during CDC).", coll.Namespace), 0)
+
 					statusManager.AddEstimatedBytes(coll.Size)
 					statusManager.AddEstimatedDocs(coll.Count)
 					statusManager.AddClonedBytes(coll.Size)
@@ -860,7 +1140,21 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	)
 
 	cdcManager.Start(ctx)
-	logging.PrintInfo("CDC process stopped. Exiting.", 0)
+	logging.PrintInfo("CDC process stopped.", 0)
+
+	if triggerFinalize.Load() {
+		logging.PrintPhase("FINALIZE", "CDC safely drained. Creating deferred indexes...")
+		if err := createAllDeferredIndexes(context.Background(), docdbURI, mongoURI, statusManager); err != nil {
+			logging.PrintError(fmt.Sprintf("Index creation failed: %v", err), 0)
+		} else {
+			statusManager.SetMigrationFinalized()
+			statusManager.SetState("completed", "Migration Finalized")
+			statusManager.Persist(context.Background())
+			logging.PrintSuccess("Migration Finalized successfully.", 0)
+		}
+	}
+
+	logging.PrintInfo("Migration process stopped. Exiting.", 0)
 }
 
 func extractDBNames(collections []discover.CollectionInfo) []string {
@@ -885,11 +1179,28 @@ func launchFullLoadWorkers(ctx context.Context, source, target *mongo.Client, co
 	logging.PrintPhase("4a", "FULL LOAD: PREPARATION")
 	indexer.StopBalancer(ctx, target)
 
-	for _, cm := range copiers {
+	// START TRACKING UPFRONT INDEXING
+	if !config.Cfg.Cloner.PostponeIndexCreation {
+		statusMgr.SetIndexingProgress(true, "Preparing...", 0, len(collections), false)
+	} else {
+		// Clearly mark it as postponed
+		statusMgr.SetIndexingProgress(false, "Postponed", 0, len(collections), false)
+	}
+
+	for i, cm := range copiers {
 		if ctx.Err() != nil {
 			return bson.Timestamp{}, ctx.Err()
 		}
+		// Report progress per collection if we are creating indexes now
+		if !config.Cfg.Cloner.PostponeIndexCreation {
+			statusMgr.SetIndexingProgress(true, cm.CollInfo.Namespace, i, len(collections), false)
+		}
 		cm.Prepare(ctx)
+	}
+
+	// MARK AS COMPLETE
+	if !config.Cfg.Cloner.PostponeIndexCreation {
+		statusMgr.SetIndexingProgress(false, "Done", len(collections), len(collections), true)
 	}
 
 	logging.PrintStep("Preparation complete. Restarting MongoDB Balancer...", 0)
@@ -974,6 +1285,9 @@ func init() {
 	rootCmd.AddCommand(stopCmd)
 	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(runCmd)
+	rootCmd.AddCommand(indexCmd)
+	rootCmd.AddCommand(finalizeCmd)
+	runCmd.Flags().Bool("finalize-only", false, "")
 }
 
 func main() {

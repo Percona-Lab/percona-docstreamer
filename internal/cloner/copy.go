@@ -243,7 +243,7 @@ func (cm *CopyManager) Prepare(ctx context.Context) error {
 	var indexModels []mongo.IndexModel
 
 	if config.Cfg.Cloner.PostponeIndexCreation {
-		logging.PrintInfo(fmt.Sprintf("[%s] Index creation POSTPONED until after full load (Sharding/ID indexes will still be created).", ns), 0)
+		logging.PrintInfo(fmt.Sprintf("[%s] Index creation POSTPONED, only shard key and _id default indexes will be created.", ns), 0)
 		// Pass empty list. applySharding (inside the function below) will still create the required Shard Key index.
 		indexModels = []mongo.IndexModel{}
 	} else {
@@ -321,8 +321,12 @@ func (cm *CopyManager) Run(ctx context.Context) (int64, bson.Timestamp, error) {
 		cm.checkpointMgr.SaveCollectionCheckpoint(ctx, ns, cm.initialTS)
 	}
 
-	if err := indexer.FinalizeIndexes(ctx, targetColl, cm.CollInfo.Indexes, ns); err != nil {
-		logging.PrintError(fmt.Sprintf("[%s] Index finalization failed: %v", ns, err), 3)
+	if config.Cfg.Cloner.PostponeIndexCreation {
+		logging.PrintInfo(fmt.Sprintf("[%s] Index finalization POSTPONED. Run 'docStreamer index' or 'docStreamer finalize' to apply.", ns), 3)
+	} else {
+		if err := indexer.FinalizeIndexes(ctx, targetColl, cm.CollInfo.Indexes, ns); err != nil {
+			logging.PrintError(fmt.Sprintf("[%s] Index finalization failed: %v", ns, err), 3)
+		}
 	}
 
 	return docsWritten, cm.initialTS, nil
