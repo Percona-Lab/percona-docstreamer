@@ -29,6 +29,35 @@ curl -X GET http://localhost:8080/status
 - `cdcLagSeconds`: Delay between the source event time and the applied time on the target.  
 - `initialSync.cloneCompleted`: `true` if the initial data load is finished.  
 
+### 1.2. Trigger Deferred Index Creation
+
+Triggers the background creation of any secondary indexes that were deferred during the Full Load phase (`postpone_index_creation: true`). This runs asynchronously, allowing the CDC stream to continue operating without interruption.
+
+| Detail | Value |
+|--------|--------|
+| Path | `/index` |
+| Method | `POST` |
+| Mandatory Prerequisite | Full Load (Clone) must be completed. |
+
+**Example**
+```bash
+curl -X POST http://localhost:8080/index
+```
+
+### 1.3. Finalize Migration
+
+Initiates a graceful shutdown of the CDC stream. It waits for the stream to safely drain all in-flight operations, builds any deferred secondary indexes, and permanently marks the migration as "Finalized" in the metadata.
+
+| Detail | Value |
+|--------|--------|
+| Path | `/finalize` |
+| Method | `POST` |
+| Mandatory Prerequisite | Full Load (Clone) must be completed. |
+
+**Example**
+```bash
+curl -X POST http://localhost:8080/finalize
+```
 
 ## 2. Validation Endpoints
 
@@ -176,6 +205,8 @@ The `/status` endpoint now provides granular metrics for CDC operations and the 
     - `currentQueuedOps`: The highest global lock queue depth detected across the cluster.
 - `insertedDocs` / `updatedDocs` / `deletedDocs`: Individual counters for each operation type applied during CDC.
 - `validation.pendingMismatches`: The real-time count of document IDs currently flagged as out of sync.
+- `migrationFinalized`: `true` if the migration has been successfully finalized.
+- `indexing`: An object tracking the live progress of index creation (`isIndexing`, `currentNamespace`, `completedCollections`, `totalCollections`, `completed`).
 
 ---
 

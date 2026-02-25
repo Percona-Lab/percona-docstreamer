@@ -133,43 +133,6 @@ func CreateCollectionAndPreloadIndexes(ctx context.Context, targetDB *mongo.Data
 	return targetColl, nil
 }
 
-// func FinalizeIndexes(ctx context.Context, targetColl *mongo.Collection, indexes []discover.IndexInfo, ns string) error {
-// 	cursor, err := targetColl.Indexes().List(ctx)
-// 	if err != nil {
-// 		return nil
-// 	}
-
-// 	existing := make(map[string]bool)
-// 	for cursor.Next(ctx) {
-// 		var idx bson.M
-// 		if err := cursor.Decode(&idx); err == nil {
-// 			if name, ok := idx["name"].(string); ok {
-// 				existing[name] = true
-// 			}
-// 		}
-// 	}
-
-// 	var missing []mongo.IndexModel
-// 	for _, idx := range indexes {
-// 		if !existing[idx.Name] {
-// 			missing = append(missing, mongo.IndexModel{
-// 				Keys:    idx.Key,
-// 				Options: options.Index().SetName(idx.Name).SetUnique(idx.Unique),
-// 			})
-// 		}
-// 	}
-
-// 	if len(missing) > 0 {
-// 		logging.PrintInfo(fmt.Sprintf("[%s] Finalizing %d missing indexes...", ns, len(missing)), 0)
-// 		_, err := targetColl.Indexes().CreateMany(ctx, missing)
-// 		if err != nil {
-// 			logging.PrintError(fmt.Sprintf("[%s] Failed to create final indexes: %v", ns, err), 0)
-// 			return err
-// 		}
-// 	}
-// 	return nil
-// }
-
 func FinalizeIndexes(ctx context.Context, targetColl *mongo.Collection, indexes []discover.IndexInfo, ns string) error {
 	cursor, err := targetColl.Indexes().List(ctx)
 	if err != nil {

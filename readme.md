@@ -240,20 +240,26 @@ Credentials for the source and target databases are required. They can be provid
 docStreamer is a tool for performing a full load and continuous data
 capture (CDC) migration from AWS DocumentDB to MongoDB.
 
+docStreamer 1
+
 Usage:
   docStreamer [command]
 
 Available Commands:
+  finalize    Stops CDC, applies indexes, and marks migration as finished
   help        Help about any command
+  index       Triggers deferred index creation
   restart     Restarts the application
   start       Starts the full load and CDC migration
   status      Checks and prints the current status of the migration
   stop        Finds the running application and stops it
 
 Flags:
+      --debug               Enable debug logging
       --docdb-user string   Source DocumentDB Username
   -h, --help                help for docStreamer
       --mongo-user string   Target MongoDB Username
+  -v, --version             version for docStreamer
 
 Use "docStreamer [command] --help" for more information about a command.
 ```
@@ -421,7 +427,9 @@ cloner:
   # All other secondary indexes are created AFTER the full load completes.
   postpone_index_creation: true 
 ```
-* **How it works**: When enabled, docStreamer creates the collection and only essential indexes (like the shard key) initially. Once the "Cloner" phase completes for a collection, the "Finalizer" identifies any missing indexes and creates them in the background before switching to CDC mode.
+
+* **Index Postponement**: If `cloner.postpone_index_creation` is enabled, only the `_id` and shard key indexes are created initially.
+* **On-Demand Finalization**: The remaining secondary indexes are not built automatically. You must explicitly trigger their creation by running `./docStreamer index` (which builds them in the background while CDC continues) or `./docStreamer finalize` (which stops CDC and finishes the migration). The application smartly compares the target against the source to ensure only missing indexes are created.
 
 #### Supported Index Types
 docStreamer automatically migrates most standard MongoDB index types, including Single Field, Compound, Multikey, and Geospatial indexes. However, some types require manual intervention:
@@ -603,6 +611,22 @@ You can use this command when you need to apply configuration changes and then r
 
 ```bash
 ./docStreamer restart
+```
+
+### Index
+
+If you configured the application to postpone index creation (`cloner.postpone_index_creation: true`), you can use this command to build the deferred secondary indexes while the continuous sync (CDC) is actively running in the background.
+
+```bash
+./docStreamer index
+```
+
+### Finalize
+
+This command is used when you are ready to cut over to your new environment. It performs a graceful shutdown of the CDC stream (waiting for any in-flight operations to safely drain), triggers the creation of any deferred secondary indexes, and marks the migration state as "Migration Finalized" so the application doesn't accidentally restart later. Please note that migrations that have been finalized can not be resumed and must start all over from scratch. Make sure you only finalize when you are ready to cutover.
+
+```bash
+./docStreamer finalize
 ```
 
 ### Status

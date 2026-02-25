@@ -66,8 +66,8 @@ This phase starts immediately after the Full Load completes (or on startup if a 
 
 docStreamer allows you to prioritize write speed during the Full Load phase by deferring secondary index creation.
 
-* **Index Postponement**: If `cloner.postpone_index_creation` is enabled, only the `_id` and shard key indexes are created initially.
-* **Finalization Phase**: Once a collection's data copy is complete, the "Finalizer" runs. It compares the source indexes with the target, identifies missing secondary indexes, and creates them in the background before the collection transitions to CDC mode.
+* **Index Postponement**: If `cloner.postpone_index_creation` is enabled, only the `_id` and shard key indexes are created initially. This dramatically increases the write throughput of the Full Load workers.
+* **Finalization Phase**: Secondary indexes are built on-demand. When the user issues the `docStreamer index` or `docStreamer finalize` command, the application queries the target collection, compares its indexes to the source collection, identifies any missing secondary indexes, and explicitly creates them.
 
 ### 5. Continuous Data Validation
 
