@@ -185,18 +185,18 @@ flow_control:
 
   # Pause Duration: How long (in milliseconds) to sleep when an overload is detected.
   # The application will re-check the status after this duration.
-  # Default: 500
-  pause_duration_ms: 500
+  # Default: 5000
+  pause_duration_ms: 5000
 
   # The maximum acceptable latency (in milliseconds) for a 'serverStatus' command 
   # on the target MongoDB. If the target takes longer than this to respond, 
   # docStreamer will pause CDC and Full Load writes to allow the database to recover.
+  # This is typically a good indicator of a stressed backend server, since this command should not take this long to return a response
   # Default: 250
   latency_threshold_ms: 250
 
   # active_client_threshold: The maximum number of concurrent active clients allowed on the target MongoDB 
   # before throttling occurs. This helps prevent connection storms and CPU saturation during heavy loads.
-  #
   # TUNING GUIDANCE:
   # This value acts as the "Speed Limit" for the migration. It measures the TOTAL active clients on the target DB,
   # which includes:

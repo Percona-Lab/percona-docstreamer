@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -23,6 +24,7 @@ type Manager struct {
 	monitoredClients []*mongo.Client
 	nodeNames        map[*mongo.Client]string
 	isPaused         atomic.Bool
+	emergencyPaused  atomic.Bool
 	stopChan         chan struct{}
 	statusMgr        *status.Manager
 	user             string
@@ -71,40 +73,69 @@ func (m *Manager) Stop() {
 }
 
 func (m *Manager) Wait() {
-	if !config.Cfg.FlowControl.Enabled {
+	if !config.Cfg.FlowControl.Enabled && !m.emergencyPaused.Load() {
 		return
 	}
-	for m.isPaused.Load() {
+	for m.isPaused.Load() || m.emergencyPaused.Load() {
 		time.Sleep(100 * time.Millisecond)
 	}
 }
 
 func (m *Manager) WaitIfPaused() {
-	if !config.Cfg.FlowControl.Enabled {
+	if !config.Cfg.FlowControl.Enabled && !m.emergencyPaused.Load() {
 		return
 	}
 
-	// 1. Fast Path: If not paused, return immediately (zero allocation)
-	if !m.isPaused.Load() {
+	// 1. Fast Path: If not paused natively AND not paused manually, return immediately
+	if !m.isPaused.Load() && !m.emergencyPaused.Load() {
 		return
 	}
 
 	// 2. Slow Path: We are paused.
-	// Log the event once so we know why the reader stopped.
-	logging.PrintInfo("[CDC] Reader paused due to Flow Control (Target Overload)...", 0)
+	if m.emergencyPaused.Load() {
+		logging.PrintInfo("[FlowControl] Data reader paused (User Emergency Pause)...", 0)
+	} else {
+		logging.PrintInfo("[FlowControl] Data reader paused due to Flow Control (Target Overload)...", 0)
+	}
 
-	// Use a ticker to check the state periodically.
-	// We check every 500ms because the monitor updates the state every 1000ms.
-	// This balances responsiveness with CPU usage.
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
-	for m.isPaused.Load() {
+	for m.isPaused.Load() || m.emergencyPaused.Load() {
 		<-ticker.C
 	}
 
 	// 3. Resumed
-	logging.PrintInfo("[CDC] Reader resumed. Target is healthy.", 0)
+	logging.PrintInfo("[FlowControl] Data reader resumed.", 0)
+}
+
+func (m *Manager) HandlePause(w http.ResponseWriter, r *http.Request) {
+	m.emergencyPaused.Store(true)
+	if m.statusMgr != nil {
+		m.statusMgr.SetState("paused", "Paused manually by user")
+		m.statusMgr.Persist(context.Background())
+	}
+	logging.PrintWarning("[FlowControl] EMERGENCY PAUSE initiated by user.", 0)
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status": "paused"}`))
+}
+
+func (m *Manager) HandleResume(w http.ResponseWriter, r *http.Request) {
+	m.emergencyPaused.Store(false)
+	if m.statusMgr != nil {
+		// Restore state gracefully based on current migration phase
+		if m.statusMgr.IsMigrationFinalized() {
+			m.statusMgr.SetState("completed", "Migration Finalized")
+		} else if m.statusMgr.IsCloneCompleted() {
+			m.statusMgr.SetState("running", "Change Data Capture")
+		} else {
+			m.statusMgr.SetState("running", "Initial Sync")
+		}
+		m.statusMgr.Persist(context.Background())
+	}
+	logging.PrintInfo("[FlowControl] EMERGENCY RESUME initiated by user.", 0)
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status": "resumed"}`))
 }
 
 // GetStatus returns the current state.
@@ -445,7 +476,8 @@ func (m *Manager) checkHealth() {
 		if !m.isPaused.Load() {
 			logging.PrintWarning(fmt.Sprintf("[FlowControl] THROTTLING PAUSED: %s", reason), 0)
 			m.isPaused.Store(true)
-			if m.statusMgr != nil {
+			// Only overwrite status if user hasn't manually paused
+			if m.statusMgr != nil && !m.emergencyPaused.Load() {
 				m.statusMgr.SetState("throttled", fmt.Sprintf("Flow Control Active: %s", reason))
 			}
 		}
@@ -454,7 +486,8 @@ func (m *Manager) checkHealth() {
 		if m.isPaused.Load() {
 			logging.PrintInfo("[FlowControl] Throttling released. Cluster healthy.", 0)
 			m.isPaused.Store(false)
-			if m.statusMgr != nil {
+			// Only update status back to running if user hasn't manually paused
+			if m.statusMgr != nil && !m.emergencyPaused.Load() {
 				if m.statusMgr.IsMigrationFinalized() {
 					m.statusMgr.SetState("completed", "Migration Finalized")
 				} else if m.statusMgr.IsCloneCompleted() {

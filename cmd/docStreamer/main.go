@@ -438,6 +438,64 @@ var finalizeCmd = &cobra.Command{
 	},
 }
 
+var pauseCmd = &cobra.Command{
+	Use:   "pause",
+	Short: "Ad-hoc emergency pause of the migration process",
+	Run: func(cmd *cobra.Command, args []string) {
+		pidVal, err := pid.Read()
+		if err == nil && pid.IsRunning(pidVal) {
+			port := config.Cfg.Migration.StatusHTTPPort
+			if port == "" {
+				port = "8080"
+			}
+			url := fmt.Sprintf("http://localhost:%s/pause", port)
+			resp, err := http.Post(url, "application/json", nil)
+			if err != nil {
+				logging.PrintError(fmt.Sprintf("Failed to contact application: %v", err), 0)
+				os.Exit(1)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode == 200 {
+				logging.PrintSuccess("Emergency pause initiated. Data flow is stopped.", 0)
+			} else {
+				body, _ := io.ReadAll(resp.Body)
+				logging.PrintError(fmt.Sprintf("Failed to pause: %s", string(body)), 0)
+			}
+		} else {
+			logging.PrintError("Application is not running.", 0)
+		}
+	},
+}
+
+var resumeCmd = &cobra.Command{
+	Use:   "resume",
+	Short: "Resumes the migration process from an emergency pause",
+	Run: func(cmd *cobra.Command, args []string) {
+		pidVal, err := pid.Read()
+		if err == nil && pid.IsRunning(pidVal) {
+			port := config.Cfg.Migration.StatusHTTPPort
+			if port == "" {
+				port = "8080"
+			}
+			url := fmt.Sprintf("http://localhost:%s/resume", port)
+			resp, err := http.Post(url, "application/json", nil)
+			if err != nil {
+				logging.PrintError(fmt.Sprintf("Failed to contact application: %v", err), 0)
+				os.Exit(1)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode == 200 {
+				logging.PrintSuccess("Emergency resume initiated. Data flow is resuming.", 0)
+			} else {
+				body, _ := io.ReadAll(resp.Body)
+				logging.PrintError(fmt.Sprintf("Failed to resume: %s", string(body)), 0)
+			}
+		} else {
+			logging.PrintError("Application is not running.", 0)
+		}
+	},
+}
+
 // Helper to construct connections and run indexer logic
 func createAllDeferredIndexes(ctx context.Context, docdbURI, mongoURI string, statusMgr *status.Manager) error {
 	discOpts := options.Client().ApplyURI(docdbURI).SetAppName("docStreamer-Discovery-Index")
@@ -841,7 +899,8 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	apiServer.RegisterRoute("/validate/failures", validationManager.HandleGetFailures)
 	apiServer.RegisterRoute("/validate/queue", validationManager.HandleGetQueueStatus)
 	apiServer.RegisterRoute("/scan", validationManager.HandleScan)
-
+	apiServer.RegisterRoute("/pause", flowManager.HandlePause)
+	apiServer.RegisterRoute("/resume", flowManager.HandleResume)
 	apiServer.RegisterRoute("/index", func(w http.ResponseWriter, r *http.Request) {
 		if !statusManager.IsCloneCompleted() {
 			http.Error(w, "Full sync is not complete", http.StatusBadRequest)
@@ -1197,6 +1256,8 @@ func init() {
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(indexCmd)
 	rootCmd.AddCommand(finalizeCmd)
+	rootCmd.AddCommand(pauseCmd)
+	rootCmd.AddCommand(resumeCmd)
 	runCmd.Flags().Bool("finalize-only", false, "")
 }
 

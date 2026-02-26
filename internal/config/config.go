@@ -231,7 +231,7 @@ func LoadConfig() {
 	viper.SetDefault("flow_control.enabled", true)
 	viper.SetDefault("flow_control.check_interval_ms", 1000)
 	viper.SetDefault("flow_control.target_max_queued_ops", 50)
-	viper.SetDefault("flow_control.pause_duration_ms", 500)
+	viper.SetDefault("flow_control.pause_duration_ms", 5000)
 	viper.SetDefault("flow_control.latency_threshold_ms", 250)
 	viper.SetDefault("flow_control.active_client_threshold", 20)
 	viper.SetDefault("flow_control.min_wired_tiger_tickets", 0) // 0 disables it

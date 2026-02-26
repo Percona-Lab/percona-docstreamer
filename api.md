@@ -59,6 +59,48 @@ Initiates a graceful shutdown of the CDC stream. It waits for the stream to safe
 curl -X POST http://localhost:8080/finalize
 ```
 
+### 1.4. Emergency Pause (FlowControl)
+
+Manually triggers the flow control mechanism to safely pause data extraction. The pipeline will finish writing any in-flight batches and then idle.
+
+| Detail | Value |
+| :--- | :--- |
+| Path | `/pause` |
+| Method | `POST` |
+
+**Example:**
+```bash
+curl -X POST http://localhost:8080/pause
+```
+
+**Example Response:**
+```json
+{
+    "status": "paused"
+}
+```
+
+### 1.5. Emergency Resume (FlowControl)
+
+Releases the manual flow control pause, allowing the data reader to wake up and resume the migration pipeline exactly where it left off.
+
+| Detail | Value |
+| :--- | :--- |
+| Path | `/resume` |
+| Method | `POST` |
+
+**Example:**
+```bash
+curl -X POST http://localhost:8080/resume
+```
+
+**Example Response:**
+```json
+{
+    "status": "resumed"
+}
+```
+
 ## 2. Validation Endpoints
 
 Endpoints for managing the data consistency check process.

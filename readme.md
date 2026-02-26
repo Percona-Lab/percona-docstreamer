@@ -1054,7 +1054,6 @@ Even with Flow Control enabled, we recommend tuning concurrency to prevent "burs
 
 1.  **Enable Flow Control (Critical):**
     * Set `flow_control.enabled: true`.
-    * Set `flow_control.target_max_resident_mb` to a safe limit for your shard nodes (e.g., if shards have 16GB RAM, set this to `14000`).
 
 2.  **Throttle Write Workers:**
     * High concurrency can flood the shards with connections before Flow Control kicks in.
@@ -1073,11 +1072,38 @@ In addition to monitoring lock queues, the Adaptive Flow Control mechanism uses 
 | Setting | Default | Description |
 | :--- | :--- | :--- |
 | `check_interval_ms` | `1000` | How often (in milliseconds) the background monitor polls the target database status. |
-| `pause_duration_ms` | `500` | The duration docStreamer sleeps when a throttling threshold is breached before re-checking. |
+| `pause_duration_ms` | `5000` | The duration docStreamer sleeps when a throttling threshold is breached before re-checking. |
 | `latency_threshold_ms` | `250` | The maximum acceptable latency for a `serverStatus` command. If exceeded, the system pauses to allow the target to recover. |
 | `active_client_threshold` | `50` | The maximum number of total concurrent active clients allowed on the target before throttling occurs. |
 | `min_wired_tiger_tickets` | `0` | The minimum number of available WiredTiger write tickets required. If it drops below this value, the system pauses. Set to `0` to disable. |
 
+#### Ad-Hoc Emergency Flow Control (Pause / Resume)
+
+If you need to temporarily pause the migration process (e.g., during an emergency, a database maintenance window, or to run a heavy workload on the target), you can manually engage docStreamer's flow control mechanism. 
+
+Unlike stopping the application (which would cause a Full Load to start completely over), the emergency pause safely and gracefully pauses the data pipeline:
+1. **The Reader Stops:** docStreamer immediately stops pulling new data from the source DocumentDB.
+2. **In-Flight Batches Drain:** Any data batches that have already been read are processed and written to the target MongoDB.
+3. **Workers Go Idle:** Once the in-flight batches are finished, the writer threads go idle. Memory usage stays flat, and no new connections or operations are sent to the target.
+
+You can trigger this behavior on the fly, without restarting the application, using the CLI:
+
+**To Pause:**
+```bash
+docStreamer pause
+```
+
+The application will print `[FlowControl] Data reader paused (User Emergency Pause)...` to the logs.
+
+**To Resume:**
+
+```bash
+docStreamer resume
+```
+
+The application will print `[FlowControl] Data reader resumed` to the logs and immediately pick up exactly where it left off.
+
+Note: This feature is safe to use during both the Full Sync and Continuous Sync (CDC) phases.
 
 ### Validation Optimization
 
@@ -1088,12 +1114,11 @@ The data validation engine is highly configurable to balance performance impact 
 | `enabled` | `true` | Master switch for the validation engine. If false, final document verification after CDC writes are skipped. CDC is guaranteed to sync the documents; this is an optional additional validation check. |
 | `batch_size` | `100` | Network vs. Memory Trade-off. Controls how many document IDs are bundled into a single database lookup. Larger batches reduce network round-trips but increase memory usage. |
 | `max_validation_workers` | `4` | Concurrency Control. The number of parallel worker threads fetching and comparing documents. Increase this if you have spare CPU/Network capacity and notice validation lagging behind CDC. |
-| `queue_size` | `2000` | Buffer Capacity. The size of the channel buffering CDC events before validation. If the CDC writer is faster than the validator and this buffer fills up, validation requests will be dropped to prevent slowing down the replication stream. |
+| `queue_size` | `2000` | Buffer Capacity. The size of the channel buffering CDC events before validation. If the CDC writer is faster than the validator and this buffer fills up, validation requests will be queued and this could cause slowing down the replication stream. |
 | `retry_interval_ms` | `500` | Hot Key Handling. If a record fails validation because it is actively being modified (detected via dirty tracking), the validator waits this long before re-checking it. |
 | `max_retries` | `3` | Persistence. How many times to retry a "Hot Key" before giving up. After this many attempts, the record is marked as a mismatch/skipped to move on. |
 | `hot_key_check_interval_minutes` | `5` | The maximum time a "Hot Key" (a record failing validation due to active writes) stays in the queue before a re-check is forced. |
 | `idle_check_interval_seconds` | `5` | How often the system checks if CDC is "Idle." If idle for this duration, the system ignores the timer above and immediately re-checks all pending keys. |
-
 
 
 ## 7. Additional Documentation
