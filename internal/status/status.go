@@ -17,9 +17,10 @@ import (
 )
 
 type StatusOutput struct {
-	OK    bool   `json:"ok"`
-	State string `json:"state"`
-	Info  string `json:"info"`
+	Version string `json:"version"`
+	OK      bool   `json:"ok"`
+	State   string `json:"state"`
+	Info    string `json:"info"`
 
 	MigrationFinalized bool          `json:"migrationFinalized"`
 	Indexing           IndexProgress `json:"indexing,omitempty"`
@@ -98,6 +99,7 @@ type Manager struct {
 	docID            string
 	state            string
 	info             string
+	appVersion       string
 	mu               sync.RWMutex
 	startTime        time.Time
 	initialSyncStart time.Time
@@ -151,7 +153,7 @@ type Manager struct {
 	valQueueSize     atomic.Int64
 }
 
-func NewManager(client *mongo.Client, isSource bool) *Manager {
+func NewManager(client *mongo.Client, isSource bool, version string) *Manager {
 	dbName := config.Cfg.Migration.MetadataDB
 	collName := config.Cfg.Migration.StatusCollection
 	docID := config.Cfg.Migration.StatusDocID
@@ -161,6 +163,7 @@ func NewManager(client *mongo.Client, isSource bool) *Manager {
 		collection: client.Database(dbName).Collection(collName),
 		docID:      docID,
 		state:      "initializing",
+		appVersion: version,
 		startTime:  time.Now().UTC(),
 	}
 	m.fcReason.Store("")
@@ -653,6 +656,7 @@ func (m *Manager) buildStatusOutput() StatusOutput {
 	}
 
 	output := StatusOutput{
+		Version:            m.appVersion,
 		OK:                 state != "error",
 		State:              state,
 		Info:               info,

@@ -43,7 +43,7 @@ import (
 	"github.com/Percona-Lab/percona-docstreamer/internal/validator"
 )
 
-var version = "1"
+var version = "dev"
 
 func getPassword(prompt string) (string, error) {
 	fmt.Print(prompt)
@@ -827,7 +827,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	}
 
 	tracker := validator.NewInFlightTracker()
-	statusManager = status.NewManager(targetClient, false)
+	statusManager = status.NewManager(targetClient, false, version)
 
 	if err := statusManager.LoadAndMerge(ctx); err != nil {
 		logging.PrintInfo(fmt.Sprintf("Status load skipped: %v", err), 0)
