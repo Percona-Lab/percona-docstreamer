@@ -324,7 +324,9 @@ func (cm *CopyManager) Run(ctx context.Context) (int64, bson.Timestamp, error) {
 	if config.Cfg.Cloner.PostponeIndexCreation {
 		logging.PrintInfo(fmt.Sprintf("[%s] Index finalization POSTPONED. Run 'docStreamer index' or 'docStreamer finalize' to apply.", ns), 3)
 	} else {
-		if err := indexer.FinalizeIndexes(ctx, targetColl, cm.CollInfo.Indexes, ns); err != nil {
+		// Pass FALSE here because this is the Full Load phase.
+		// We do not want TTL indexes created until CDC is stopped via 'finalize'.
+		if err := indexer.FinalizeIndexes(ctx, targetColl, cm.CollInfo.Indexes, ns, false); err != nil {
 			logging.PrintError(fmt.Sprintf("[%s] Index finalization failed: %v", ns, err), 3)
 		}
 	}

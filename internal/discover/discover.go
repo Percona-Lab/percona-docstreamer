@@ -14,9 +14,10 @@ import (
 
 // IndexInfo holds information about a single index
 type IndexInfo struct {
-	Name   string
-	Key    bson.D
-	Unique bool
+	Name               string
+	Key                bson.D
+	Unique             bool
+	ExpireAfterSeconds *int32 `bson:"expireAfterSeconds,omitempty"`
 }
 
 // CollectionInfo holds metadata about a collection to be migrated
@@ -293,9 +294,9 @@ func getCollectionInfo(ctx context.Context, db *mongo.Database, collName string)
 			continue
 		}
 		if indexDoc.ExpireAfterSeconds != nil {
-			logging.PrintWarning(fmt.Sprintf("Skipping TTL index '%s' on %s.%s", indexDoc.Name, db.Name(), collName), 0)
-			continue
+			logging.PrintInfo(fmt.Sprintf("Discovered TTL index '%s' on %s.%s (will be deferred until finalize)", indexDoc.Name, db.Name(), collName), 0)
 		}
+
 		if indexDoc.PartialFilterExpression != nil {
 			logging.PrintWarning(fmt.Sprintf("Skipping partial index '%s' on %s.%s", indexDoc.Name, db.Name(), collName), 0)
 			continue
@@ -313,9 +314,10 @@ func getCollectionInfo(ctx context.Context, db *mongo.Database, collName string)
 		}
 
 		indexes = append(indexes, IndexInfo{
-			Name:   indexDoc.Name,
-			Key:    indexDoc.Key,
-			Unique: indexDoc.Unique,
+			Name:               indexDoc.Name,
+			Key:                indexDoc.Key,
+			Unique:             indexDoc.Unique,
+			ExpireAfterSeconds: indexDoc.ExpireAfterSeconds,
 		})
 	}
 

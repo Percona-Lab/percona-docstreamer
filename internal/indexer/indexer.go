@@ -133,7 +133,7 @@ func CreateCollectionAndPreloadIndexes(ctx context.Context, targetDB *mongo.Data
 	return targetColl, nil
 }
 
-func FinalizeIndexes(ctx context.Context, targetColl *mongo.Collection, indexes []discover.IndexInfo, ns string) error {
+func FinalizeIndexes(ctx context.Context, targetColl *mongo.Collection, indexes []discover.IndexInfo, ns string, includeTTL bool) error {
 	cursor, err := targetColl.Indexes().List(ctx)
 	if err != nil {
 		return nil
@@ -169,12 +169,30 @@ func FinalizeIndexes(ctx context.Context, targetColl *mongo.Collection, indexes 
 			continue
 		}
 
+		// Check if this index has an expiration set (is a TTL index)
+		isTTL := idx.ExpireAfterSeconds != nil
+
+		if isTTL && !includeTTL {
+			logging.PrintInfo(fmt.Sprintf("[%s] Skipping TTL index '%s' (use 'finalize' to create safely).", ns, idx.Name), 0)
+			continue
+		}
+
 		// 2. Check if the index key already exists on the target
 		keyBytes, _ := bson.Marshal(idx.Key)
 		if !existingKeys[string(keyBytes)] {
+
+			// Build the index options safely
+			idxOpts := options.Index().SetName(idx.Name)
+			if idx.Unique {
+				idxOpts.SetUnique(true)
+			}
+			if isTTL {
+				idxOpts.SetExpireAfterSeconds(*idx.ExpireAfterSeconds)
+			}
+
 			missing = append(missing, mongo.IndexModel{
 				Keys:    idx.Key,
-				Options: options.Index().SetName(idx.Name).SetUnique(idx.Unique),
+				Options: idxOpts,
 			})
 		}
 	}

@@ -95,7 +95,7 @@ If your host is running out of memory, you can lower the RAM requirement by modi
 
 ### The easy way
 
-All you need to do is follow 3 steps:
+This is the recommended approach, all you need to do is follow 3 steps:
 
 1. Go to our repo (you are already here)
 2. Go to the [releases](https://github.com/Percona-Lab/percona-docstreamer/releases) page and download the appropriate release for your needs 
@@ -249,7 +249,9 @@ Available Commands:
   finalize    Stops CDC, applies indexes, and marks migration as finished
   help        Help about any command
   index       Triggers deferred index creation
+  pause       Ad-hoc emergency pause of the migration process
   restart     Restarts the application
+  resume      Resumes the migration process from an emergency pause
   start       Starts the full load and CDC migration
   status      Checks and prints the current status of the migration
   stop        Finds the running application and stops it
@@ -416,7 +418,7 @@ sharding:
 
 ### Index Management & Optimization
 
-Percona docStreamer handles index migration with specific optimizations to ensure high-velocity data ingestion.
+Percona docStreamer handles index migration with specific optimizations to ensure high-velocity data ingestion. We recommend to postpone index creation, as this guarantees the best migration performance and lowest impact on the destination cluster, by reducing the impact of index maintenance, especially for large collections.
 
 #### Postponing Index Creation
 A major bottleneck during the **Full Load** phase is the overhead of maintaining secondary indexes during bulk inserts. You can optimize this behavior in `config.yaml`:
@@ -640,38 +642,67 @@ This command is used when you are ready to cut over to your new environment. It 
 
 ```bash
 --- docStreamer Status (Live) ---
-PID: 2987556 (Querying http://localhost:8080/status)
+PID: 775378 (Querying http://localhost:8080/status)
 {
+    "version": "dev",
     "ok": true,
     "state": "running",
     "info": "Change Data Capture",
-    "timeSinceLastEventSeconds": 103.757565546,
+    "migrationFinalized": false,
+    "indexing": {
+        "isIndexing": false,
+        "currentNamespace": "",
+        "completedCollections": 0,
+        "totalCollections": 0,
+        "completed": false
+    },
+    "flowControl": {
+        "enabled": true,
+        "isPaused": false,
+        "currentQueuedOps": 0,
+        "currentWriterQueue": 0,
+        "isReplicationLagged": false,
+        "assignedRateLimit": 0
+    },
+    "timeSinceLastEventSeconds": 1861.430341972,
     "cdcLagSeconds": 0,
-    "totalEventsApplied": 7330,
+    "totalEventsApplied": 6182,
+    "adaptiveSerialBatches": 0,
+    "insertedDocs": 2830,
+    "updatedDocs": 2306,
+    "deletedDocs": 1046,
     "validation": {
-        "totalChecked": 7314,
-        "validCount": 7314,
-        "mismatchCount": 0,
+        "queuedBatches": 0,
+        "totalChecked": 10266,
+        "mismatchFound": 64,
+        "mismatchFixed": 64,
+        "pendingMismatches": 0,
+        "hotKeysWaiting": 0,
         "syncPercent": 100,
-        "lastValidatedAt": "2025-12-18T16:19:14Z"
+        "lastValidatedAt": "2026-02-26T21:38:03Z"
     },
     "lastSourceEventTime": {
-        "ts": "1766074752.79",
-        "isoDate": "2025-12-18T16:19:12Z"
+        "ts": "1772140028",
+        "isoDate": "2026-02-26T21:07:08Z"
     },
     "lastAppliedEventTime": {
-        "ts": "1766074752.79",
-        "isoDate": "2025-12-18T16:19:12Z"
+        "ts": "1772140028",
+        "isoDate": "2026-02-26T21:07:08Z"
     },
-    "lastBatchAppliedAt": "2025-12-18T16:19:13Z",
+    "lastBatchAppliedAt": "2026-02-26T21:38:09Z",
     "initialSync": {
         "completed": true,
-        "completionLagSeconds": 150,
-        "cloneCompleted": true,
-        "estimatedCloneSizeBytes": 1843039739,
-        "clonedSizeBytes": 1843039739,
-        "estimatedCloneSizeHuman": "2 GB",
-        "clonedSizeHuman": "2 GB"
+        "progressPercent": 100,
+        "clonedDocs": 3459543,
+        "estimatedTotalDocs": 3455411,
+        "clonedBytes": 7026191966,
+        "estimatedTotalBytes": 8853615388,
+        "clonedSizeHuman": "6.5 GB",
+        "estimatedCloneSizeHuman": "8.2 GB",
+        "startedAt": "",
+        "endedAt": "",
+        "duration": "N/A",
+        "completionLagSeconds": 0
     }
 }
 ```
@@ -681,21 +712,25 @@ PID: 2987556 (Querying http://localhost:8080/status)
 
 The status command provides real-time metrics on the health and progress of your migration.
 
-* ok
-    * true: The application is healthy and operating normally.
-    * false: A critical error has occurred (e.g., lost connection), and the process has likely stopped or is in a failed state.
+* **version**: The version of docStreamer currently running.
 
-* state: The current phase of the migration. Common states include:
-    * starting: The application is initializing (loading configuration, setting up loggers).
-    * connecting: Attempting to establish connections to the Source and Target databases.
-    * discovering: Scanning the Source database to identify databases and collections to migrate.
-    * copying: Synonymous with running during the Full Load phase.
-    * running: The main active state. Used for both the Initial Sync (Full Load) and the Continuous Sync (CDC) phases.
-    * destroying: Only seen if the --destroy flag is used. Percona docStreamer is actively dropping target databases before starting.
-    * complete: The process has finished its work (only occurs if there were no collections to migrate).
-    * error: A fatal error occurred.
+* **ok**
+    * `true`: The application is healthy and operating normally.
+    * `false`: A critical error has occurred (e.g., lost connection), and the process has likely stopped or is in a failed state.
 
-* info
+* **state**: The current phase of the migration. Common states include:
+    * `starting`: The application is initializing (loading configuration, setting up loggers).
+    * `connecting`: Attempting to establish connections to the Source and Target databases.
+    * `discovering`: Scanning the Source database to identify databases and collections to migrate.
+    * `copying`: Synonymous with running during the Full Load phase.
+    * `running`: The main active state. Used for both the Initial Sync (Full Load) and the Continuous Sync (CDC) phases.
+    * `paused`: The pipeline has been manually halted via the emergency pause command.
+    * `throttled`: The pipeline is temporarily paused by the automatic Flow Control mechanism to prevent target overload.
+    * `destroying`: Only seen if the `--destroy` flag is used. Percona docStreamer is actively dropping target databases before starting.
+    * `completed`: The process has finished its work (e.g., Migration Finalized, or no collections to migrate).
+    * `error`: A fatal error occurred.
+
+* **info**
 
     | State       | Info Message                               | Description                                                         |
     |-------------|---------------------------------------------|---------------------------------------------------------------------|
@@ -706,36 +741,74 @@ The status command provides real-time metrics on the health and progress of your
     | running     | Initial Sync (Full Load)                    | Currently snapshotting existing data.                               |
     | running     | Change Data Capture                         | Sync is live; streaming updates from the source.                    |
     | running     | Applying DDL: `<Op>` on `<NS>`              | Applying a schema change (e.g., drop, rename, create).              |
-    | complete    | No collections found to migrate.            | Source was empty or filtered out; nothing to do.                    |
+    | paused      | Paused manually by user                     | Data flow is stopped due to an ad-hoc emergency pause.              |
+    | throttled   | Flow Control Active: `<Reason>`             | Target is overloaded; actively throttling writes.                   |
+    | completed   | Migration Finalized                         | CDC has been safely stopped and deferred indexes are built.         |
+    | completed   | No collections found to migrate.            | Source was empty or filtered out; nothing to do.                    |
     | error       | error                                       | Check the application logs for the specific fatal error message.    |
 
-* timeSinceLastEventSeconds (Source Idle Time):
+* **migrationFinalized**: `true` if the user has triggered the `finalize` command, successfully stopping CDC and completing the migration.
+
+* **indexing**: Tracks the progress of deferred index creation (if configured to postpone indexing during Full Load).
+    * `isIndexing`: `true` if background index creation is actively running.
+    * `currentNamespace`: The specific collection currently being indexed (or "Postponed").
+    * `completedCollections`: Number of collections that have finished index creation.
+    * `totalCollections`: Total number of collections requiring indexes.
+    * `completed`: `true` when all indexes have been successfully created on the target.
+
+* **flowControl**: Metrics detailing the adaptive throttling mechanism.
+    * `enabled`: `true` if flow control is enabled in the configuration.
+    * `isPaused`: `true` if the reader is currently pausing extraction.
+    * `pauseReason`: A description of why flow control engaged (e.g., high queued ops, high latency, or manual pause).
+    * `currentQueuedOps`: The number of operations waiting in the target database's global lock queue.
+    * `currentWriterQueue`: The number of active writers waiting in the target database.
+    * `isReplicationLagged`: Native flow control indicator showing if the target cluster itself is experiencing replication lag.
+    * `assignedRateLimit`: The sustainer rate limit imposed by native MongoDB flow control.
+
+* **timeSinceLastEventSeconds (Source Idle Time)**:
     * Meaning: How many seconds have passed since the Source DocumentDB produced a change event.
-    * Interpretation: If this number is high but no events are being applied and state is running, it usually means your source database is idle (no changes are happening). This is normal during low-traffic periods.
+    * Interpretation: If this number is high but no events are being applied and state is `running`, it usually means your source database is idle (no changes are happening). This is normal during low-traffic periods.
 
-* cdcLagSeconds (Replication Latency):
+* **cdcLagSeconds (Replication Latency)**:
     * Meaning: The time difference (latency) between when an event occurred on the Source and when it was successfully applied to the Target.
-    * Interpretation: This is your true "lag." It should stay close to 0 (typically < 2 seconds). If this number spikes, it means docStreamer cannot keep up with the volume of changes. If no events are being applied and state is running, it usually means your source database is idle.
+    * Interpretation: This is your true "lag." It should stay close to 0 (typically < 2 seconds). If this number spikes, it means docStreamer cannot keep up with the volume of changes.
 
-* validation: Tracks the number of documents that are a perfect match between Source and Destination
-    * totalChecked: This is the number of total CDC events checked
-    * validCount: Number of documents that are an exact match
-    * mismatchCount: Number or active discrepancies
-    * syncPercent: Percentage of documents that are in perfect sync
-    * lastValidatedAt: Last time the records were validated
+* **CDC Operation Counters**:
+    * `totalEventsApplied`: The total number of operations replicated since the CDC phase started.
+    * `insertedDocs`: Total number of CDC inserts successfully applied.
+    * `updatedDocs`: Total number of CDC updates successfully applied.
+    * `deletedDocs`: Total number of CDC deletes successfully applied.
+    * `adaptiveSerialBatches`: The number of times docStreamer had to automatically fall back to single-threaded serial writes to resolve batch deadlocks or conflicts.
 
-* totalEventsApplied: The total number of operations replicated since the CDC phase started.
+* **validation**: Tracks the real-time background validation between Source and Destination.
+    * `queuedBatches`: The number of batches currently buffered in memory waiting to be validated.
+    * `totalChecked`: The total number of CDC events validated so far.
+    * `mismatchFound`: Number of discrepancies detected between source and target.
+    * `mismatchFixed`: Number of discrepancies automatically repaired by the validator.
+    * `pendingMismatches`: Discrepancies currently in the retry queue waiting to be resolved.
+    * `hotKeysWaiting`: Number of documents temporarily skipped from validation due to high write-activity on that specific document.
+    * `syncPercent`: Percentage of checked documents that are in perfect sync.
+    * `lastValidatedAt`: Timestamp of the most recent validation check.
 
-* lastSourceEventTime: The timestamp of the very last operation read from the Source change stream.
-    * ts: Internal MongoDB Timestamp format.
-    * isoDate: Human-readable UTC time of the event.
+* **lastSourceEventTime**: The timestamp of the very last operation read from the Source change stream.
+    * `ts`: Internal MongoDB Timestamp format.
+    * `isoDate`: Human-readable UTC time of the event.
 
-* lastBatchAppliedAt: The local wall-clock time when docStreamer last successfully wrote a batch of data to the Destination MongoDB.
+* **lastAppliedEventTime**: The source timestamp of the last operation successfully *applied* to the target database.
 
-* initialSync: Statistics regarding the Full Load phase. Once the Full load is complete and docStreamer switches to CDC these numbers will remain static.
-    * completed: true if the snapshot phase is finished.
-    * completionLagSeconds: How far behind real-time the migration was at the exact moment the Full Load finished.
-    * clonedSizeHuman: Total volume of data copied during the Full load phase.
+* **lastBatchAppliedAt**: The local wall-clock time when docStreamer last successfully wrote a batch of data to the Destination MongoDB.
+
+* **initialSync**: Detailed statistics regarding the Full Load phase. Once the Full load is complete and docStreamer switches to CDC, these numbers will remain static.
+    * `completed`: `true` if the snapshot phase is finished.
+    * `progressPercent`: The estimated completion percentage of the full load.
+    * `clonedDocs`: The actual number of documents successfully copied so far.
+    * `estimatedTotalDocs`: The total number of documents discovered on the source prior to the full load.
+    * `clonedBytes` / `clonedSizeHuman`: Total volume of data copied during the Full load phase.
+    * `estimatedTotalBytes` / `estimatedCloneSizeHuman`: Total estimated volume of data to be copied.
+    * `startedAt`: When the Full Load phase began.
+    * `endedAt`: When the Full Load phase successfully finished.
+    * `duration`: Total time taken to complete the Full Load phase.
+    * `completionLagSeconds`: How far behind real-time the migration was at the exact moment the Full Load finished.
 
 ### API
 
@@ -1167,17 +1240,34 @@ Supported: drop (collection), dropDatabase, rename (collection), create (collect
 
 Percona docStreamer automatically handles the creation of indexes during the Full Sync stage to ensure your destination performance matches the source. However, there are specific limitations regarding index types.
 
-Currently Supported:
-
+**Currently Supported:**
 Most standard MongoDB index types (e.g., Single Field, Compound, Multikey, Geospatial).
 
-Not Currently Supported: 
-
-The following index types are not migrated during the Full Sync and must be created manually on the destination if required:
-
+**Not Currently Supported:**
+The following index types are not migrated by docStreamer and must be created manually on the destination if required:
  - Text Indexes
  - Partial Indexes
+
+**Deferred Until Finalization:**
+The following index type is automatically deferred during the Full Sync and CDC phases to protect data integrity, but will be automatically created during the `finalize` stage:
  - TTL Indexes
 
 ***Note:*** We recommend reviewing your source indexes prior to migration. If your application relies heavily on text search or partial indexing, plan to run a post-migration script to reconstruct these specific indexes on the destination cluster.
 
+#### TTL Index Special Considerations 
+
+The reason TTL (Time-To-Live) indexes are excluded from automatic creation during the initial migration phases comes down to data integrity and avoiding race conditions between the source and target databases.
+
+##### Reasons to defer creating TTL indexes until after the migration is complete:
+
+* **Premature Data Deletion**: TTL indexes run on a background thread in MongoDB and automatically delete documents when their timestamp expires. If you create the TTL index on the target database *before* or *during* the migration, the target database will start actively deleting data on its own. Because a migration can take hours or days, documents that are valid on the source might be copied over, expire, and get deleted on the target before the migration even finishes. 
+* **CDC Conflicts**: During the CDC phase, docStreamer listens for changes on the source DocumentDB and replicates them to the target MongoDB. If the target MongoDB's TTL job deletes a document, and then the source DocumentDB also deletes or updates that same document, docStreamer will try to replicate that change. This can lead to "document not found" errors or synchronization mismatches because the target database altered the data independently of the migration tool.
+* **Resource Overhead**: Creating indexes and running the TTL background jobs consumes CPU and disk I/O. During a heavy Full Load phase, you want all of the target resources dedicated to absorbing the incoming data as fast as possible.
+
+**Best Practice**
+
+By default, docStreamer safely defers TTL index creation. The safest and recommended way to handle TTL indexes is to simply wait until you are ready to cut over. 
+
+When you run the `docStreamer finalize` command, docStreamer safely stops the CDC stream and **automatically builds your TTL indexes** (along with any other deferred indexes). Because the data stream is stopped, this ensures your target has an exact, 1:1 match of the source data before it begins autonomously managing document expiration. 
+
+*(Alternatively, you can choose to manually create TTL indexes on the destination cluster after the migration is fully complete.)*

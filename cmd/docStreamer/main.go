@@ -497,7 +497,7 @@ var resumeCmd = &cobra.Command{
 }
 
 // Helper to construct connections and run indexer logic
-func createAllDeferredIndexes(ctx context.Context, docdbURI, mongoURI string, statusMgr *status.Manager) error {
+func createAllDeferredIndexes(ctx context.Context, docdbURI, mongoURI string, statusMgr *status.Manager, includeTTL bool) error {
 	discOpts := options.Client().ApplyURI(docdbURI).SetAppName("docStreamer-Discovery-Index")
 	if config.Cfg.DocDB.TLS && config.Cfg.DocDB.TlsAllowInvalidHostnames {
 		discOpts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
@@ -539,7 +539,7 @@ func createAllDeferredIndexes(ctx context.Context, docdbURI, mongoURI string, st
 
 		logging.PrintStep(fmt.Sprintf("[%s] Checking %d source indexes...", collInfo.Namespace, len(collInfo.Indexes)), 0)
 
-		if err := indexer.FinalizeIndexes(ctx, targetColl, collInfo.Indexes, collInfo.Namespace); err != nil {
+		if err := indexer.FinalizeIndexes(ctx, targetColl, collInfo.Indexes, collInfo.Namespace, includeTTL); err != nil {
 			logging.PrintError(fmt.Sprintf("[%s] Failed to finalize indexes: %v", collInfo.Namespace, err), 0)
 		}
 	}
@@ -844,7 +844,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 			os.Exit(1)
 		}
 		logging.PrintPhase("FINALIZE", "Creating deferred indexes...")
-		if err := createAllDeferredIndexes(context.Background(), docdbURI, mongoURI, statusManager); err != nil {
+		if err := createAllDeferredIndexes(context.Background(), docdbURI, mongoURI, statusManager, true); err != nil {
 			logging.PrintError(fmt.Sprintf("Index creation failed: %v", err), 0)
 			os.Exit(1)
 		}
@@ -908,7 +908,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		}
 		go func() {
 			logging.PrintPhase("INDEX", "Starting deferred index creation (CDC running in background)...")
-			if err := createAllDeferredIndexes(context.Background(), docdbURI, mongoURI, statusManager); err != nil {
+			if err := createAllDeferredIndexes(context.Background(), docdbURI, mongoURI, statusManager, false); err != nil {
 				logging.PrintError(fmt.Sprintf("Deferred index creation failed: %v", err), 0)
 			} else {
 				logging.PrintSuccess("Deferred index creation complete.", 0)
@@ -1113,7 +1113,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 
 	if triggerFinalize.Load() {
 		logging.PrintPhase("FINALIZE", "CDC safely drained. Creating deferred indexes...")
-		if err := createAllDeferredIndexes(context.Background(), docdbURI, mongoURI, statusManager); err != nil {
+		if err := createAllDeferredIndexes(context.Background(), docdbURI, mongoURI, statusManager, true); err != nil {
 			logging.PrintError(fmt.Sprintf("Index creation failed: %v", err), 0)
 		} else {
 			statusManager.SetMigrationFinalized()
