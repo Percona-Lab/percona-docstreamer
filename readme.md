@@ -623,6 +623,23 @@ If you configured the application to postpone index creation (`cloner.postpone_i
 ./docStreamer index
 ```
 
+### Pause
+
+You can temporarily pause the migration during overload periods. This command has the same effect as the flow control mechanism, which pauses bot read and write workers.
+The application will print `[FlowControl] Data reader paused (User Emergency Pause)...` to the logs.
+
+```bash
+docStreamer pause
+```
+
+### Resume
+
+This command should be used only when you want to resume a migration. It is not intended for use during a restart or stop workflow. It should be used strictly to resume the migration after the pause command has been issued.
+
+```bash
+docStreamer resume
+```
+
 ### Finalize
 
 This command is used when you are ready to cut over to your new environment. It performs a graceful shutdown of the CDC stream (waiting for any in-flight operations to safely drain), triggers the creation of any deferred secondary indexes, and marks the migration state as "Migration Finalized" so the application doesn't accidentally restart later. Please note that migrations that have been finalized can not be resumed and must start all over from scratch. Make sure you only finalize when you are ready to cutover.
