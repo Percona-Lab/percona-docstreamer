@@ -642,7 +642,7 @@ This command is used when you are ready to cut over to your new environment. It 
 
 ```bash
 --- docStreamer Status (Live) ---
-PID: 775378 (Querying http://localhost:8080/status)
+PID: 1321077 (Querying http://localhost:8080/status)
 {
     "version": "dev",
     "ok": true,
@@ -664,41 +664,41 @@ PID: 775378 (Querying http://localhost:8080/status)
         "isReplicationLagged": false,
         "assignedRateLimit": 0
     },
-    "timeSinceLastEventSeconds": 1861.430341972,
+    "timeSinceLastEventSeconds": 606.175643039,
     "cdcLagSeconds": 0,
-    "totalEventsApplied": 6182,
-    "adaptiveSerialBatches": 0,
-    "insertedDocs": 2830,
-    "updatedDocs": 2306,
-    "deletedDocs": 1046,
+    "totalEventsApplied": 43906,
+    "adaptiveSerialBatches": 7,
+    "insertedDocs": 34422,
+    "updatedDocs": 4710,
+    "deletedDocs": 4774,
     "validation": {
         "queuedBatches": 0,
-        "totalChecked": 10266,
-        "mismatchFound": 64,
-        "mismatchFixed": 64,
+        "totalChecked": 2519,
+        "mismatchFound": 24,
+        "mismatchFixed": 24,
         "pendingMismatches": 0,
         "hotKeysWaiting": 0,
         "syncPercent": 100,
-        "lastValidatedAt": "2026-02-26T21:38:03Z"
+        "lastValidatedAt": "2026-03-03T19:46:33Z"
     },
     "lastSourceEventTime": {
-        "ts": "1772140028",
-        "isoDate": "2026-02-26T21:07:08Z"
+        "ts": "1772567184",
+        "isoDate": "2026-03-03T19:46:24Z"
     },
     "lastAppliedEventTime": {
-        "ts": "1772140028",
-        "isoDate": "2026-02-26T21:07:08Z"
+        "ts": "1772567184",
+        "isoDate": "2026-03-03T19:46:24Z"
     },
-    "lastBatchAppliedAt": "2026-02-26T21:38:09Z",
+    "lastBatchAppliedAt": "2026-03-03T19:56:29Z",
     "initialSync": {
         "completed": true,
         "progressPercent": 100,
-        "clonedDocs": 3459543,
-        "estimatedTotalDocs": 3455411,
-        "clonedBytes": 7026191966,
-        "estimatedTotalBytes": 8853615388,
-        "clonedSizeHuman": "6.5 GB",
-        "estimatedCloneSizeHuman": "8.2 GB",
+        "clonedDocs": 4945277,
+        "estimatedTotalDocs": 4945205,
+        "clonedBytes": 7864311434,
+        "estimatedTotalBytes": 11430286453,
+        "clonedSizeHuman": "7.3 GB",
+        "estimatedCloneSizeHuman": "10.6 GB",
         "startedAt": "",
         "endedAt": "",
         "duration": "N/A",
@@ -821,6 +821,7 @@ Percona docStreamer generates three separate logs, each of the logs location and
 1. Application Log (`logs/docStreamer.log`): Tracks the overall application status and any errors encountered.
 2. Full Load Log (`logs/full_load.log`): Dedicated to the initial full synchronization process. This log, together with the status endpoint, helps you monitor the progress of the initial sync.
 3. CDC Log (`logs/cdc.log`): Dedicated to Change Data Capture (CDC) operations. These operations begin only after the full sync is complete, so this log will remain empty until that point. Use it, along with the status endpoint, to track CDC progress.
+4. Validation Log (`logs/validator.log`): Dedicated log for tracking the validation progress
 
 #### Logging Configuration
 
@@ -832,6 +833,7 @@ The application generates specialized logs to help you monitor different stages 
 | `file_path` | `logs/docStreamer.log` | The primary application log containing system status and errors. |
 | `ops_log_path` | `logs/cdc.log` | Dedicated log for Change Data Capture (CDC) operations and batch details. |
 | `full_load_log_path` | `logs/full_load.log` | Dedicated log for tracking the progress and batches of the initial full sync. |
+| `validator_log_path` | `logs/validator.log` | Dedicated log for tracking the validation progress. |
 
 <details>
 <summary>Application log sample:</summary>
@@ -1149,6 +1151,7 @@ In addition to monitoring lock queues, the Adaptive Flow Control mechanism uses 
 | `latency_threshold_ms` | `250` | The maximum acceptable latency for a `serverStatus` command. If exceeded, the system pauses to allow the target to recover. |
 | `active_client_threshold` | `50` | The maximum number of total concurrent active clients allowed on the target before throttling occurs. |
 | `min_wired_tiger_tickets` | `0` | The minimum number of available WiredTiger write tickets required. If it drops below this value, the system pauses. Set to `0` to disable. |
+| `target_max_queued_ops` | `50` | The safety limit for the Target's Global Lock Queue. If any node exceeds this many queued operations, docStreamer pauses. |
 
 #### Ad-Hoc Emergency Flow Control (Pause / Resume)
 
@@ -1185,6 +1188,7 @@ The data validation engine is highly configurable to balance performance impact 
 | Setting | Default | Description |
 |--------:|--------:|-------------|
 | `enabled` | `true` | Master switch for the validation engine. If false, final document verification after CDC writes are skipped. CDC is guaranteed to sync the documents; this is an optional additional validation check. |
+| `full_validation` | `false` | Controls the scope of CDC data validation. If true, all ops are validated. If false (recommended), ONLY Deletes are validated (massive performance boost since inserts/updates are guaranteed by the stream payload). Note: This setting is hot-reloadable and can be changed without restarting the app. |
 | `batch_size` | `100` | Network vs. Memory Trade-off. Controls how many document IDs are bundled into a single database lookup. Larger batches reduce network round-trips but increase memory usage. |
 | `max_validation_workers` | `4` | Concurrency Control. The number of parallel worker threads fetching and comparing documents. Increase this if you have spare CPU/Network capacity and notice validation lagging behind CDC. |
 | `queue_size` | `2000` | Buffer Capacity. The size of the channel buffering CDC events before validation. If the CDC writer is faster than the validator and this buffer fills up, validation requests will be queued and this could cause slowing down the replication stream. |

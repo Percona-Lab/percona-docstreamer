@@ -224,7 +224,7 @@ func LoadConfig() {
 
 	// Validation Defaults
 	viper.SetDefault("validation.enabled", true)
-	viper.SetDefault("validation.full_validation", true)
+	viper.SetDefault("validation.full_validation", false)
 	viper.SetDefault("validation.batch_size", 100)
 	viper.SetDefault("validation.retry_interval_ms", 500)
 	viper.SetDefault("validation.max_validation_workers", 4)

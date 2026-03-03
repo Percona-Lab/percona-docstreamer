@@ -427,14 +427,13 @@ func (m *CDCManager) hydrateAndFixOperations(ctx context.Context, ns string, bat
 	}
 
 	foundDocs := make(map[string]bson.M)
-	if err == nil {
-		defer cursor.Close(ctx)
-		for cursor.Next(ctx) {
-			var doc bson.M
-			if err := cursor.Decode(&doc); err == nil {
-				idStr := formatID(doc["_id"])
-				foundDocs[idStr] = doc
-			}
+
+	defer cursor.Close(ctx)
+	for cursor.Next(ctx) {
+		var doc bson.M
+		if err := cursor.Decode(&doc); err == nil {
+			idStr := formatID(doc["_id"])
+			foundDocs[idStr] = doc
 		}
 	}
 

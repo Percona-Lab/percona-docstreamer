@@ -112,6 +112,7 @@ func (m *Manager) WaitIfPaused() {
 func (m *Manager) HandlePause(w http.ResponseWriter, r *http.Request) {
 	m.emergencyPaused.Store(true)
 	if m.statusMgr != nil {
+		m.statusMgr.SetEmergencyPaused(true)
 		m.statusMgr.SetState("paused", "Paused manually by user")
 		m.statusMgr.Persist(context.Background())
 	}
@@ -123,7 +124,7 @@ func (m *Manager) HandlePause(w http.ResponseWriter, r *http.Request) {
 func (m *Manager) HandleResume(w http.ResponseWriter, r *http.Request) {
 	m.emergencyPaused.Store(false)
 	if m.statusMgr != nil {
-		// Restore state gracefully based on current migration phase
+		m.statusMgr.SetEmergencyPaused(false)
 		if m.statusMgr.IsMigrationFinalized() {
 			m.statusMgr.SetState("completed", "Migration Finalized")
 		} else if m.statusMgr.IsCloneCompleted() {

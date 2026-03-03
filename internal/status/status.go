@@ -121,6 +121,7 @@ type Manager struct {
 	estimatedTotalDocs  atomic.Int64
 	clonedBytes         atomic.Int64
 	clonedDocs          atomic.Int64
+	initialSyncLag      atomic.Value
 
 	// Timestamps (Stored as Unix Seconds)
 	lastSourceEventTime  atomic.Int64
@@ -146,6 +147,7 @@ type Manager struct {
 	fcWriterQueue     atomic.Int64
 	fcNativeLagged    atomic.Bool
 	fcNativeSustainer atomic.Int64
+	fcEmergencyPaused atomic.Bool
 
 	// Validation Stats (In-Memory)
 	valTotalChecked atomic.Int64
@@ -153,6 +155,20 @@ type Manager struct {
 	valHotKeys      atomic.Int64
 	valLastCheck    atomic.Int64
 	valQueueSize    atomic.Int64
+}
+
+func parseTime(v interface{}) time.Time {
+	if v == nil {
+		return time.Time{}
+	}
+	if t, ok := v.(time.Time); ok {
+		return t
+	}
+	// Handle BSON DateTime (which is an int64 under the hood representing milliseconds)
+	if dt, ok := v.(bson.DateTime); ok {
+		return time.Unix(int64(dt)/1000, (int64(dt)%1000)*1000000).UTC()
+	}
+	return time.Time{}
 }
 
 func NewManager(client *mongo.Client, isSource bool, version string) *Manager {
@@ -169,7 +185,8 @@ func NewManager(client *mongo.Client, isSource bool, version string) *Manager {
 		startTime:  time.Now().UTC(),
 	}
 	m.fcReason.Store("")
-	m.idxCurrentNs.Store("") // Safely initialize empty string
+	m.idxCurrentNs.Store("")
+	m.initialSyncLag.Store(0.0)
 	return m
 }
 
@@ -286,8 +303,15 @@ func (m *Manager) SetInitialSyncEnd(t time.Time) {
 func (m *Manager) IsInitialSyncCompleted() bool {
 	return m.initialSyncCompleted.Load()
 }
+
 func (m *Manager) SetInitialSyncCompleted(lagSeconds float64) {
 	m.initialSyncCompleted.Store(true)
+	m.initialSyncLag.Store(lagSeconds)
+}
+
+func (m *Manager) SetEmergencyPaused(paused bool) {
+	m.fcEmergencyPaused.Store(paused)
+	go m.Persist(context.Background())
 }
 
 func (m *Manager) IsCloneCompleted() bool {
@@ -387,15 +411,26 @@ func (m *Manager) LoadAndMerge(ctx context.Context) error {
 			m.idxFinished.Store(val)
 		}
 	}
-
 	m.mu.Lock()
-	if val, ok := doc["initialSyncStart"].(time.Time); ok {
-		m.initialSyncStart = val
+
+	if val, ok := doc["initialSyncStart"]; ok {
+		m.initialSyncStart = parseTime(val)
 	}
-	if val, ok := doc["initialSyncEnd"].(time.Time); ok {
-		m.initialSyncEnd = val
+	if val, ok := doc["initialSyncEnd"]; ok {
+		m.initialSyncEnd = parseTime(val)
 	}
 	m.mu.Unlock()
+
+	if val, ok := doc["initialSyncLag"]; ok {
+		switch v := val.(type) {
+		case float64:
+			m.initialSyncLag.Store(v)
+		case int32:
+			m.initialSyncLag.Store(float64(v))
+		case int64:
+			m.initialSyncLag.Store(float64(v))
+		}
+	}
 
 	if fc, ok := doc["flowControl"].(bson.M); ok {
 		if val, ok := fc["isPaused"].(bool); ok {
@@ -415,6 +450,9 @@ func (m *Manager) LoadAndMerge(ctx context.Context) error {
 		}
 		if val, ok := fc["assignedRateLimit"]; ok {
 			m.fcNativeSustainer.Store(parseInt64(val))
+		}
+		if val, ok := fc["emergencyPaused"].(bool); ok {
+			m.fcEmergencyPaused.Store(val)
 		}
 	}
 
@@ -437,9 +475,12 @@ func (m *Manager) Persist(ctx context.Context) {
 		"completed":            m.idxFinished.Load(),
 	}
 
+	lag, _ := m.initialSyncLag.Load().(float64)
+
 	fcStatus := bson.M{
 		"enabled":             config.Cfg.FlowControl.Enabled,
 		"isPaused":            m.fcIsPaused.Load(),
+		"emergencyPaused":     m.fcEmergencyPaused.Load(),
 		"pauseReason":         m.fcReason.Load().(string),
 		"currentQueuedOps":    m.fcQueuedOps.Load(),
 		"currentWriterQueue":  m.fcWriterQueue.Load(),
@@ -470,6 +511,7 @@ func (m *Manager) Persist(ctx context.Context) {
 			"initialSyncCompleted":  m.initialSyncCompleted.Load(),
 			"initialSyncStart":      start,
 			"initialSyncEnd":        end,
+			"initialSyncLag":        lag,
 			"migrationFinalized":    m.migrationFinalized.Load(),
 			"flowControl":           fcStatus,
 			"indexing":              idxStatus,
@@ -548,6 +590,7 @@ func (m *Manager) buildStatusOutput(valStore ValidatorStore) StatusOutput {
 	lastSourceUnix := m.lastSourceEventTime.Load()
 	lastAppliedUnix := m.lastAppliedEventTime.Load()
 	lastBatchUnix := m.lastBatchAppliedAt.Load()
+	lag, _ := m.initialSyncLag.Load().(float64)
 
 	idleTime := 0.0
 	cdcLag := 0.0
@@ -670,19 +713,22 @@ func (m *Manager) buildStatusOutput(valStore ValidatorStore) StatusOutput {
 			StartedAt:               startStr,
 			EndedAt:                 endStr,
 			Duration:                duration,
-			CompletionLagSeconds:    0,
+			CompletionLagSeconds:    lag,
 		},
 	}
-
-	if config.Cfg.FlowControl.Enabled {
+	isEmergencyPaused := m.fcEmergencyPaused.Load()
+	if config.Cfg.FlowControl.Enabled || isEmergencyPaused {
 		output.FlowControl = &FCStatus{
-			Enabled:             true,
-			IsPaused:            m.fcIsPaused.Load(),
+			Enabled:             config.Cfg.FlowControl.Enabled,
+			IsPaused:            m.fcIsPaused.Load() || isEmergencyPaused,
 			PauseReason:         m.fcReason.Load().(string),
 			CurrentQueuedOps:    int(m.fcQueuedOps.Load()),
 			CurrentWriterQueue:  int(m.fcWriterQueue.Load()),
 			NativeLagged:        m.fcNativeLagged.Load(),
 			NativeSustainerRate: int(m.fcNativeSustainer.Load()),
+		}
+		if isEmergencyPaused {
+			output.FlowControl.PauseReason = "Paused manually by user"
 		}
 	}
 
