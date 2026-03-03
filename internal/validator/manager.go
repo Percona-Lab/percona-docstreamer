@@ -66,11 +66,18 @@ func NewManager(source, target *mongo.Client, tracker *InFlightTracker, store *S
 		shutdownCancel:  cancel,
 	}
 
+	return vm
+}
+
+func (vm *Manager) Start() {
 	workerCount := config.Cfg.Validation.MaxValidationWorkers
-	// Ensure at least 1 worker exists to prevent deadlock,
-	// but relies on config default (4) for the upper value.
 	if workerCount < 1 {
 		workerCount = 1
+	}
+
+	queueSize := config.Cfg.Validation.QueueSize
+	if queueSize <= 0 {
+		queueSize = 2000
 	}
 
 	// Add 1 for the retry worker and N for the queue workers
@@ -78,20 +85,17 @@ func NewManager(source, target *mongo.Client, tracker *InFlightTracker, store *S
 	go vm.startRetryWorker()
 
 	logging.PrintInfo(fmt.Sprintf("[VAL] Starting %d parallel CDC validation workers (Queue: %d)...", workerCount, queueSize), 0)
+	logging.LogValidatorInfo(fmt.Sprintf("Starting %d parallel CDC validation workers (Queue: %d)...", workerCount, queueSize))
 	for i := 0; i < workerCount; i++ {
 		go vm.startQueueWorker(i)
 	}
 
 	go vm.startBackgroundSweep()
-
-	return vm
 }
 
 func (vm *Manager) Close() {
-	logging.PrintInfo("[VAL] Shutting down validation workers...", 0)
 	vm.shutdownCancel()
 	vm.wg.Wait()
-	logging.PrintInfo("[VAL] Validation workers stopped.", 0)
 }
 
 func (vm *Manager) CanRun() bool {
@@ -163,12 +167,7 @@ func (vm *Manager) startBackgroundSweep() {
 		idlePollInterval = 5
 	}
 
-	maxRetries := config.Cfg.Validation.MaxRetries
-	if maxRetries < 1 {
-		maxRetries = 3
-	}
-
-	logging.PrintInfo(fmt.Sprintf("[VAL] Smart sweeper started. Max interval: %d min. Idle check every %ds.", maxInterval, idlePollInterval), 0)
+	logging.LogValidatorInfo(fmt.Sprintf("Validation Recovery Worker started. Max interval: %d min. Idle check every %ds.", maxInterval, idlePollInterval))
 
 	ticker := time.NewTicker(time.Duration(idlePollInterval) * time.Second)
 	defer ticker.Stop()
@@ -194,13 +193,15 @@ func (vm *Manager) startBackgroundSweep() {
 
 			timeSince := now.Sub(lastSweep)
 			if timeSince >= time.Duration(maxInterval)*time.Minute {
-				if vm.store.HasEligibleFailures(vm.shutdownCtx, maxRetries) {
+				// Pass -1 for infinite retries. Let it pick up all deferred records.
+				if vm.store.HasEligibleFailures(vm.shutdownCtx, -1) {
 					vm.RetryEligibleFailures()
 				}
 				lastSweep = time.Now()
 				continue
 			}
 
+			// Leverage the CDC idle check to process backlog safely
 			idleSeconds, lagSeconds := vm.statusMgr.GetCDCIdleMetrics()
 
 			if idleSeconds > float64(idlePollInterval) && lagSeconds < 1.0 {
@@ -208,7 +209,8 @@ func (vm *Manager) startBackgroundSweep() {
 				debounceDuration := time.Duration(idlePollInterval) * 3 * time.Second
 
 				if timeSince > debounceDuration {
-					if vm.store.HasEligibleFailures(vm.shutdownCtx, maxRetries) {
+					// Pass -1 for infinite retries
+					if vm.store.HasEligibleFailures(vm.shutdownCtx, -1) {
 						vm.RetryEligibleFailures()
 						lastSweep = time.Now()
 					}
@@ -230,14 +232,15 @@ func (vm *Manager) RetryEligibleFailures() {
 		}
 	}
 
-	const maxDBRetries = 10
-	failures, err := vm.store.GetEligibleFailures(vm.shutdownCtx, maxDBRetries)
+	// Pass -1 to allow unlimited retries.
+	// We rely on the idle/lag checks in startBackgroundSweep to regulate when this runs.
+	failures, err := vm.store.GetEligibleFailures(vm.shutdownCtx, -1)
 	if err != nil || len(failures) == 0 {
 		return
 	}
 
 	if config.Cfg.Logging.Level == "debug" {
-		logging.PrintInfo(fmt.Sprintf("[VAL] Background sweep: Processing %d items pending re-verification...", len(failures)), 0)
+		logging.LogValidatorInfo(fmt.Sprintf("Validation Recovery Worker: Processing %d previously failed items for re-verification...", len(failures)))
 	}
 
 	grouped := make(map[string][]bson.D)
@@ -250,9 +253,7 @@ func (vm *Manager) RetryEligibleFailures() {
 			if oid, err := bson.ObjectIDFromHex(f.DocID); err == nil {
 				idVal = oid
 			} else if parsedUUID, err := uuid.Parse(f.DocID); err == nil {
-				b := make([]byte, 16)
-				copy(b, parsedUUID[:])
-				idVal = bson.Binary{Data: b, Subtype: 4}
+				idVal = parsedUUID
 			}
 			filter = bson.D{{Key: "_id", Value: idVal}}
 		}
@@ -296,7 +297,7 @@ func (vm *Manager) ValidateAsync(ns string, keys []bson.D) {
 	if !vm.isThrottled.Swap(true) {
 		msg := fmt.Sprintf("Validator queue full (%d). Throttling CDC to match Validator speed...", cap(vm.validationQueue))
 		if config.Cfg.Logging.Level == "debug" {
-			logging.PrintWarning(fmt.Sprintf("[VAL] %s", msg), 0)
+			logging.LogValidatorWarning(fmt.Sprintf("%s", msg))
 		}
 		if vm.statusMgr != nil {
 			vm.statusMgr.SetState("throttled", msg)
@@ -307,7 +308,7 @@ func (vm *Manager) ValidateAsync(ns string, keys []bson.D) {
 	select {
 	case vm.validationQueue <- task:
 	case <-vm.shutdownCtx.Done():
-		logging.PrintInfo("[VAL] Dropping validation task due to shutdown.", 0)
+		logging.LogValidatorInfo("Dropping validation task due to shutdown.")
 	}
 }
 
@@ -324,7 +325,21 @@ func (vm *Manager) startQueueWorker(workerID int) {
 
 		select {
 		case <-vm.shutdownCtx.Done():
-			return
+			// Shutdown triggered. Drain the remaining tasks in the queue before exiting.
+			for {
+				select {
+				case task := <-vm.validationQueue:
+					ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+					_, err := vm.ValidateSync(ctx, task.Namespace, task.Keys)
+					cancel()
+					if err != nil {
+						vm.persistFailedBatch(task.Namespace, task.Keys, fmt.Sprintf("Shutdown drain failed: %v", err))
+					}
+				default:
+					logging.LogValidatorInfo("CDC validation worker stopped.")
+					return
+				}
+			}
 		case task, ok := <-vm.validationQueue:
 			if !ok {
 				return
@@ -336,7 +351,7 @@ func (vm *Manager) startQueueWorker(workerID int) {
 
 			if vm.isThrottled.Load() && len(vm.validationQueue) < cap(vm.validationQueue)/2 {
 				if vm.isThrottled.Swap(false) {
-					logging.PrintInfo("[VAL] Validator queue has recovered. Releasing throttle.", 0)
+					logging.LogValidatorInfo("Validator queue has recovered. Releasing throttle.")
 					if vm.statusMgr != nil {
 						vm.statusMgr.SetState("running", "Change Data Capture")
 					}
@@ -348,7 +363,7 @@ func (vm *Manager) startQueueWorker(workerID int) {
 			cancel()
 
 			if err != nil && ctx.Err() == nil {
-				logging.PrintError(fmt.Sprintf("[VAL] Batch validation failed for %s: %v. Persisting to retry queue.", task.Namespace, err), 0)
+				logging.LogValidatorError(fmt.Sprintf("Batch validation failed for %s: %v. Persisting to retry queue.", task.Namespace, err))
 				vm.persistFailedBatch(task.Namespace, task.Keys, fmt.Sprintf("Batch fetch failed: %v", err))
 			}
 		}
@@ -390,12 +405,28 @@ func (vm *Manager) startRetryWorker() {
 
 		select {
 		case <-vm.shutdownCtx.Done():
-			return
+			// --- SHUTDOWN DRAIN PHASE ---
+			for {
+				select {
+				case item := <-vm.retryQueue:
+					// Run synchronously with a fresh context so it completes before exiting
+					ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+					vm.validateInternal(ctx, item.Namespace, []bson.D{item.Key}, item.AttemptCount)
+					cancel()
+				default:
+					return // Queue is completely empty, safe to exit worker
+				}
+			}
+
 		case item := <-vm.retryQueue:
 			go func(retItem RetryItem) {
 				select {
 				case <-vm.shutdownCtx.Done():
-					return
+					// If shutdown happens while we are waiting for retryDelay,
+					// do NOT drop it. Validate it immediately using a fresh context.
+					ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+					vm.validateInternal(ctx, retItem.Namespace, []bson.D{retItem.Key}, retItem.AttemptCount)
+					cancel()
 				case <-time.After(retryDelay):
 					vm.validateSingle(retItem)
 				}
@@ -410,6 +441,8 @@ func extractIDString(filter bson.D) string {
 			switch v := e.Value.(type) {
 			case bson.ObjectID:
 				return v.Hex()
+			case uuid.UUID:
+				return v.String()
 			case bson.Binary:
 				if v.Subtype == 4 {
 					if u, err := uuid.FromBytes(v.Data); err == nil {
@@ -472,9 +505,9 @@ func (vm *Manager) validateInternal(ctx context.Context, namespace string, keys 
 				continue
 			} else {
 				res.Status = "hot_key_waiting"
-				res.Reason = fmt.Sprintf("Key remains hot after %d attempts. Deferred to background queue.", maxRetries)
+				res.Reason = fmt.Sprintf("Key remains hot after %d attempts. Deferred to persistent retry queue.", maxRetries)
 				if config.Cfg.Logging.Level == "debug" {
-					logging.PrintWarning(fmt.Sprintf("[VAL] Deferring hot key %s to background sweep.", id), 0)
+					logging.LogValidatorWarning(fmt.Sprintf("Deferring hot key %s to the Validation Recovery Worker.", id))
 				}
 				vm.store.RegisterOutcome(ctx, namespace, res)
 				results = append(results, res)
@@ -508,7 +541,7 @@ func (vm *Manager) validateInternal(ctx context.Context, namespace string, keys 
 		if okSrc {
 			if isGhost {
 				if config.Cfg.Logging.Level == "debug" {
-					logging.PrintWarning(fmt.Sprintf("[VAL] Ghost detected for %s (Count: %d). Purging...", id, count), 0)
+					logging.LogValidatorWarning(fmt.Sprintf("Ghost detected for %s (Count: %d). Purging...", id, count))
 				}
 				targetColl.DeleteMany(checkCtx, bson.D{{Key: "_id", Value: idVal}})
 				_, errIns := targetColl.InsertOne(checkCtx, src)
@@ -517,7 +550,7 @@ func (vm *Manager) validateInternal(ctx context.Context, namespace string, keys 
 					res.Status = "healed_pending_verify"
 					res.Reason = "Auto-healed: Purged ghosts and re-inserted"
 					if config.Cfg.Logging.Level == "debug" {
-						logging.PrintSuccess(fmt.Sprintf("[VAL] Fixed ghosts for %s", id), 0)
+						logging.LogValidatorSuccess(fmt.Sprintf("Fixed ghosts for %s", id))
 					}
 					vm.store.LogAudit(namespace, id, "ghost_fixed", fmt.Sprintf("Found %d copies, purged and re-inserted", count))
 				} else {
@@ -547,7 +580,7 @@ func (vm *Manager) validateInternal(ctx context.Context, namespace string, keys 
 					res.Status = "healed_pending_verify"
 					res.Reason = "Auto-healed: Content mismatch fixed"
 					if config.Cfg.Logging.Level == "debug" {
-						logging.PrintSuccess(fmt.Sprintf("[VAL] Fixed content mismatch for %s", id), 0)
+						logging.LogValidatorSuccess(fmt.Sprintf("Fixed content mismatch for %s", id))
 					}
 					vm.store.LogAudit(namespace, id, "content_mismatch_fixed", "Field values differed, overwrote target")
 				}
@@ -555,12 +588,12 @@ func (vm *Manager) validateInternal(ctx context.Context, namespace string, keys 
 
 		} else {
 			if count > 0 {
-				delRes, errDel := targetColl.DeleteOne(checkCtx, bson.D{{Key: "_id", Value: idVal}})
+				delRes, errDel := targetColl.DeleteMany(checkCtx, bson.D{{Key: "_id", Value: idVal}})
 				if errDel == nil {
 					res.Status = "healed_pending_verify"
 					res.Reason = "Auto-healed: Deleted orphaned document"
 					if config.Cfg.Logging.Level == "debug" {
-						logging.PrintSuccess(fmt.Sprintf("[VAL] Deleted %d orphans for %s", delRes.DeletedCount, id), 0)
+						logging.LogValidatorSuccess(fmt.Sprintf("Deleted %d orphans for %s", delRes.DeletedCount, id))
 					}
 					vm.store.LogAudit(namespace, id, "orphan_deleted", fmt.Sprintf("Deleted %d orphaned documents", delRes.DeletedCount))
 				} else {
@@ -599,9 +632,7 @@ func (vm *Manager) RetryAllFailures(ctx context.Context) (int, error) {
 				if oid, err := bson.ObjectIDFromHex(f.DocID); err == nil {
 					idVal = oid
 				} else if parsedUUID, err := uuid.Parse(f.DocID); err == nil {
-					b := make([]byte, 16)
-					copy(b, parsedUUID[:])
-					idVal = bson.Binary{Data: b, Subtype: 4}
+					idVal = parsedUUID
 				}
 				filter = bson.D{{Key: "_id", Value: idVal}}
 			}
@@ -711,6 +742,8 @@ func processCursorResults(ctx context.Context, cursor *mongo.Cursor) (map[string
 		switch v := idVal.(type) {
 		case bson.ObjectID:
 			foundIDStr = v.Hex()
+		case uuid.UUID:
+			foundIDStr = v.String()
 		case bson.Binary:
 			if v.Subtype == 4 {
 				if u, err := uuid.FromBytes(v.Data); err == nil {
@@ -737,7 +770,7 @@ func processCursorResults(ctx context.Context, cursor *mongo.Cursor) (map[string
 
 func (vm *Manager) QueueScan(ns, scanType string) {
 	go func() {
-		logging.PrintInfo(fmt.Sprintf("[VAL SCAN] Starting full validation scan for %s (Mode: %s)", ns, scanType), 0)
+		logging.LogValidatorInfo(fmt.Sprintf("Starting full validation scan for %s (Mode: %s)", ns, scanType))
 
 		ctx := context.Background() // Long-running background process
 		parts := strings.SplitN(ns, ".", 2)
@@ -753,7 +786,7 @@ func (vm *Manager) QueueScan(ns, scanType string) {
 		opts := options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}})
 		cursor, err := coll.Find(ctx, bson.D{}, opts)
 		if err != nil {
-			logging.PrintError(fmt.Sprintf("[VAL SCAN] Failed to query collection: %v", err), 0)
+			logging.LogValidatorError(fmt.Sprintf("Failed to query collection: %v", err))
 			return
 		}
 		defer cursor.Close(ctx)
@@ -763,7 +796,7 @@ func (vm *Manager) QueueScan(ns, scanType string) {
 
 		for cursor.Next(ctx) {
 			if vm.shutdownCtx.Err() != nil {
-				logging.PrintInfo("[VAL SCAN] Scan aborted due to shutdown.", 0)
+				logging.LogValidatorInfo("Scan aborted due to shutdown.")
 				return
 			}
 
@@ -800,6 +833,6 @@ func (vm *Manager) QueueScan(ns, scanType string) {
 			vm.ValidateAsync(ns, batch)
 		}
 
-		logging.PrintInfo(fmt.Sprintf("[VAL SCAN] Full scan queued %d documents for %s", count, ns), 0)
+		logging.LogValidatorInfo(fmt.Sprintf("Full scan queued %d documents for %s", count, ns))
 	}()
 }

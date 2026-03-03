@@ -26,6 +26,9 @@ logging:
   # Path to full load ops log
   full_load_log_path: "logs/full_load.log"
 
+  # validator log
+  validator_log_path: "logs/validator.log"
+
 # -----------------------------------------------
 # Source DocumentDB
 # -----------------------------------------------
@@ -112,6 +115,19 @@ validation:
   # Enabled: If true, every batch written by CDC is immediately queued for verification.
   # This ensures data consistency in real-time. You want to enable this, otherwise, you will have to validate source and destination on your own
   enabled: True
+
+  # --------------------------------------------------------------------------
+  # full_validation: Controls the scope of CDC data validation.
+  #   - true:  (Default) Validates all operations (Inserts, Upserts, Updates, and Deletes).
+  #   - false: Validates ONLY Deletes. This is a massive performance optimization 
+  #            since Inserts and Updates are guaranteed by the source change stream 
+  #            payload, whereas Deletes lose their full document payload.
+  #
+  # * Note: This setting is hot-reloadable! You can change this from true to false 
+  #         while the app is running and the validator will adjust immediately 
+  #         without requiring a restart.
+  # --------------------------------------------------------------------------
+  full_validation: false
 
   # Batch Size: How many documents to validate in a single lookup operation.
   # Larger batches reduce network round-trips but increase memory usage.

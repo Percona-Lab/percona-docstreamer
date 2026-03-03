@@ -228,15 +228,25 @@ func (m *CDCManager) getSafeCheckpointTS() bson.Timestamp {
 
 	minTS := bson.Timestamp{T: 0xFFFFFFFF, I: 0xFFFFFFFF}
 
+	anyPending := false
+	for _, pending := range m.watermark.workerPending {
+		if pending > 0 {
+			anyPending = true
+			break
+		}
+	}
+
 	for i := 0; i < len(m.watermark.workerLastTS); i++ {
 		effectiveTS := m.watermark.workerLastTS[i]
-		if m.watermark.workerPending[i] == 0 {
+		if m.watermark.workerPending[i] == 0 && !anyPending {
 			effectiveTS = m.watermark.lastReceivedTS
 		}
+
 		if effectiveTS.T < minTS.T || (effectiveTS.T == minTS.T && effectiveTS.I < minTS.I) {
 			minTS = effectiveTS
 		}
 	}
+
 	return minTS
 }
 
@@ -264,7 +274,22 @@ func (m *CDCManager) handleBulkWrite(ctx context.Context, batchMap map[string]*B
 			totalDel += del
 			namespaces = append(namespaces, ns)
 			if len(batch.Keys) > 0 {
-				m.validatorMgr.ValidateAsync(ns, batch.Keys)
+				if !config.Cfg.Validation.FullValidation {
+					var deleteKeys []bson.D
+					for i, model := range batch.Models {
+						if _, isDelete := model.(*mongo.DeleteOneModel); isDelete {
+							deleteKeys = append(deleteKeys, batch.Keys[i])
+						} else if _, isDelMany := model.(*mongo.DeleteManyModel); isDelMany {
+							deleteKeys = append(deleteKeys, batch.Keys[i])
+						}
+					}
+					if len(deleteKeys) > 0 {
+						m.validatorMgr.ValidateAsync(ns, deleteKeys)
+					}
+				} else {
+					// Default to "full" validation
+					m.validatorMgr.ValidateAsync(ns, batch.Keys)
+				}
 			}
 			continue
 		}
@@ -464,12 +489,16 @@ func (m *CDCManager) hydrateAndFixOperations(ctx context.Context, ns string, bat
 			continue
 		}
 
-		currentKeys := bson.D{}
+		hydratedFilter := bson.D{{Key: "_id", Value: idVal}}
 		hasKeys := true
 		for _, key := range shardKeys {
+			// Skip _id if it's part of the shard key to prevent duplicate fields
+			if key == "_id" {
+				continue
+			}
 			path := strings.Split(key, ".")
 			if val, ok := GetNestedValue(doc, path); ok {
-				currentKeys = append(currentKeys, bson.E{Key: key, Value: val})
+				hydratedFilter = append(hydratedFilter, bson.E{Key: key, Value: val})
 			} else {
 				hasKeys = false
 				break
@@ -481,9 +510,6 @@ func (m *CDCManager) hydrateAndFixOperations(ctx context.Context, ns string, bat
 			newKeys = append(newKeys, batch.Keys[i])
 			continue
 		}
-
-		hydratedFilter := bson.D{{Key: "_id", Value: idVal}}
-		hydratedFilter = append(hydratedFilter, currentKeys...)
 
 		wasSplit := false
 
@@ -626,10 +652,19 @@ func (m *CDCManager) executeBatch(ctx context.Context, ns string, batch *Batch) 
 
 	res, err := targetColl.BulkWrite(attemptCtx, batch.Models, opts)
 	if err != nil {
-		// Existing error handling
+		// Check for duplicate keys
 		if mongo.IsDuplicateKeyError(err) || strings.Contains(err.Error(), "E11000") {
 			return 0, 0, 0, 0, nil
 		}
+
+		// Detect structural/targeting errors that should not be retried
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "matched twice") ||
+			strings.Contains(errMsg, "must contain a single field") ||
+			strings.Contains(errMsg, "shard key") {
+			return 0, 0, 0, 0, err
+		}
+
 		return 0, 0, 0, 0, err
 	}
 
@@ -652,6 +687,12 @@ func (m *CDCManager) executeSerially(ctx context.Context, ns string, batch *Batc
 			Keys:   []bson.D{batch.Keys[i]},
 		}
 
+		retries := 0
+		maxRetries := config.Cfg.CDC.NumRetries
+		if maxRetries <= 0 {
+			maxRetries = 10
+		}
+
 		for {
 			if ctx.Err() != nil {
 				return 0, 0, 0, 0, ctx.Err()
@@ -663,8 +704,17 @@ func (m *CDCManager) executeSerially(ctx context.Context, ns string, batch *Batc
 				totalIns += ins
 				totalUpd += upd
 				totalDel += del
+
 				if i < len(batch.Keys) {
-					m.validatorMgr.ValidateAsync(ns, []bson.D{batch.Keys[i]})
+					if !config.Cfg.Validation.FullValidation {
+						if _, isDelete := model.(*mongo.DeleteOneModel); isDelete {
+							m.validatorMgr.ValidateAsync(ns, []bson.D{batch.Keys[i]})
+						} else if _, isDelMany := model.(*mongo.DeleteManyModel); isDelMany {
+							m.validatorMgr.ValidateAsync(ns, []bson.D{batch.Keys[i]})
+						}
+					} else {
+						m.validatorMgr.ValidateAsync(ns, []bson.D{batch.Keys[i]})
+					}
 				}
 				break
 			}
@@ -673,16 +723,44 @@ func (m *CDCManager) executeSerially(ctx context.Context, ns string, batch *Batc
 				return 0, 0, 0, 0, err
 			}
 
-			// Prevent infinite loop on invalid update documents
-			if strings.Contains(err.Error(), "update document must have at least one element") {
-				if config.Cfg.Logging.Level == "debug" {
-					logging.PrintError(fmt.Sprintf("[CDC %s] Skipping invalid operation: %v. ID: %s", ns, err, formatID(batch.Keys[i])), 0)
+			errStr := err.Error()
+
+			// Fast-fail unrecoverable database errors to avoid waiting 20s per broken document
+			isUnrecoverable := strings.Contains(errStr, "update document must have at least one element") ||
+				strings.Contains(errStr, "shard key") ||
+				strings.Contains(errStr, "Failed to target")
+
+			if isUnrecoverable || retries >= maxRetries {
+				reason := fmt.Sprintf("CDC Serial op failed after max retries: %v", err)
+				if isUnrecoverable {
+					reason = fmt.Sprintf("CDC Unrecoverable structural error: %v", err)
 				}
-				break // Stop retrying this specific op and move to the next in the batch
+
+				logging.PrintError(fmt.Sprintf("[CDC %s] %s. Dropping model to prevent deadlock and logging to persistent store.", ns, reason), 0)
+
+				// Log the EXACT real error directly to the persistent failures collection!
+				if i < len(batch.Keys) {
+					idVal := ""
+					for _, e := range batch.Keys[i] {
+						if e.Key == "_id" {
+							idVal = formatID(e.Value)
+							break
+						}
+					}
+
+					m.store.RegisterOutcome(context.Background(), ns, validator.ValidationResult{
+						DocID:  idVal,
+						Keys:   batch.Keys[i],
+						Status: "cdc_write_failed",
+						Reason: reason,
+					})
+				}
+				break // Stop retrying this specific op and move to the next
 			}
 
+			retries++
 			if config.Cfg.Logging.Level == "debug" {
-				logging.PrintWarning(fmt.Sprintf("[CDC %s] Serial op failed: %v. Model: %s. Throttling...", ns, err, describeModel(model)), 0)
+				logging.PrintWarning(fmt.Sprintf("[CDC %s] Serial op failed (Attempt %d): %v. Model: %s. Throttling...", ns, retries, err, describeModel(model)), 0)
 			}
 
 			select {
@@ -764,12 +842,6 @@ func (m *CDCManager) Start(ctx context.Context) error {
 	}
 
 	logging.PrintInfo(fmt.Sprintf("Starting CDC... Resuming from: %v", m.startAt), 0)
-
-	go func() {
-		if err := m.validatorMgr.ReconcileStats(ctx); err != nil {
-			logging.PrintWarning(fmt.Sprintf("[CDC] Stats reconciliation failed: %v", err), 0)
-		}
-	}()
 
 	cdcCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -876,16 +948,26 @@ func (m *CDCManager) runChangeStream(ctx context.Context) error {
 		SetFullDocument(options.UpdateLookup).
 		SetMaxAwaitTime(maxAwaitTime)
 
+	// Step 1: Get the current global safe checkpoint based on applied batches
 	safeStart := m.getSafeCheckpointTS()
-	if safeStart.T == 0xFFFFFFFF {
-		safeStart = m.startAt
+
+	// Step 2: On fresh starts or restarts with uninitialized watermarks,
+	// use the T0 Anchor to bridge the gap between Full Load and CDC.
+	if safeStart.T == 0 || safeStart.T == 0xFFFFFFFF {
+		if anchorTS, found := m.checkpoint.GetAnchorTimestamp(ctx); found {
+			safeStart = anchorTS
+			logging.PrintInfo(fmt.Sprintf("[CDC] Fresh start: Resuming from T0 Anchor: %d.%d", safeStart.T, safeStart.I), 0)
+		} else if collTS, found := m.checkpoint.GetLatestCollectionCheckpoint(ctx); found {
+			safeStart = collTS
+			logging.PrintInfo(fmt.Sprintf("[CDC] Fresh start: Resuming from oldest collection T0: %d.%d", safeStart.T, safeStart.I), 0)
+		} else {
+			safeStart = m.startAt
+		}
 	}
 
 	if safeStart.T > 0 {
 		opts.SetStartAtOperationTime(&safeStart)
 		logging.PrintInfo(fmt.Sprintf("[CDC] Starting stream from SAFE timestamp: %d.%d", safeStart.T, safeStart.I), 0)
-	} else {
-		opts.SetStartAtOperationTime(&m.startAt)
 	}
 
 	m.statusManager.SetState("running", "Change Data Capture")

@@ -55,10 +55,11 @@ type CDCConfig struct {
 
 // LoggingConfig holds logging settings
 type LoggingConfig struct {
-	Level           string `mapstructure:"level"`
-	FilePath        string `mapstructure:"file_path"`
-	OpsLogPath      string `mapstructure:"ops_log_path"`
-	FullLoadLogPath string `mapstructure:"full_load_log_path"`
+	Level            string `mapstructure:"level"`
+	FilePath         string `mapstructure:"file_path"`
+	OpsLogPath       string `mapstructure:"ops_log_path"`
+	FullLoadLogPath  string `mapstructure:"full_load_log_path"`
+	ValidatorLogPath string `mapstructure:"validator_log_path"`
 }
 
 // DocDBConfig holds source-specific settings
@@ -122,6 +123,7 @@ type ClonerConfig struct {
 // ValidationConfig holds settings for online data validation
 type ValidationConfig struct {
 	Enabled                    bool `mapstructure:"enabled"`
+	FullValidation             bool `mapstructure:"full_validation"`
 	BatchSize                  int  `mapstructure:"batch_size"`
 	RetryIntervalMS            int  `mapstructure:"retry_interval_ms"`
 	MaxValidationWorkers       int  `mapstructure:"max_validation_workers"`
@@ -165,6 +167,7 @@ func LoadConfig() {
 	viper.SetDefault("logging.file_path", "docStreamer.log")
 	viper.SetDefault("logging.ops_log_path", "cdc.log")
 	viper.SetDefault("logging.full_load_log_path", "full_load.log")
+	viper.SetDefault("logging.validator_log_path", "validator.log")
 
 	viper.SetDefault("docdb.endpoint", "localhost")
 	viper.SetDefault("docdb.port", "27017")
@@ -221,6 +224,7 @@ func LoadConfig() {
 
 	// Validation Defaults
 	viper.SetDefault("validation.enabled", true)
+	viper.SetDefault("validation.full_validation", true)
 	viper.SetDefault("validation.batch_size", 100)
 	viper.SetDefault("validation.retry_interval_ms", 500)
 	viper.SetDefault("validation.max_validation_workers", 4)

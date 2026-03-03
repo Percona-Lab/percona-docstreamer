@@ -91,6 +91,7 @@ docStreamer %s `, version),
 			logging.Init()
 			logging.InitOpLogger()
 			logging.InitFullLoadLogger()
+			logging.InitValidatorLog()
 		}
 		if cmd.Name() != "run" && cmd.Name() != "status" {
 			logging.PrintHeader("DocMongo Stream")
@@ -829,6 +830,13 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	tracker := validator.NewInFlightTracker()
 	statusManager = status.NewManager(targetClient, false, version)
 
+	flowManager := flow.NewManager(targetClient, statusManager, mongoUser, mongoPass)
+	valStore := validator.NewStore(targetClient, flowManager, statusManager)
+
+	if err := valStore.Reconcile(ctx); err != nil {
+		logging.PrintWarning(fmt.Sprintf("Stats reconciliation failed: %v", err), 0)
+	}
+
 	if err := statusManager.LoadAndMerge(ctx); err != nil {
 		logging.PrintInfo(fmt.Sprintf("Status load skipped: %v", err), 0)
 	}
@@ -855,11 +863,8 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	flowManager := flow.NewManager(targetClient, statusManager, mongoUser, mongoPass)
 	flowManager.Start()
 	defer flowManager.Stop()
-
-	valStore := validator.NewStore(targetClient, flowManager, statusManager)
 
 	apiServer = api.NewServer(config.Cfg.Migration.StatusHTTPPort)
 
@@ -890,7 +895,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	validationManager := validator.NewManager(valSourceClient, valTargetClient, tracker, valStore, statusManager, flowManager)
 	defer validationManager.Close()
 
-	apiServer.RegisterRoute("/status", statusManager.StatusHandler)
+	apiServer.RegisterRoute("/status", statusManager.StatusHandler(valStore))
 	apiServer.RegisterRoute("/validate", validationManager.HandleValidateRequest)
 	apiServer.RegisterRoute("/validate/adhoc", validationManager.HandleAdHocValidation)
 	apiServer.RegisterRoute("/validate/stats", validationManager.HandleGetStats)
@@ -1107,6 +1112,9 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		validationManager,
 		flowManager,
 	)
+
+	// Start the validator right before CDC starts
+	validationManager.Start()
 
 	cdcManager.Start(ctx)
 	logging.PrintInfo("CDC process stopped.", 0)

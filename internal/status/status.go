@@ -16,6 +16,10 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
+type ValidatorStore interface {
+	GetTotals(ctx context.Context) (int64, int64, int64, int64, error)
+}
+
 type StatusOutput struct {
 	Version string `json:"version"`
 	OK      bool   `json:"ok"`
@@ -144,13 +148,11 @@ type Manager struct {
 	fcNativeSustainer atomic.Int64
 
 	// Validation Stats (In-Memory)
-	valTotalChecked  atomic.Int64
-	valMismatchFound atomic.Int64
-	valMismatchFixed atomic.Int64
-	valPending       atomic.Int64
-	valHotKeys       atomic.Int64
-	valLastCheck     atomic.Int64
-	valQueueSize     atomic.Int64
+	valTotalChecked atomic.Int64
+	valPending      atomic.Int64
+	valHotKeys      atomic.Int64
+	valLastCheck    atomic.Int64
+	valQueueSize    atomic.Int64
 }
 
 func NewManager(client *mongo.Client, isSource bool, version string) *Manager {
@@ -185,12 +187,6 @@ func (m *Manager) UpdateFlowControl(paused bool, reason string, queuedOps, write
 func (m *Manager) UpdateValidationStats(checked, found, fixed, pending, hotKeys int64) {
 	if checked > 0 {
 		m.valTotalChecked.Add(checked)
-	}
-	if found > 0 {
-		m.valMismatchFound.Add(found)
-	}
-	if fixed > 0 {
-		m.valMismatchFixed.Add(fixed)
 	}
 	m.valPending.Store(pending)
 	m.valHotKeys.Store(hotKeys)
@@ -317,6 +313,12 @@ func (m *Manager) LoadAndMerge(ctx context.Context) error {
 		return err
 	}
 
+	if valStatsRaw, ok := doc["validation"]; ok {
+		if valStats, isM := valStatsRaw.(bson.M); isM {
+			m.valTotalChecked.Store(parseInt64(valStats["totalChecked"]))
+		}
+	}
+
 	if val, ok := doc["lastSourceEventTime"]; ok {
 		m.lastSourceEventTime.Store(parseInt64(val))
 	}
@@ -395,26 +397,6 @@ func (m *Manager) LoadAndMerge(ctx context.Context) error {
 	}
 	m.mu.Unlock()
 
-	//Safe Validation Stats Loading (handles int32/int64/float64 transparently)
-	if valStatsRaw, ok := doc["validation"]; ok {
-		if valStats, isM := valStatsRaw.(bson.M); isM {
-			m.valTotalChecked.Store(parseInt64(valStats["totalChecked"]))
-			m.valMismatchFound.Store(parseInt64(valStats["mismatchFound"]))
-			m.valMismatchFixed.Store(parseInt64(valStats["mismatchFixed"]))
-		} else if valStatsD, isD := valStatsRaw.(bson.D); isD {
-			for _, e := range valStatsD {
-				switch e.Key {
-				case "totalChecked":
-					m.valTotalChecked.Store(parseInt64(e.Value))
-				case "mismatchFound":
-					m.valMismatchFound.Store(parseInt64(e.Value))
-				case "mismatchFixed":
-					m.valMismatchFixed.Store(parseInt64(e.Value))
-				}
-			}
-		}
-	}
-
 	if fc, ok := doc["flowControl"].(bson.M); ok {
 		if val, ok := fc["isPaused"].(bool); ok {
 			m.fcIsPaused.Store(val)
@@ -467,8 +449,6 @@ func (m *Manager) Persist(ctx context.Context) {
 
 	valStats := bson.M{
 		"totalChecked":    m.valTotalChecked.Load(),
-		"mismatchFound":   m.valMismatchFound.Load(),
-		"mismatchFixed":   m.valMismatchFixed.Load(),
 		"lastValidatedAt": time.Unix(m.valLastCheck.Load(), 0).UTC(),
 	}
 
@@ -525,17 +505,14 @@ func (m *Manager) GetCDCIdleMetrics() (float64, float64) {
 	return idle, lag
 }
 
-func (m *Manager) GetStats() StatusOutput {
-	// Internal helper to get raw stats without HTTP wrapping if needed
-	return m.buildStatusOutput()
+func (m *Manager) GetStats(valStore ValidatorStore) StatusOutput {
+	return m.buildStatusOutput(valStore)
 }
 
-func (m *Manager) StatusHandler(w http.ResponseWriter, r *http.Request) {
-	out := m.buildStatusOutput()
-	w.Header().Set("Content-Type", "application/json")
-	if b, err := json.MarshalIndent(out, "", "    "); err == nil {
-		w.Write(b)
-	} else {
+func (m *Manager) StatusHandler(valStore ValidatorStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		out := m.buildStatusOutput(valStore)
+		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(out)
 	}
 }
@@ -560,7 +537,7 @@ func ByteToHuman(bytes int64) string {
 	return fmt.Sprintf("%d B", bytes)
 }
 
-func (m *Manager) buildStatusOutput() StatusOutput {
+func (m *Manager) buildStatusOutput(valStore ValidatorStore) StatusOutput {
 	m.mu.RLock()
 	state := m.state
 	info := m.info
@@ -600,19 +577,12 @@ func (m *Manager) buildStatusOutput() StatusOutput {
 		progress = 100.0
 	}
 
-	vChecked := m.valTotalChecked.Load()
-	vFound := m.valMismatchFound.Load()
-	vFixed := m.valMismatchFixed.Load()
-	vPending := m.valPending.Load()
+	vChecked, vFound, vFixed, vPending, _ := valStore.GetTotals(context.Background())
 	vLast := m.valLastCheck.Load()
 
 	vPercent := 0.0
 	if vChecked > 0 {
-		validOrFixedCount := vChecked - vPending
-		if validOrFixedCount < 0 {
-			validOrFixedCount = 0
-		}
-		vPercent = (float64(validOrFixedCount) / float64(vChecked)) * 100.0
+		vPercent = (float64(vChecked-vPending) / float64(vChecked)) * 100.0
 	}
 
 	vLastStr := ""

@@ -93,10 +93,12 @@ func NewStore(client *mongo.Client, flowMgr *flow.Manager, statusMgr *status.Man
 }
 
 func (s *Store) Close() {
+	logging.PrintInfo("[VAL STORE] Shutting down stats persistence workers...", 0)
 	close(s.quit)
 	close(s.outcomeChan)
 	close(s.auditChan)
 	s.wg.Wait()
+	logging.PrintInfo("[VAL STORE] Stats persistence workers stopped.", 0)
 }
 
 func (s *Store) ensureIndexes() {
@@ -231,16 +233,22 @@ func (s *Store) writeChunk(batch []outcomeOp) {
 				{Key: "detected_at", Value: time.Now().UTC()},
 				{Key: "keys", Value: op.res.Keys},
 			}
+
+			// Group all fields meant for $set to avoid duplicate operator errors
 			setFields := bson.D{
 				{Key: "status", Value: op.res.Status},
 				{Key: "reason", Value: op.res.Reason},
 			}
 			update := bson.D{{Key: "$setOnInsert", Value: setOnInsert}}
 
-			if op.res.Status == "hot_key_waiting" || op.res.Status == "batch_failed" ||
-				op.res.Status == "healed_pending_verify" || op.res.Status == "safety_deferred_delete" {
+			switch op.res.Status {
+			case "hot_key_waiting":
+				setFields = append(setFields, bson.E{Key: "retry_count", Value: config.Cfg.Validation.MaxRetries})
+
+			case "batch_failed", "healed_pending_verify", "safety_deferred_delete":
 				setFields = append(setFields, bson.E{Key: "retry_count", Value: 0})
-			} else {
+
+			default:
 				update = append(update, bson.E{Key: "$inc", Value: bson.D{{Key: "retry_count", Value: 1}}})
 			}
 			update = append(update, bson.E{Key: "$set", Value: setFields})
@@ -257,11 +265,9 @@ func (s *Store) writeChunk(batch []outcomeOp) {
 		res, err := s.failures.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
 
 		if err != nil {
-			logging.PrintWarning(fmt.Sprintf("[VAL STORE] DB congested. Re-queued %d items for %s.", len(models), ns), 0)
+			logging.LogValidatorWarning(fmt.Sprintf("DB congested. Re-queued %d items for %s.", len(models), ns))
 
 			// Re-queue items back into the channel using a goroutine to avoid deadlock
-			// The channel might be full, but we must retry. This goroutine allows the
-			// writeChunk function to return, freeing up the worker.
 			go func(nsToRetry string) {
 				for _, op := range batch {
 					if op.ns == nsToRetry {
@@ -323,7 +329,7 @@ func (s *Store) flushAuditBatch(batch []interface{}) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if _, err := s.audit.InsertMany(ctx, batch); err != nil {
-		logging.PrintWarning(fmt.Sprintf("[VAL STORE] Audit log write failed: %v", err), 0)
+		logging.LogValidatorWarning(fmt.Sprintf("Audit log write failed: %v", err))
 	}
 }
 
@@ -385,10 +391,19 @@ func (s *Store) HasEligibleFailures(ctx context.Context, maxRetries int) bool {
 }
 
 func getEligibleFilter(maxRetries int) bson.D {
+	// If maxRetries is negative, we enforce no retry limits.
+	// This ensures items deferred due to high activity are eventually
+	// processed during CDC idle periods, regardless of attempt count.
+	if maxRetries < 0 {
+		return bson.D{
+			{Key: "status", Value: bson.D{{Key: "$ne", Value: "manual_validation_required"}}},
+		}
+	}
+
 	return bson.D{
 		{Key: "status", Value: bson.D{{Key: "$ne", Value: "manual_validation_required"}}},
 		{Key: "$or", Value: bson.A{
-			bson.D{{Key: "retry_count", Value: bson.D{{Key: "$lt", Value: maxRetries}}}},
+			bson.D{{Key: "retry_count", Value: bson.D{{Key: "$lte", Value: maxRetries}}}},
 			bson.D{{Key: "retry_count", Value: bson.D{{Key: "$exists", Value: false}}}},
 		}},
 	}
@@ -422,7 +437,7 @@ func (s *Store) Reset(ctx context.Context) error {
 }
 
 func (s *Store) Reconcile(ctx context.Context) error {
-	logging.PrintInfo("[VAL STORE] Starting stats reconciliation...", 0)
+	logging.LogValidatorInfo("[VAL STORE] Starting stats reconciliation...")
 
 	auditPipeline := mongo.Pipeline{
 		{{Key: "$match", Value: bson.D{{Key: "action", Value: bson.D{{Key: "$in", Value: bson.A{"ghost_fixed", "content_mismatch_fixed", "orphan_deleted", "missing_target_fixed"}}}}}}},
@@ -494,7 +509,52 @@ func (s *Store) Reconcile(ctx context.Context) error {
 			}},
 		}
 		s.stats.UpdateOne(ctx, bson.D{{Key: "_id", Value: ns}}, update, options.UpdateOne().SetUpsert(true))
-		logging.PrintInfo(fmt.Sprintf("[VAL STORE] Reconciled %s: Found=%d, Fixed=%d, Pending=%d", ns, found, fixed, pending), 0)
+		logging.LogValidatorInfo(fmt.Sprintf("Reconciled %s: Found=%d, Fixed=%d, Pending=%d", ns, found, fixed, pending))
 	}
 	return nil
+}
+
+// GetTotals returns the aggregated Found and Fixed counts across all namespaces
+// directly from the validation_stats collection.
+func (s *Store) GetTotals(ctx context.Context) (int64, int64, int64, int64, error) {
+	pipeline := mongo.Pipeline{
+		{{Key: "$group", Value: bson.D{
+			{Key: "_id", Value: nil},
+			{Key: "totalChecked", Value: bson.D{{Key: "$sum", Value: "$total_checked"}}},
+			{Key: "totalFound", Value: bson.D{{Key: "$sum", Value: "$mismatch_found"}}},
+			{Key: "totalFixed", Value: bson.D{{Key: "$sum", Value: "$mismatch_fixed"}}},
+		}}},
+	}
+
+	cursor, err := s.stats.Aggregate(ctx, pipeline)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	defer cursor.Close(ctx)
+
+	var results []struct {
+		Checked int64 `bson:"totalChecked"`
+		Found   int64 `bson:"totalFound"`
+		Fixed   int64 `bson:"totalFixed"`
+	}
+
+	if err := cursor.All(ctx, &results); err != nil {
+		return 0, 0, 0, 0, err
+	}
+
+	// Use a strict filter for actionable pending mismatches.
+	// This excludes records that are 'valid' or require 'manual_validation_required'.
+	pendingFilter := bson.D{
+		{Key: "status", Value: bson.D{{Key: "$nin", Value: bson.A{"valid", "manual_validation_required"}}}},
+	}
+	pendingCount, err := s.failures.CountDocuments(ctx, pendingFilter)
+	if err != nil {
+		pendingCount = 0
+	}
+
+	if len(results) == 0 {
+		return 0, 0, 0, pendingCount, nil
+	}
+
+	return results[0].Checked, results[0].Found, results[0].Fixed, pendingCount, nil
 }
