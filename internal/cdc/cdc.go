@@ -420,6 +420,12 @@ func (m *CDCManager) hydrateAndFixOperations(ctx context.Context, ns string, bat
 
 	cursor, err := targetColl.Find(lookupCtx, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: idsToLookup}}}})
 
+	// If lookup fails, we MUST NOT assume the documents don't exist.
+	// Leave the models unchanged so we don't convert Replaces into Inserts that silently fail.
+	if err != nil {
+		return
+	}
+
 	foundDocs := make(map[string]bson.M)
 	if err == nil {
 		defer cursor.Close(ctx)
@@ -652,8 +658,10 @@ func (m *CDCManager) executeBatch(ctx context.Context, ns string, batch *Batch) 
 
 	res, err := targetColl.BulkWrite(attemptCtx, batch.Models, opts)
 	if err != nil {
-		// Check for duplicate keys
-		if mongo.IsDuplicateKeyError(err) || strings.Contains(err.Error(), "E11000") {
+		// Only ignore E11000 if we are in Adaptive Serial Mode (len == 1).
+		// If we are in Bulk Mode (len > 1), we MUST return the error so handleBulkWrite
+		// falls back to serial mode. Otherwise, all other VALID operations in this batch are silently lost!
+		if len(batch.Models) == 1 && (mongo.IsDuplicateKeyError(err) || strings.Contains(err.Error(), "E11000")) {
 			return 0, 0, 0, 0, nil
 		}
 
