@@ -629,7 +629,7 @@ You can temporarily pause the migration during overload periods. This command ha
 The application will print `[FlowControl] Data reader paused (User Emergency Pause)...` to the logs.
 
 ```bash
-docStreamer pause
+./docStreamer pause
 ```
 
 ### Resume
@@ -637,7 +637,7 @@ docStreamer pause
 This command should be used only when you want to resume a migration. It is not intended for use during a restart or stop workflow. It should be used strictly to resume the migration after the pause command has been issued.
 
 ```bash
-docStreamer resume
+./docStreamer resume
 ```
 
 ### Finalize
@@ -1183,7 +1183,7 @@ You can trigger this behavior on the fly, without restarting the application, us
 
 **To Pause:**
 ```bash
-docStreamer pause
+./docStreamer pause
 ```
 
 The application will print `[FlowControl] Data reader paused (User Emergency Pause)...` to the logs.
@@ -1191,7 +1191,7 @@ The application will print `[FlowControl] Data reader paused (User Emergency Pau
 **To Resume:**
 
 ```bash
-docStreamer resume
+./docStreamer resume
 ```
 
 The application will print `[FlowControl] Data reader resumed` to the logs and immediately pick up exactly where it left off.
