@@ -534,33 +534,75 @@ func (vm *Manager) validateInternal(ctx context.Context, namespace string, keys 
 		}
 
 		checkCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		count, errCount := targetColl.CountDocuments(checkCtx, bson.D{{Key: "_id", Value: idVal}})
 
-		isGhost := (errCount == nil && count > 1)
+		cursor, errFind := targetColl.Find(checkCtx, bson.D{{Key: "_id", Value: idVal}})
+
+		if errFind != nil {
+			res.Status = "error"
+			res.Reason = fmt.Sprintf("Target Find failed: %v", errFind)
+			vm.store.RegisterOutcome(ctx, namespace, res)
+			results = append(results, res)
+			cancel()
+			continue
+		}
+
+		var targetDocs []bson.M
+		if err := cursor.All(checkCtx, &targetDocs); err != nil {
+			res.Status = "error"
+			res.Reason = fmt.Sprintf("Target cursor decode failed: %v", err)
+			vm.store.RegisterOutcome(ctx, namespace, res)
+			results = append(results, res)
+			cancel()
+			continue
+		}
+
+		count := len(targetDocs)
 
 		if okSrc {
-			if isGhost {
-				if config.Cfg.Logging.Level == "debug" {
-					logging.LogValidatorWarning(fmt.Sprintf("Ghost detected for %s (Count: %d). Purging...", id, count))
+			if count > 1 {
+				// Ghosts exist! Delete each one specifically using a precise filter
+				deletedCount := 0
+				var lastDelErr error
+				for _, tDoc := range targetDocs {
+					delFilter := bson.D{}
+					for _, e := range key {
+						path := strings.Split(e.Key, ".")
+						if val, ok := getNestedValueValidator(tDoc, path); ok {
+							delFilter = append(delFilter, bson.E{Key: e.Key, Value: val})
+						} else {
+							delFilter = append(delFilter, bson.E{Key: e.Key, Value: e.Value})
+						}
+					}
+
+					delRes, errDel := targetColl.DeleteOne(checkCtx, delFilter)
+					if errDel != nil {
+						lastDelErr = errDel
+					} else if delRes.DeletedCount == 0 {
+						lastDelErr = fmt.Errorf("Ghost delete matched 0 docs for filter: %v", delFilter)
+					} else {
+						deletedCount++
+					}
 				}
-				targetColl.DeleteMany(checkCtx, bson.D{{Key: "_id", Value: idVal}})
+
 				_, errIns := targetColl.InsertOne(checkCtx, src)
 
-				if errIns == nil {
+				// Gracefully catch concurrent duplicate key errors
+				if (errIns == nil || mongo.IsDuplicateKeyError(errIns)) && lastDelErr == nil {
 					res.Status = "healed_pending_verify"
 					res.Reason = "Auto-healed: Purged ghosts and re-inserted"
 					if config.Cfg.Logging.Level == "debug" {
 						logging.LogValidatorSuccess(fmt.Sprintf("Fixed ghosts for %s", id))
 					}
-					vm.store.LogAudit(namespace, id, "ghost_fixed", fmt.Sprintf("Found %d copies, purged and re-inserted", count))
+					vm.store.LogAudit(namespace, id, "ghost_fixed", fmt.Sprintf("Found %d copies, purged %d and re-inserted", count, deletedCount))
 				} else {
 					res.Status = "manual_validation_required"
-					res.Reason = fmt.Sprintf("Repair failed: %v", errIns)
+					res.Reason = fmt.Sprintf("Repair failed: InsErr: %v, DelErr: %v", errIns, lastDelErr)
 				}
 
 			} else if count == 0 {
 				_, errIns := targetColl.InsertOne(checkCtx, src)
-				if errIns == nil {
+				// If it's a duplicate key, another thread just inserted it. Mark it for a double-check.
+				if errIns == nil || mongo.IsDuplicateKeyError(errIns) {
 					res.Status = "healed_pending_verify"
 					res.Reason = "Auto-healed: Inserted missing doc"
 					vm.store.LogAudit(namespace, id, "missing_target_fixed", "Document missing in destination, re-inserted")
@@ -570,35 +612,79 @@ func (vm *Manager) validateInternal(ctx context.Context, namespace string, keys 
 				}
 
 			} else {
-				var actualDst bson.M
-				errFind := targetColl.FindOne(checkCtx, bson.D{{Key: "_id", Value: idVal}}).Decode(&actualDst)
-				if errFind == nil && reflect.DeepEqual(src, actualDst) {
+				// count == 1
+				if reflect.DeepEqual(src, targetDocs[0]) {
 					res.Status = "valid"
 				} else {
-					targetColl.DeleteMany(checkCtx, bson.D{{Key: "_id", Value: idVal}})
-					targetColl.InsertOne(checkCtx, src)
-					res.Status = "healed_pending_verify"
-					res.Reason = "Auto-healed: Content mismatch fixed"
-					if config.Cfg.Logging.Level == "debug" {
-						logging.LogValidatorSuccess(fmt.Sprintf("Fixed content mismatch for %s", id))
+					// Mismatch! Extract the precise shard keys from the old document
+					delFilter := bson.D{}
+					for _, e := range key {
+						path := strings.Split(e.Key, ".")
+						if val, ok := getNestedValueValidator(targetDocs[0], path); ok {
+							delFilter = append(delFilter, bson.E{Key: e.Key, Value: val})
+						} else {
+							delFilter = append(delFilter, bson.E{Key: e.Key, Value: e.Value})
+						}
 					}
-					vm.store.LogAudit(namespace, id, "content_mismatch_fixed", "Field values differed, overwrote target")
+
+					delRes, errDel := targetColl.DeleteOne(checkCtx, delFilter)
+					if errDel == nil && delRes.DeletedCount == 0 {
+						errDel = fmt.Errorf("DeleteOne matched 0 docs using filter: %v", delFilter)
+					}
+
+					var errIns error
+					if errDel == nil {
+						_, errIns = targetColl.InsertOne(checkCtx, src)
+					}
+
+					// Catch concurrent inserts
+					if (errIns == nil || mongo.IsDuplicateKeyError(errIns)) && errDel == nil {
+						res.Status = "healed_pending_verify"
+						res.Reason = "Auto-healed: Content mismatch fixed"
+						if config.Cfg.Logging.Level == "debug" {
+							logging.LogValidatorSuccess(fmt.Sprintf("Fixed content mismatch for %s", id))
+						}
+						vm.store.LogAudit(namespace, id, "content_mismatch_fixed", "Field values differed, overwrote target")
+					} else {
+						res.Status = "manual_validation_required"
+						res.Reason = fmt.Sprintf("Mismatch repair failed. DelErr: %v, InsErr: %v", errDel, errIns)
+					}
 				}
 			}
-
 		} else {
 			if count > 0 {
-				delRes, errDel := targetColl.DeleteMany(checkCtx, bson.D{{Key: "_id", Value: idVal}})
-				if errDel == nil {
+				deletedCount := 0
+				var lastDelErr error
+				for _, tDoc := range targetDocs {
+					delFilter := bson.D{}
+					for _, e := range key {
+						path := strings.Split(e.Key, ".")
+						if val, ok := getNestedValueValidator(tDoc, path); ok {
+							delFilter = append(delFilter, bson.E{Key: e.Key, Value: val})
+						} else {
+							delFilter = append(delFilter, bson.E{Key: e.Key, Value: e.Value})
+						}
+					}
+
+					delRes, errDel := targetColl.DeleteOne(checkCtx, delFilter)
+					if errDel != nil {
+						lastDelErr = errDel
+					} else if delRes.DeletedCount == 0 {
+						lastDelErr = fmt.Errorf("Orphan delete matched 0 docs for filter: %v", delFilter)
+					} else {
+						deletedCount++
+					}
+				}
+				if lastDelErr == nil {
 					res.Status = "healed_pending_verify"
 					res.Reason = "Auto-healed: Deleted orphaned document"
 					if config.Cfg.Logging.Level == "debug" {
-						logging.LogValidatorSuccess(fmt.Sprintf("Deleted %d orphans for %s", delRes.DeletedCount, id))
+						logging.LogValidatorSuccess(fmt.Sprintf("Deleted %d orphans for %s", deletedCount, id))
 					}
-					vm.store.LogAudit(namespace, id, "orphan_deleted", fmt.Sprintf("Deleted %d orphaned documents", delRes.DeletedCount))
+					vm.store.LogAudit(namespace, id, "orphan_deleted", fmt.Sprintf("Deleted %d orphaned documents", deletedCount))
 				} else {
 					res.Status = "manual_validation_required"
-					res.Reason = fmt.Sprintf("Delete failed: %v", errDel)
+					res.Reason = fmt.Sprintf("Delete failed: %v", lastDelErr)
 				}
 			} else {
 				res.Status = "valid"
@@ -835,4 +921,51 @@ func (vm *Manager) QueueScan(ns, scanType string) {
 
 		logging.LogValidatorInfo(fmt.Sprintf("Full scan queued %d documents for %s", count, ns))
 	}()
+}
+
+func getNestedValueValidator(doc interface{}, path []string) (interface{}, bool) {
+	if doc == nil {
+		return nil, false
+	}
+	current := doc
+	for _, part := range path {
+		switch v := current.(type) {
+		case bson.M:
+			if val, exists := v[part]; exists {
+				current = val
+			} else {
+				return nil, false
+			}
+		case map[string]interface{}:
+			if val, exists := v[part]; exists {
+				current = val
+			} else {
+				return nil, false
+			}
+		case bson.D:
+			found := false
+			for _, e := range v {
+				if e.Key == part {
+					current = e.Value
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil, false
+			}
+		default:
+			return nil, false
+		}
+	}
+
+	// The Go driver decodes UUIDs into generic maps as bson.Binary{Subtype: 4}.
+	// We must convert it back to a native uuid.UUID to ensure DeleteOne matches correctly in MongoDB.
+	if b, ok := current.(bson.Binary); ok && b.Subtype == 4 {
+		if u, err := uuid.FromBytes(b.Data); err == nil {
+			return u, true
+		}
+	}
+
+	return current, true
 }

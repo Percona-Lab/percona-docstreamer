@@ -84,6 +84,8 @@ func formatID(id interface{}) string {
 	switch v := id.(type) {
 	case bson.ObjectID:
 		return v.Hex()
+	case uuid.UUID:
+		return v.String()
 	case bson.Binary:
 		if v.Subtype == 4 {
 			if u, err := uuid.FromBytes(v.Data); err == nil {
@@ -281,6 +283,14 @@ func (m *CDCManager) handleBulkWrite(ctx context.Context, batchMap map[string]*B
 							deleteKeys = append(deleteKeys, batch.Keys[i])
 						} else if _, isDelMany := model.(*mongo.DeleteManyModel); isDelMany {
 							deleteKeys = append(deleteKeys, batch.Keys[i])
+						} else {
+							// Clear dirty flag for skipped validation keys to prevent memory leak & infinite hot keys
+							for _, e := range batch.Keys[i] {
+								if e.Key == "_id" {
+									m.tracker.ClearDirty(formatID(e.Value))
+									break
+								}
+							}
 						}
 					}
 					if len(deleteKeys) > 0 {
@@ -718,6 +728,14 @@ func (m *CDCManager) executeSerially(ctx context.Context, ns string, batch *Batc
 							m.validatorMgr.ValidateAsync(ns, []bson.D{batch.Keys[i]})
 						} else if _, isDelMany := model.(*mongo.DeleteManyModel); isDelMany {
 							m.validatorMgr.ValidateAsync(ns, []bson.D{batch.Keys[i]})
+						} else {
+							// Clear dirty flag for skipped validation keys
+							for _, e := range batch.Keys[i] {
+								if e.Key == "_id" {
+									m.tracker.ClearDirty(formatID(e.Value))
+									break
+								}
+							}
 						}
 					} else {
 						m.validatorMgr.ValidateAsync(ns, []bson.D{batch.Keys[i]})
