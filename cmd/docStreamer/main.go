@@ -519,6 +519,18 @@ func createAllDeferredIndexes(ctx context.Context, docdbURI, mongoURI string, st
 	}
 	defer targetClient.Disconnect(ctx)
 
+	logging.PrintStep("Stopping MongoDB Balancer to prevent index build deadlocks...", 0)
+	indexer.StopBalancer(ctx, targetClient)
+
+	// Use defer to ENSURE the balancer is restarted when this function exits,
+	// even if an error occurs or the context is cancelled.
+	defer func() {
+		logging.PrintStep("Restarting MongoDB Balancer...", 0)
+		// We use context.Background() here because if the user cancelled the operation,
+		// the original 'ctx' is dead, and the balancer restart command would fail.
+		indexer.StartBalancer(context.Background(), targetClient)
+	}()
+
 	collectionsToMigrate, err := discover.DiscoverCollections(ctx, discClient)
 	if err != nil {
 		return err
@@ -535,6 +547,11 @@ func createAllDeferredIndexes(ctx context.Context, docdbURI, mongoURI string, st
 	statusMgr.SetIndexingProgress(true, "Preparing...", 0, totalColls, false)
 
 	for i, collInfo := range collsWithIndexes {
+		if ctx.Err() != nil {
+			logging.PrintWarning("Index creation aborted due to shutdown.", 0)
+			return ctx.Err()
+		}
+
 		statusMgr.SetIndexingProgress(true, collInfo.Namespace, i, totalColls, false)
 		targetColl := targetClient.Database(collInfo.DB).Collection(collInfo.Coll)
 
@@ -542,6 +559,7 @@ func createAllDeferredIndexes(ctx context.Context, docdbURI, mongoURI string, st
 
 		if err := indexer.FinalizeIndexes(ctx, targetColl, collInfo.Indexes, collInfo.Namespace, includeTTL); err != nil {
 			logging.PrintError(fmt.Sprintf("[%s] Failed to finalize indexes: %v", collInfo.Namespace, err), 0)
+			return err
 		}
 	}
 
@@ -852,7 +870,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 			os.Exit(1)
 		}
 		logging.PrintPhase("FINALIZE", "Creating deferred indexes...")
-		if err := createAllDeferredIndexes(context.Background(), docdbURI, mongoURI, statusManager, true); err != nil {
+		if err := createAllDeferredIndexes(ctx, docdbURI, mongoURI, statusManager, true); err != nil {
 			logging.PrintError(fmt.Sprintf("Index creation failed: %v", err), 0)
 			os.Exit(1)
 		}
@@ -932,6 +950,8 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		w.Write([]byte(`{"status": "finalization started"}`))
 
 		logging.PrintPhase("FINALIZE", "Stopping CDC to begin finalization...")
+		statusManager.SetState("finalizing", "Stopping CDC to begin finalization")
+		statusManager.Persist(context.Background())
 		triggerFinalize.Store(true) // Flip the switch to trigger finalization
 		cancel()                    // Tell CDC to stop safely
 	})
@@ -1121,6 +1141,8 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 
 	if triggerFinalize.Load() {
 		logging.PrintPhase("FINALIZE", "CDC safely drained. Creating deferred indexes...")
+		statusManager.SetState("finalizing", "Creating deferred indexes")
+		statusManager.Persist(context.Background())
 		if err := createAllDeferredIndexes(context.Background(), docdbURI, mongoURI, statusManager, true); err != nil {
 			logging.PrintError(fmt.Sprintf("Index creation failed: %v", err), 0)
 		} else {

@@ -833,7 +833,7 @@ Percona docStreamer also has an API that allows you to perform certain status an
 
 ### Logs
 
-Percona docStreamer generates three separate logs, each of the logs location and name can be configured via [config.yaml](./config.yaml):
+Percona docStreamer generates separate logs, each of the logs location and name can be configured via [config.yaml](./config.yaml):
 
 1. Application Log (`logs/docStreamer.log`): Tracks the overall application status and any errors encountered.
 2. Full Load Log (`logs/full_load.log`): Dedicated to the initial full synchronization process. This log, together with the status endpoint, helps you monitor the progress of the initial sync.
@@ -1292,3 +1292,8 @@ By default, docStreamer safely defers TTL index creation. The safest and recomme
 When you run the `docStreamer finalize` command, docStreamer safely stops the CDC stream and **automatically builds your TTL indexes** (along with any other deferred indexes). Because the data stream is stopped, this ensures your target has an exact, 1:1 match of the source data before it begins autonomously managing document expiration. 
 
 *(Alternatively, you can choose to manually create TTL indexes on the destination cluster after the migration is fully complete.)*
+
+
+# Disclaimer
+
+This code is not supported by Percona. It has been provided as a community contribution and is not covered under any Percona services agreement.
