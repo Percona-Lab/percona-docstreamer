@@ -1296,4 +1296,4 @@ When you run the `docStreamer finalize` command, docStreamer safely stops the CD
 
 # Disclaimer
 
-This code is not supported by Percona. It has been provided as a community contribution and is not covered under any Percona services agreement.
+This application is not supported by Percona. It has been provided as a community contribution and is not covered under any Percona services agreement.
