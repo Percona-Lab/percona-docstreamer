@@ -1200,15 +1200,127 @@ Note: This feature is safe to use during both the Full Sync and Continuous Sync 
 
 ### Validation Optimization
 
-The data validation engine is highly configurable to balance performance impact against data integrity assurance. You can tune these settings via [config.yaml](./config.yaml) under the `validation` section.
+The validation engine is configurable so you can balance data verification, migration throughput, and load on the source and destination databases. These settings are in [config.yaml](./config.yaml) under the `validation` section.
+
+Validation runs during the CDC phase after the initial full load is complete. When CDC successfully writes a batch to the destination, docStreamer can queue the corresponding document keys for validation. A validation worker later reads the document from both the source DocumentDB cluster and the destination MongoDB cluster, compares the result, and records the validation outcome.
+
+#### How the Validation Queue Works
+
+`queuedBatches` is an internal docStreamer queue. It is not a queue inside DocumentDB or MongoDB.
+
+Each queued item contains:
+
+```text
+namespace + document key list
+```
+
+The queue lives in RAM on the host running docStreamer. It stores document keys, not full documents, so it is much smaller than buffering full records. However, it can still consume noticeable memory if both `queue_size` and `batch_size` are large, especially with compound shard keys.
+
+The practical memory ceiling is:
+
+```text
+validation.queue_size x validation.batch_size x average key size
+```
+
+Example:
+
+```yaml
+validation:
+  batch_size: 500
+  queue_size: 10000
+```
+
+This allows up to:
+
+```text
+10000 queued batches x 500 keys = 5,000,000 validation keys buffered
+```
+
+The memory for that queue is consumed on the docStreamer host. The source and destination databases are affected when validation workers drain the queue and issue reads.
+
+#### Tuning Impact by Component
+
+| Setting | Primary impact | Where the impact occurs |
+|--------:|----------------|-------------------------|
+| `queue_size` | Increases or decreases how much validation backlog docStreamer can hold before throttling. | RAM on the docStreamer host. |
+| `batch_size` | Controls how many document keys are checked in a validation operation. Larger values reduce round trips but increase memory per task. | docStreamer RAM, source reads, destination reads. |
+| `max_validation_workers` | Controls validation concurrency. Higher values validate faster but create more simultaneous reads. | docStreamer CPU/network, source DocumentDB reads, destination MongoDB reads. |
+| `full_validation` | Controls validation scope. `false` validates only deletes; `true` validates inserts, updates, upserts, and deletes. | Source and destination read load. |
+| `retry_interval_ms` / `max_retries` | Controls how aggressively hot records are rechecked. | docStreamer scheduling and extra source/destination reads. |
+
+#### What Happens if the Queue Fills
+
+If CDC writes faster than the validator can read and compare, `queuedBatches` will increase. If the validation queue reaches `queue_size`, docStreamer marks the validator as throttled and applies backpressure so CDC does not continue to build unlimited memory pressure.
+
+Increasing `queue_size` gives docStreamer more room to absorb temporary validation spikes. It does not make validation faster. It mainly delays throttling and uses more RAM on the docStreamer host.
+
+To make validation faster, tune:
+
+```yaml
+validation:
+  max_validation_workers: 8
+  batch_size: 500
+```
+
+Be careful: increasing these values can increase read pressure on both the source and destination.
+
+#### Recommended Starting Point
+
+For most migrations, start with:
+
+```yaml
+validation:
+  enabled: true
+  full_validation: false
+  batch_size: 500
+  max_validation_workers: 8
+  queue_size: 2000
+```
+
+Use `full_validation: false` unless there is a specific reason to validate every insert and update. CDC already applies inserts and updates from the source change stream payload. Delete validation is usually the highest-value check because delete events do not carry the full source document.
+
+#### How to Tune Based on Symptoms
+
+| Symptom | Likely cause | Recommended action |
+|--------:|--------------|--------------------|
+| `queuedBatches` stays near `0` | Validator is keeping up. | No change needed. |
+| `queuedBatches` rises briefly, then drains | Normal temporary burst. | No change needed unless memory is tight. |
+| `queuedBatches` continuously increases | Validator is slower than CDC. | Increase `max_validation_workers` if source/target have capacity, or reduce CDC/write pressure. |
+| docStreamer host memory grows too much | Queue or batch settings are too large. | Lower `queue_size` or `batch_size`. |
+| Source DocumentDB read load increases | Too many validation workers or large validation batches. | Lower `max_validation_workers` or `batch_size`. |
+| Destination MongoDB read/load increases | Validator is checking too aggressively. | Lower `max_validation_workers`, lower `batch_size`, or keep `full_validation: false`. |
+| CDC becomes throttled because validation is full | Validator cannot drain fast enough. | Add validation workers only if DBs can handle the reads; otherwise reduce CDC throughput or increase `queue_size` as a buffer. |
+
+You can check validator queue state with:
+
+```bash
+curl http://localhost:8080/validate/queue
+```
+
+Example response:
+
+```json
+{
+  "queue_used": 150,
+  "queue_capacity": 2000,
+  "is_throttled": false,
+  "status_message": "Healthy"
+}
+```
+
+You can also check overall migration status:
+
+```bash
+./docStreamer status
+```
 
 | Setting | Default | Description |
 |--------:|--------:|-------------|
 | `enabled` | `true` | Master switch for the validation engine. If false, final document verification after CDC writes are skipped. CDC is guaranteed to sync the documents; this is an optional additional validation check. |
 | `full_validation` | `false` | Controls the scope of CDC data validation. If true, all ops are validated. If false (recommended), ONLY Deletes are validated (massive performance boost since inserts/updates are guaranteed by the stream payload). Note: This setting is hot-reloadable and can be changed without restarting the app. |
-| `batch_size` | `100` | Network vs. Memory Trade-off. Controls how many document IDs are bundled into a single database lookup. Larger batches reduce network round-trips but increase memory usage. |
-| `max_validation_workers` | `4` | Concurrency Control. The number of parallel worker threads fetching and comparing documents. Increase this if you have spare CPU/Network capacity and notice validation lagging behind CDC. |
-| `queue_size` | `2000` | Buffer Capacity. The size of the channel buffering CDC events before validation. If the CDC writer is faster than the validator and this buffer fills up, validation requests will be queued and this could cause slowing down the replication stream. |
+| `batch_size` | `100` | Number of document keys validated together. Larger batches reduce network round trips but increase memory per validation task and the size of each source/target read. |
+| `max_validation_workers` | `4` | Number of parallel validation workers. Increase only when the docStreamer host, source DocumentDB, and destination MongoDB have spare capacity. |
+| `queue_size` | `2000` | Number of validation batches that can wait in memory on the docStreamer host. Higher values absorb backlog but use more RAM and delay throttling. |
 | `retry_interval_ms` | `500` | Hot Key Handling. If a record fails validation because it is actively being modified (detected via dirty tracking), the validator waits this long before re-checking it. |
 | `max_retries` | `3` | Persistence. How many times to retry a "Hot Key" before giving up. After this many attempts, the record is marked as a mismatch/skipped to move on. |
 | `hot_key_check_interval_minutes` | `5` | The maximum time a "Hot Key" (a record failing validation due to active writes) stays in the queue before a re-check is forced. |
