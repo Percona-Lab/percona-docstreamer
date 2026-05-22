@@ -94,6 +94,7 @@ migration:
   validation_stats_collection: "validation_stats"
   validation_failures_collection: "validation_failures"
   validation_audit_collection: "validation_audit"
+  validation_queue_collection: "validation_queue"
 
   # Timeout for collection discovery and stats (in milliseconds)
   # Default: 120000 (2 minutes) to handle large collections on DocumentDB
@@ -178,6 +179,15 @@ validation:
   # Default: 2000 (lower than 100 will revert to default 2000)
   queue_size: 2000
 
+  # Shutdown Queue Mode: Controls what happens to in-memory validation work when docStreamer stops.
+  #   - persist: (Default) Save remaining validation/retry queue items into the metadata DB and
+  #              reload them on the next startup. Best for normal stop/restart operations.
+  #   - drain:   Validate all queued items before exiting. Strictest mode, but shutdown can take
+  #              a long time when queuedBatches is high.
+  #   - drop:    Discard queued validation work and exit quickly. Use only for testing, or when
+  #              you will run a separate validation pass after restart.
+  shutdown_queue_mode: "persist"
+
 # -----------------------------------------------
 # Adaptive Flow Control (Throttling)
 # -----------------------------------------------
@@ -235,12 +245,12 @@ flow_control:
 sharding:
   # Example 1: Compound Range Sharding (Default behavior)
   # Shards on 'email' (ascending) and 'rental_id' (ascending)
-    - namespace: "lukRange_1.test_1"
+    - namespace: "docdb_compRange.test"
       shard_key: "email, rental_id"
 
   # Example 2: Custom compound range sharding with pre-splitting
   # testId is UUID datatype and testOid is an Object_ID datatype
-    - namespace: "lukHash_1.test_2"
+    - namespace: "docdb_custCompRange.test"
       shard_key: "testId:1, testOid:1"
       unique_shard_key: False # Not required, defaults to False
       pre_split_strategy: "composite_uuid_oid"
@@ -249,20 +259,20 @@ sharding:
 
   # Example 3: Hashed Sharding
   # Shards on testId ('uuid' datatype) using a Hashed Index
-    - namespace: "lukHash_1.test_1"
+    - namespace: "docdb_hash.test"
       shard_key: "testId:hashed"
       pre_split_strategy: "hashed_manual"
       pre_split_chunk_count: 10 # This will create 10 evenly spaced chunks in the hash ring
 
   # Example 4: Compound Hashed Sharding
   # Shards on 'region' (Range) and 'user_id' (Hashed)
-    - namespace: "compoundShard.test"
+    - namespace: "docdb_compHash.test"
       shard_key: "region:1, user_id:hashed"
 
   # Example 5: Range Sharding
   # Shards on 'entryTimestamp' using a range sharding
-    - namespace: "singleFieldShard.test"
-      shard_key: "entryTimestamp"
+    - namespace: "docdb_range.test"
+      shard_key: "timestamp_type"
       pre_split_strategy: "range_manual"
       pre_split_chunk_count: 10
       split_min: "1700000000000"  # Your start timestamp
@@ -361,4 +371,3 @@ cdc:
   # If the network hangs, this ensures the worker doesn't freeze forever.
   # Default: 30000 (30 seconds)
   write_timeout_ms: 300000
-

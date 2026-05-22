@@ -20,14 +20,16 @@ import (
 )
 
 type ValidationTask struct {
-	Namespace string
-	Keys      []bson.D
+	Namespace    string
+	Keys         []bson.D
+	PersistentID string
 }
 
 type RetryItem struct {
 	Namespace    string
 	Key          bson.D
 	AttemptCount int
+	PersistentID string
 }
 
 type Manager struct {
@@ -40,6 +42,7 @@ type Manager struct {
 	statusMgr       *status.Manager
 	flowMgr         *flow.Manager
 	wg              sync.WaitGroup
+	retryDelayWG    sync.WaitGroup
 	shutdownCtx     context.Context
 	shutdownCancel  context.CancelFunc
 	isThrottled     atomic.Bool
@@ -91,11 +94,178 @@ func (vm *Manager) Start() {
 	}
 
 	go vm.startBackgroundSweep()
+	vm.wg.Add(1)
+	go vm.loadPersistedQueue()
 }
 
 func (vm *Manager) Close() {
+	mode := validationShutdownMode()
 	vm.shutdownCancel()
 	vm.wg.Wait()
+	vm.retryDelayWG.Wait()
+	if mode == "persist" {
+		vm.persistRemainingQueues()
+	} else if mode == "drop" {
+		vm.dropRemainingQueues()
+	}
+}
+
+func validationShutdownMode() string {
+	switch strings.ToLower(strings.TrimSpace(config.Cfg.Validation.ShutdownQueueMode)) {
+	case "drain", "drop", "persist":
+		return strings.ToLower(strings.TrimSpace(config.Cfg.Validation.ShutdownQueueMode))
+	case "":
+		return "persist"
+	default:
+		logging.LogValidatorWarning(fmt.Sprintf("Unknown validation.shutdown_queue_mode %q. Using persist.", config.Cfg.Validation.ShutdownQueueMode))
+		return "persist"
+	}
+}
+
+func (vm *Manager) loadPersistedQueue() {
+	defer vm.wg.Done()
+	if vm.store == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if err := vm.store.ResetPersistedQueue(ctx); err != nil {
+		logging.LogValidatorWarning(fmt.Sprintf("Failed to reset persisted validation queue state: %v", err))
+	}
+	cancel()
+
+	loaded := 0
+	for {
+		select {
+		case <-vm.shutdownCtx.Done():
+			return
+		default:
+		}
+
+		ctx, cancel := context.WithTimeout(vm.shutdownCtx, 10*time.Second)
+		rec, err := vm.store.ClaimNextQueuedTask(ctx)
+		cancel()
+		if err == mongo.ErrNoDocuments {
+			if loaded > 0 {
+				logging.LogValidatorInfo(fmt.Sprintf("Loaded %d persisted validation queue records.", loaded))
+			}
+			return
+		}
+		if err != nil {
+			if vm.shutdownCtx.Err() == nil {
+				logging.LogValidatorWarning(fmt.Sprintf("Failed to claim persisted validation queue record: %v", err))
+			}
+			return
+		}
+
+		switch rec.QueueType {
+		case "retry":
+			if len(rec.Keys) == 0 {
+				vm.store.DeleteQueuedTask(context.Background(), rec.ID)
+				continue
+			}
+			item := RetryItem{
+				Namespace:    rec.Namespace,
+				Key:          rec.Keys[0],
+				AttemptCount: rec.RetryCount,
+				PersistentID: rec.ID,
+			}
+			select {
+			case vm.retryQueue <- item:
+				loaded++
+			case <-vm.shutdownCtx.Done():
+				vm.requeuePersistedRecord(rec.ID)
+				return
+			}
+		default:
+			task := ValidationTask{Namespace: rec.Namespace, Keys: rec.Keys, PersistentID: rec.ID}
+			select {
+			case vm.validationQueue <- task:
+				if vm.statusMgr != nil {
+					vm.statusMgr.SetValidationQueueSize(len(vm.validationQueue))
+				}
+				loaded++
+			case <-vm.shutdownCtx.Done():
+				vm.requeuePersistedRecord(rec.ID)
+				return
+			}
+		}
+	}
+}
+
+func (vm *Manager) requeuePersistedRecord(id string) {
+	if vm.store == nil || id == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	vm.store.MarkQueuedTaskPending(ctx, id)
+}
+
+func (vm *Manager) persistRemainingQueues() {
+	if vm.store == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	validationCount := 0
+	retryCount := 0
+	for {
+		select {
+		case task := <-vm.validationQueue:
+			if err := vm.store.PersistValidationTask(ctx, task); err != nil {
+				logging.LogValidatorError(fmt.Sprintf("Failed to persist validation queue item for %s: %v", task.Namespace, err))
+			} else {
+				validationCount++
+			}
+		default:
+			goto drainRetry
+		}
+	}
+
+drainRetry:
+	for {
+		select {
+		case item := <-vm.retryQueue:
+			if err := vm.store.PersistRetryItem(ctx, item); err != nil {
+				logging.LogValidatorError(fmt.Sprintf("Failed to persist retry queue item for %s: %v", item.Namespace, err))
+			} else {
+				retryCount++
+			}
+		default:
+			if validationCount > 0 || retryCount > 0 {
+				logging.PrintInfo(fmt.Sprintf("[VAL] Persisted validation queue on shutdown: %d validation batches, %d retry items.", validationCount, retryCount), 0)
+			}
+			return
+		}
+	}
+}
+
+func (vm *Manager) dropRemainingQueues() {
+	validationCount := 0
+	retryCount := 0
+	for {
+		select {
+		case <-vm.validationQueue:
+			validationCount++
+		default:
+			goto drainRetry
+		}
+	}
+
+drainRetry:
+	for {
+		select {
+		case <-vm.retryQueue:
+			retryCount++
+		default:
+			if validationCount > 0 || retryCount > 0 {
+				logging.PrintWarning(fmt.Sprintf("[VAL] Dropped validation queue on shutdown: %d validation batches, %d retry items.", validationCount, retryCount), 0)
+			}
+			return
+		}
+	}
 }
 
 func (vm *Manager) CanRun() bool {
@@ -325,6 +495,10 @@ func (vm *Manager) startQueueWorker(workerID int) {
 
 		select {
 		case <-vm.shutdownCtx.Done():
+			if mode := validationShutdownMode(); mode == "persist" || mode == "drop" {
+				logging.LogValidatorInfo("CDC validation worker stopped without draining queue due to shutdown queue mode.")
+				return
+			}
 			// Shutdown triggered. Drain the remaining tasks in the queue before exiting.
 			for {
 				select {
@@ -334,6 +508,8 @@ func (vm *Manager) startQueueWorker(workerID int) {
 					cancel()
 					if err != nil {
 						vm.persistFailedBatch(task.Namespace, task.Keys, fmt.Sprintf("Shutdown drain failed: %v", err))
+					} else if task.PersistentID != "" && vm.store != nil {
+						vm.store.DeleteQueuedTask(context.Background(), task.PersistentID)
 					}
 				default:
 					logging.LogValidatorInfo("CDC validation worker stopped.")
@@ -365,6 +541,10 @@ func (vm *Manager) startQueueWorker(workerID int) {
 			if err != nil && ctx.Err() == nil {
 				logging.LogValidatorError(fmt.Sprintf("Batch validation failed for %s: %v. Persisting to retry queue.", task.Namespace, err))
 				vm.persistFailedBatch(task.Namespace, task.Keys, fmt.Sprintf("Batch fetch failed: %v", err))
+			} else if err == nil && task.PersistentID != "" && vm.store != nil {
+				vm.store.DeleteQueuedTask(context.Background(), task.PersistentID)
+			} else if task.PersistentID != "" && vm.store != nil {
+				vm.requeuePersistedRecord(task.PersistentID)
 			}
 		}
 	}
@@ -405,6 +585,9 @@ func (vm *Manager) startRetryWorker() {
 
 		select {
 		case <-vm.shutdownCtx.Done():
+			if mode := validationShutdownMode(); mode == "persist" || mode == "drop" {
+				return
+			}
 			// --- SHUTDOWN DRAIN PHASE ---
 			for {
 				select {
@@ -413,22 +596,47 @@ func (vm *Manager) startRetryWorker() {
 					ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 					vm.validateInternal(ctx, item.Namespace, []bson.D{item.Key}, item.AttemptCount)
 					cancel()
+					if item.PersistentID != "" && vm.store != nil {
+						vm.store.DeleteQueuedTask(context.Background(), item.PersistentID)
+					}
 				default:
 					return // Queue is completely empty, safe to exit worker
 				}
 			}
 
 		case item := <-vm.retryQueue:
+			vm.retryDelayWG.Add(1)
 			go func(retItem RetryItem) {
+				defer vm.retryDelayWG.Done()
 				select {
 				case <-vm.shutdownCtx.Done():
+					mode := validationShutdownMode()
+					if mode == "persist" {
+						if retItem.PersistentID != "" {
+							vm.requeuePersistedRecord(retItem.PersistentID)
+						} else if vm.store != nil {
+							ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+							_ = vm.store.PersistRetryItem(ctx, retItem)
+							cancel()
+						}
+						return
+					}
+					if mode == "drop" {
+						return
+					}
 					// If shutdown happens while we are waiting for retryDelay,
 					// do NOT drop it. Validate it immediately using a fresh context.
 					ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 					vm.validateInternal(ctx, retItem.Namespace, []bson.D{retItem.Key}, retItem.AttemptCount)
 					cancel()
+					if retItem.PersistentID != "" && vm.store != nil {
+						vm.store.DeleteQueuedTask(context.Background(), retItem.PersistentID)
+					}
 				case <-time.After(retryDelay):
 					vm.validateSingle(retItem)
+					if retItem.PersistentID != "" && vm.store != nil {
+						vm.store.DeleteQueuedTask(context.Background(), retItem.PersistentID)
+					}
 				}
 			}(item)
 		}

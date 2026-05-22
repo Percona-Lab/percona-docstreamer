@@ -1264,6 +1264,44 @@ validation:
 
 Be careful: increasing these values can increase read pressure on both the source and destination.
 
+#### Validation Queue Behavior During Stop and Restart
+
+By default, docStreamer does not silently discard queued validation work during a controlled stop or restart.
+
+When `shutdown_queue_mode` is set to `persist`, docStreamer stops the validator workers, saves any remaining in-memory validation and retry queue items to the metadata database, and exits. On the next startup, docStreamer reloads those pending records from the metadata collection and processes them through the normal validator workers. Each persisted queue record is removed after it is processed.
+
+The persisted queue is stored in:
+
+```text
+<migration.metadata_db>.<migration.validation_queue_collection>
+```
+
+Default:
+
+```text
+docStreamer.validation_queue
+```
+
+Configuration:
+
+```yaml
+migration:
+  validation_queue_collection: "validation_queue"
+
+validation:
+  shutdown_queue_mode: "persist"
+```
+
+Available shutdown modes:
+
+| Mode | Behavior | Recommended use |
+|-----:|----------|-----------------|
+| `persist` | Save remaining validation and retry queue items to MongoDB metadata storage, then reload them after restart. | Default. Best for normal stop/restart operations and validation tuning changes. |
+| `drain` | Validate all queued items before exiting. | Strictest behavior, but shutdown can take a long time when `queuedBatches` is high. |
+| `drop` | Discard queued validation work and exit quickly. | Testing only, or when a separate full/ad hoc validation will be run after restart. |
+
+CDC checkpointing is separate from validation queue persistence. A persisted validation queue protects verification coverage; the CDC checkpoint protects replication continuity.
+
 #### Recommended Starting Point
 
 For most migrations, start with:
@@ -1275,6 +1313,7 @@ validation:
   batch_size: 500
   max_validation_workers: 8
   queue_size: 2000
+  shutdown_queue_mode: "persist"
 ```
 
 Use `full_validation: false` unless there is a specific reason to validate every insert and update. CDC already applies inserts and updates from the source change stream payload. Delete validation is usually the highest-value check because delete events do not carry the full source document.
@@ -1321,6 +1360,7 @@ You can also check overall migration status:
 | `batch_size` | `100` | Number of document keys validated together. Larger batches reduce network round trips but increase memory per validation task and the size of each source/target read. |
 | `max_validation_workers` | `4` | Number of parallel validation workers. Increase only when the docStreamer host, source DocumentDB, and destination MongoDB have spare capacity. |
 | `queue_size` | `2000` | Number of validation batches that can wait in memory on the docStreamer host. Higher values absorb backlog but use more RAM and delay throttling. |
+| `shutdown_queue_mode` | `persist` | Controls what happens to queued validation work during controlled shutdown. `persist` saves pending queue items to MongoDB metadata and reloads them after restart. `drain` validates all pending work before exit. `drop` discards pending validation work. |
 | `retry_interval_ms` | `500` | Hot Key Handling. If a record fails validation because it is actively being modified (detected via dirty tracking), the validator waits this long before re-checking it. |
 | `max_retries` | `3` | Persistence. How many times to retry a "Hot Key" before giving up. After this many attempts, the record is marked as a mismatch/skipped to move on. |
 | `hot_key_check_interval_minutes` | `5` | The maximum time a "Hot Key" (a record failing validation due to active writes) stays in the queue before a re-check is forced. |

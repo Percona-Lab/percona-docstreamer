@@ -2,6 +2,8 @@ package validator
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sync"
 	"time"
@@ -39,11 +41,25 @@ type ValidationStats struct {
 	MismatchFixed int64  `bson:"mismatch_fixed" json:"mismatchFixed"`
 }
 
+type PersistentQueueRecord struct {
+	ID          string    `bson:"_id" json:"id"`
+	Namespace   string    `bson:"namespace" json:"namespace"`
+	Keys        []bson.D  `bson:"keys" json:"keys"`
+	QueueType   string    `bson:"queue_type" json:"queueType"`
+	Status      string    `bson:"status" json:"status"`
+	RetryCount  int       `bson:"retry_count" json:"retryCount"`
+	CreatedAt   time.Time `bson:"created_at" json:"createdAt"`
+	PersistedAt time.Time `bson:"persisted_at" json:"persistedAt"`
+	LoadedAt    time.Time `bson:"loaded_at,omitempty" json:"loadedAt,omitempty"`
+	Reason      string    `bson:"reason,omitempty" json:"reason,omitempty"`
+}
+
 type Store struct {
 	client    *mongo.Client
 	failures  *mongo.Collection
 	stats     *mongo.Collection
 	audit     *mongo.Collection
+	queue     *mongo.Collection
 	flowMgr   *flow.Manager
 	statusMgr *status.Manager
 
@@ -81,6 +97,7 @@ func NewStore(client *mongo.Client, flowMgr *flow.Manager, statusMgr *status.Man
 		failures:    client.Database(dbName).Collection(config.Cfg.Migration.ValidationFailuresCollection),
 		stats:       client.Database(dbName).Collection(config.Cfg.Migration.ValidationStatsCollection),
 		audit:       client.Database(dbName).Collection(auditCollName),
+		queue:       client.Database(dbName).Collection(validationQueueCollectionName()),
 		flowMgr:     flowMgr,
 		statusMgr:   statusMgr,
 		auditChan:   make(chan interface{}, batchSize),
@@ -90,6 +107,13 @@ func NewStore(client *mongo.Client, flowMgr *flow.Manager, statusMgr *status.Man
 	s.ensureIndexes()
 	s.startWorkers()
 	return s
+}
+
+func validationQueueCollectionName() string {
+	if config.Cfg.Migration.ValidationQueueCollection != "" {
+		return config.Cfg.Migration.ValidationQueueCollection
+	}
+	return "validation_queue"
 }
 
 func (s *Store) Close() {
@@ -117,7 +141,141 @@ func (s *Store) ensureIndexes() {
 			{Keys: bson.D{{Key: "timestamp", Value: 1}}},
 			{Keys: bson.D{{Key: "action", Value: 1}}},
 		})
+		s.queue.Indexes().CreateMany(ctx, []mongo.IndexModel{
+			{Keys: bson.D{{Key: "status", Value: 1}, {Key: "persisted_at", Value: 1}}},
+			{Keys: bson.D{{Key: "namespace", Value: 1}, {Key: "queue_type", Value: 1}}},
+		})
 	}()
+}
+
+func queueRecordID(queueType, ns string, keys []bson.D, retryCount int) string {
+	payload, err := bson.MarshalExtJSON(bson.D{
+		{Key: "queue_type", Value: queueType},
+		{Key: "namespace", Value: ns},
+		{Key: "keys", Value: keys},
+		{Key: "retry_count", Value: retryCount},
+	}, false, false)
+	if err != nil {
+		payload = []byte(fmt.Sprintf("%s|%s|%v|%d", queueType, ns, keys, retryCount))
+	}
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
+}
+
+func (s *Store) PersistValidationTask(ctx context.Context, task ValidationTask) error {
+	if len(task.Keys) == 0 {
+		return nil
+	}
+	id := task.PersistentID
+	if id == "" {
+		id = queueRecordID("validation", task.Namespace, task.Keys, 0)
+	}
+	return s.persistQueueRecord(ctx, PersistentQueueRecord{
+		ID:          id,
+		Namespace:   task.Namespace,
+		Keys:        task.Keys,
+		QueueType:   "validation",
+		Status:      "pending",
+		RetryCount:  0,
+		PersistedAt: time.Now().UTC(),
+		Reason:      "shutdown_persist",
+	})
+}
+
+func (s *Store) PersistRetryItem(ctx context.Context, item RetryItem) error {
+	keys := []bson.D{item.Key}
+	id := item.PersistentID
+	if id == "" {
+		id = queueRecordID("retry", item.Namespace, keys, item.AttemptCount)
+	}
+	return s.persistQueueRecord(ctx, PersistentQueueRecord{
+		ID:          id,
+		Namespace:   item.Namespace,
+		Keys:        keys,
+		QueueType:   "retry",
+		Status:      "pending",
+		RetryCount:  item.AttemptCount,
+		PersistedAt: time.Now().UTC(),
+		Reason:      "shutdown_persist",
+	})
+}
+
+func (s *Store) persistQueueRecord(ctx context.Context, rec PersistentQueueRecord) error {
+	now := time.Now().UTC()
+	if rec.CreatedAt.IsZero() {
+		rec.CreatedAt = now
+	}
+	if rec.PersistedAt.IsZero() {
+		rec.PersistedAt = now
+	}
+	update := bson.D{
+		{Key: "$set", Value: bson.D{
+			{Key: "namespace", Value: rec.Namespace},
+			{Key: "keys", Value: rec.Keys},
+			{Key: "queue_type", Value: rec.QueueType},
+			{Key: "status", Value: "pending"},
+			{Key: "retry_count", Value: rec.RetryCount},
+			{Key: "persisted_at", Value: rec.PersistedAt},
+			{Key: "reason", Value: rec.Reason},
+		}},
+		{Key: "$setOnInsert", Value: bson.D{{Key: "created_at", Value: rec.CreatedAt}}},
+		{Key: "$unset", Value: bson.D{{Key: "loaded_at", Value: ""}}},
+	}
+	_, err := s.queue.UpdateOne(ctx, bson.D{{Key: "_id", Value: rec.ID}}, update, options.UpdateOne().SetUpsert(true))
+	return err
+}
+
+func (s *Store) ResetPersistedQueue(ctx context.Context) error {
+	_, err := s.queue.UpdateMany(ctx,
+		bson.D{{Key: "status", Value: bson.D{{Key: "$in", Value: bson.A{"in_memory", "processing"}}}}},
+		bson.D{
+			{Key: "$set", Value: bson.D{{Key: "status", Value: "pending"}}},
+			{Key: "$unset", Value: bson.D{{Key: "loaded_at", Value: ""}}},
+		},
+	)
+	return err
+}
+
+func (s *Store) ClaimNextQueuedTask(ctx context.Context) (*PersistentQueueRecord, error) {
+	filter := bson.D{{Key: "status", Value: "pending"}}
+	update := bson.D{{Key: "$set", Value: bson.D{
+		{Key: "status", Value: "in_memory"},
+		{Key: "loaded_at", Value: time.Now().UTC()},
+	}}}
+	opts := options.FindOneAndUpdate().
+		SetSort(bson.D{{Key: "persisted_at", Value: 1}}).
+		SetReturnDocument(options.After)
+
+	var rec PersistentQueueRecord
+	if err := s.queue.FindOneAndUpdate(ctx, filter, update, opts).Decode(&rec); err != nil {
+		return nil, err
+	}
+	return &rec, nil
+}
+
+func (s *Store) DeleteQueuedTask(ctx context.Context, id string) {
+	if id == "" {
+		return
+	}
+	if _, err := s.queue.DeleteOne(ctx, bson.D{{Key: "_id", Value: id}}); err != nil {
+		logging.LogValidatorWarning(fmt.Sprintf("Failed to delete persisted validation queue record %s: %v", id, err))
+	}
+}
+
+func (s *Store) MarkQueuedTaskPending(ctx context.Context, id string) {
+	if id == "" {
+		return
+	}
+	_, err := s.queue.UpdateOne(ctx,
+		bson.D{{Key: "_id", Value: id}},
+		bson.D{
+			{Key: "$set", Value: bson.D{{Key: "status", Value: "pending"}}},
+			{Key: "$unset", Value: bson.D{{Key: "loaded_at", Value: ""}}},
+		},
+	)
+	if err != nil {
+		logging.LogValidatorWarning(fmt.Sprintf("Failed to return persisted validation queue record %s to pending: %v", id, err))
+	}
 }
 
 func (s *Store) startWorkers() {

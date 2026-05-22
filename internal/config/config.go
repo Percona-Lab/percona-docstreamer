@@ -94,7 +94,8 @@ type MigrationConfig struct {
 	StatusDocID                  string   `mapstructure:"status_doc_id"`
 	ValidationStatsCollection    string   `mapstructure:"validation_stats_collection"`
 	ValidationFailuresCollection string   `mapstructure:"validation_failures_collection"`
-	ValidationAuditCollection    string   `yaml:"validation_audit_collection"`
+	ValidationAuditCollection    string   `mapstructure:"validation_audit_collection"`
+	ValidationQueueCollection    string   `mapstructure:"validation_queue_collection"`
 	PIDFilePath                  string   `mapstructure:"pid_file_path"`
 	MaxConcurrentWorkers         int      `mapstructure:"max_concurrent_workers"`
 	DiscoveryTimeoutMS           int      `mapstructure:"discovery_timeout_ms"`
@@ -122,15 +123,16 @@ type ClonerConfig struct {
 
 // ValidationConfig holds settings for online data validation
 type ValidationConfig struct {
-	Enabled                    bool `mapstructure:"enabled"`
-	FullValidation             bool `mapstructure:"full_validation"`
-	BatchSize                  int  `mapstructure:"batch_size"`
-	RetryIntervalMS            int  `mapstructure:"retry_interval_ms"`
-	MaxValidationWorkers       int  `mapstructure:"max_validation_workers"`
-	MaxRetries                 int  `mapstructure:"max_retries"`
-	QueueSize                  int  `mapstructure:"queue_size"`
-	HotKeyCheckIntervalMinutes int  `yaml:"hot_key_check_interval_minutes"`
-	IdleCheckIntervalSeconds   int  `yaml:"idle_check_interval_seconds"`
+	Enabled                    bool   `mapstructure:"enabled"`
+	FullValidation             bool   `mapstructure:"full_validation"`
+	BatchSize                  int    `mapstructure:"batch_size"`
+	RetryIntervalMS            int    `mapstructure:"retry_interval_ms"`
+	MaxValidationWorkers       int    `mapstructure:"max_validation_workers"`
+	MaxRetries                 int    `mapstructure:"max_retries"`
+	QueueSize                  int    `mapstructure:"queue_size"`
+	ShutdownQueueMode          string `mapstructure:"shutdown_queue_mode"`
+	HotKeyCheckIntervalMinutes int    `mapstructure:"hot_key_check_interval_minutes"`
+	IdleCheckIntervalSeconds   int    `mapstructure:"idle_check_interval_seconds"`
 }
 
 // FlowControlConfig holds settings for adaptive throttling
@@ -194,6 +196,8 @@ func LoadConfig() {
 	viper.SetDefault("migration.status_doc_id", "migration_status")
 	viper.SetDefault("migration.validation_stats_collection", "validation_stats")
 	viper.SetDefault("migration.validation_failures_collection", "validation_failures")
+	viper.SetDefault("migration.validation_audit_collection", "validation_audit")
+	viper.SetDefault("migration.validation_queue_collection", "validation_queue")
 	viper.SetDefault("migration.pid_file_path", "./docStreamer.pid")
 	viper.SetDefault("migration.destroy", false)
 	viper.SetDefault("migration.dry_run", false)
@@ -230,6 +234,7 @@ func LoadConfig() {
 	viper.SetDefault("validation.max_validation_workers", 4)
 	viper.SetDefault("validation.max_retries", 3)
 	viper.SetDefault("validation.queue_size", 2000)
+	viper.SetDefault("validation.shutdown_queue_mode", "persist")
 
 	// Flow control Defaults
 	viper.SetDefault("flow_control.enabled", true)
