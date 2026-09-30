@@ -438,9 +438,9 @@ cloner:
 docStreamer automatically migrates most standard MongoDB index types, including Single Field, Compound, Multikey, and Geospatial indexes. However, some types require manual intervention:
 
 * **Automatically Migrated**: Standard B-tree indexes, unique indexes (if compatible with shard key), and geospatial indexes.
-* **Excluded/Skipped**:
-    * **Text Indexes**: These are not currently supported for automatic migration.
-    * **Partial Indexes**: These are skipped to prevent inconsistencies during the migration stream.
+* **Skipped on purpose** (docStreamer never creates these; a warning in the log is expected):
+    * **Text Indexes**: A text index is more than its field list. It also has weights, a default language, and a language override, and DocumentDB does not support text indexes. Creating one from the field list alone would not match the source, so docStreamer leaves it out. Create it on the destination after the migration if the application needs text search.
+    * **Partial Indexes**: A partial index includes only the documents that match its `partialFilterExpression`. docStreamer does not copy that filter. Creating the same key without it would index every document, and a unique partial index would then reject writes that succeed on the source. Create it on the destination after the migration, with the same filter, if the application needs it.
 * **Deferred until finalize**:
     * **TTL Indexes**: Built by `finalize` after CDC has stopped. They are not created during full load or by `docStreamer index`.
 
@@ -1423,21 +1423,21 @@ Supported: drop (collection), dropDatabase, rename (collection), create (collect
 
 ### Supported Index Types
 
-Percona docStreamer automatically handles the creation of indexes during the Full Sync stage to ensure your destination performance matches the source. However, there are specific limitations regarding index types.
+Percona docStreamer creates indexes during the Full Sync stage so the destination matches the source. Text and partial indexes are skipped on purpose. A log line such as `Skipping text index` or `Skipping partial index` means docStreamer left that index out so the target would not get an index that behaves differently from DocumentDB. It does not mean index creation failed.
 
-**Currently Supported:**
-Most standard MongoDB index types (e.g., Single Field, Compound, Multikey, Geospatial).
+**Created automatically:**
+Single-field, compound, multikey, unique, and geospatial indexes.
 
-**Not Currently Supported:**
-The following index types are not migrated by docStreamer and must be created manually on the destination if required:
- - Text Indexes
- - Partial Indexes
+**Skipped on purpose:**
 
-**Deferred Until Finalization:**
-The following index type is automatically deferred during the Full Sync and CDC phases to protect data integrity, but will be automatically created during the `finalize` stage:
- - TTL Indexes
+* **Text indexes.** A text index also carries weights, a default language, and a language override. DocumentDB does not support text indexes. Building one from the field list alone would not match the source, so docStreamer never creates it. Add the text index on the destination after the migration if the application needs text search.
+* **Partial indexes.** A partial index includes only documents that match its `partialFilterExpression`. docStreamer does not copy that filter. The same key without the filter would index every document, and a unique partial index would reject writes that DocumentDB accepts, which breaks CDC. docStreamer never creates it. Add the partial index on the destination after the migration, with the same filter, if the application needs it.
 
-***Note:*** We recommend reviewing your source indexes prior to migration. If your application relies heavily on text search or partial indexing, plan to run a post-migration script to reconstruct these specific indexes on the destination cluster.
+**Deferred until finalize:**
+
+* **TTL indexes** are created when you run `finalize`, after CDC has stopped. See [TTL Index Special Considerations](#ttl-index-special-considerations).
+
+Review the source indexes before cutover. If the application uses text search or partial indexes, create those on the destination yourself after the migration. The migration does not fail because they were skipped.
 
 #### TTL Index Special Considerations
 

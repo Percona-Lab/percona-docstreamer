@@ -24,9 +24,15 @@ jobs:
       - name: Build and Package
         run: make build
 
+      - name: Read release notes from the tag
+        run: |
+          git fetch --tags --force
+          git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(contents)' > release-notes.md
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           files: bin/*.tar.gz
+          body_path: release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
