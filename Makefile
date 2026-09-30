@@ -23,11 +23,14 @@ build: clean build-linux build-mac
 
 # Build and Package for Linux (CentOS, RHEL, Ubuntu, Debian, etc.)
 build-linux:
-	@echo "Building and packaging $(APP_NAME) for Linux (amd64)..."
+	@echo "Building and packaging $(APP_NAME) for Linux (amd64 and arm64)..."
 	@mkdir -p $(BIN_DIR)
-	# CGO_ENABLED=0 creates a static binary that runs on CentOS/RHEL/Alpine
+	# CGO_ENABLED=0 creates a static binary that runs on CentOS/RHEL/Alpine.
+	# Both architectures cross-compile from the release runner; no C toolchain is required.
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o $(BIN_DIR)/$(APP_NAME)-linux-amd64 $(SRC_DIR)
 	tar -czvf $(BIN_DIR)/$(APP_NAME)-linux-amd64.tar.gz -C $(BIN_DIR) $(APP_NAME)-linux-amd64
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build $(LDFLAGS) -o $(BIN_DIR)/$(APP_NAME)-linux-arm64 $(SRC_DIR)
+	tar -czvf $(BIN_DIR)/$(APP_NAME)-linux-arm64.tar.gz -C $(BIN_DIR) $(APP_NAME)-linux-arm64
 
 # Build and Package for Mac
 build-mac:
@@ -62,7 +65,7 @@ run: build-local
 help:
 	@echo "Makefile for $(APP_NAME)"
 	@echo "Usage:"
-	@echo "  make build       - Create .tar.gz releases for Linux (CentOS/Ubuntu) and Mac"
+	@echo "  make build       - Create .tar.gz releases for Linux (amd64, arm64) and Mac (amd64, arm64)"
 	@echo "  make build-local - Build native binary for local testing"
 	@echo "  make clean       - Remove build artifacts"
 	@echo "  make run         - Build locally and run (shows help)"

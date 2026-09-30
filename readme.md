@@ -110,10 +110,16 @@ You might want to compile Percona docStreamer for a different architecture (not 
 2. Make whatever changes to the application you want (not required)
 3. Build it for your specific architecture, examples below:
 
-Build for linux
+Build for linux (x86_64)
 
 ```bash
-GOOS=linux GOARCH=amd64 go build -o ./bin/docStreamer ./cmd/docStreamer/
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ./bin/docStreamer ./cmd/docStreamer/
+```
+
+Build for linux (arm64, including AWS Graviton)
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o ./bin/docStreamer ./cmd/docStreamer/
 ```
 
 Build for your current OS and Architecture
