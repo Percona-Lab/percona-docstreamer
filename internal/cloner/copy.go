@@ -170,12 +170,15 @@ func (s *Segmenter) Next(ctx context.Context) (keyRange, error) {
 }
 
 func convertIndexes(indexes []discover.IndexInfo) []mongo.IndexModel {
-	models := make([]mongo.IndexModel, len(indexes))
-	for i, idx := range indexes {
-		models[i] = mongo.IndexModel{
+	models := make([]mongo.IndexModel, 0, len(indexes))
+	for _, idx := range indexes {
+		if idx.ExpireAfterSeconds != nil {
+			continue
+		}
+		models = append(models, mongo.IndexModel{
 			Keys:    idx.Key,
 			Options: options.Index().SetName(idx.Name).SetUnique(idx.Unique),
-		}
+		})
 	}
 	return models
 }
@@ -247,7 +250,19 @@ func (cm *CopyManager) Prepare(ctx context.Context) error {
 		// Pass empty list. applySharding (inside the function below) will still create the required Shard Key index.
 		indexModels = []mongo.IndexModel{}
 	} else {
-		// Standard behavior: Pre-load all indexes before copying
+		// Secondary indexes are created before the copy. TTL indexes are not:
+		// building them now would expire documents during the migration, and
+		// creating them without expireAfterSeconds leaves a shell that blocks
+		// the real TTL index at finalize ("index already exists").
+		var deferredTTL []string
+		for _, idx := range cm.CollInfo.Indexes {
+			if idx.ExpireAfterSeconds != nil {
+				deferredTTL = append(deferredTTL, idx.Name)
+			}
+		}
+		if len(deferredTTL) > 0 {
+			logging.PrintInfo(fmt.Sprintf("[%s] Deferring TTL index(es) until finalize: %s", ns, strings.Join(deferredTTL, ", ")), 0)
+		}
 		indexModels = convertIndexes(cm.CollInfo.Indexes)
 	}
 

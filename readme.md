@@ -431,7 +431,8 @@ cloner:
 ```
 
 * **Index Postponement**: If `cloner.postpone_index_creation` is enabled, only the `_id` and shard key indexes are created initially.
-* **On-Demand Finalization**: The remaining secondary indexes are not built automatically. You must explicitly trigger their creation by running `./docStreamer index` (which builds them in the background while CDC continues) or `./docStreamer finalize` (which stops CDC and finishes the migration). The application smartly compares the target against the source to ensure only missing indexes are created.
+* **TTL indexes**: Always deferred until `finalize`, including when `postpone_index_creation` is false. They are not created during startup, and `docStreamer index` skips them so the target does not expire documents while CDC is still running.
+* **On-Demand Finalization**: The remaining secondary indexes are not built automatically. You must explicitly trigger their creation by running `./docStreamer index` (which builds them in the background while CDC continues) or `./docStreamer finalize` (which stops CDC and finishes the migration). The application smartly compares the target against the source to ensure only missing indexes are created. Finalize is what builds TTL indexes. If an older run left a non-TTL shell with the same name, finalize converts that shell into the real TTL index.
 
 #### Supported Index Types
 docStreamer automatically migrates most standard MongoDB index types, including Single Field, Compound, Multikey, and Geospatial indexes. However, some types require manual intervention:
@@ -440,7 +441,8 @@ docStreamer automatically migrates most standard MongoDB index types, including 
 * **Excluded/Skipped**:
     * **Text Indexes**: These are not currently supported for automatic migration.
     * **Partial Indexes**: These are skipped to prevent inconsistencies during the migration stream.
-    * **TTL Indexes**: These must be created manually on the destination to avoid premature data expiration during the sync process.
+* **Deferred until finalize**:
+    * **TTL Indexes**: Built by `finalize` after CDC has stopped. They are not created during full load or by `docStreamer index`.
 
 ## 5. How to Use Percona docStreamer
 
@@ -619,6 +621,8 @@ You can use this command when you need to apply configuration changes and then r
 
 If you configured the application to postpone index creation (`cloner.postpone_index_creation: true`), you can use this command to build the deferred secondary indexes while the continuous sync (CDC) is actively running in the background.
 
+This command does not create TTL indexes. Those stay deferred until [`finalize`](#finalize), including when `postpone_index_creation` is false.
+
 ```bash
 ./docStreamer index
 ```
@@ -647,6 +651,14 @@ This command is used when you are ready to cut over to your new environment. It 
 ```bash
 ./docStreamer finalize
 ```
+
+#### TTL indexes are created here
+
+TTL indexes are created only when you run `finalize`. They are left out of startup, the full load, and `docStreamer index`, whether or not `cloner.postpone_index_creation` is enabled.
+
+MongoDB applies a TTL index with a background job that deletes documents once their timestamp expires. If that index existed on the target while CDC was still streaming, the target would delete those documents on its own. A document that is still valid on the source could be copied, expire on the target, and disappear before cutover. Later source updates or deletes for the same document would then fail to apply, and the target would drift from the source.
+
+`finalize` stops CDC and waits until in-flight operations drain. Only then does it build each TTL index with its `expireAfterSeconds` value. Expiration on the target starts after the copy matches the source. If an older run left a normal index with the same name and no `expireAfterSeconds`, finalize converts that index into the real TTL index.
 
 ### Status
 
@@ -1427,23 +1439,17 @@ The following index type is automatically deferred during the Full Sync and CDC 
 
 ***Note:*** We recommend reviewing your source indexes prior to migration. If your application relies heavily on text search or partial indexing, plan to run a post-migration script to reconstruct these specific indexes on the destination cluster.
 
-#### TTL Index Special Considerations 
+#### TTL Index Special Considerations
 
-The reason TTL (Time-To-Live) indexes are excluded from automatic creation during the initial migration phases comes down to data integrity and avoiding race conditions between the source and target databases.
+TTL indexes are created only by [`finalize`](#finalize). Full load and `docStreamer index` leave them out, including when `cloner.postpone_index_creation` is false. See [Finalize](#finalize) for how that command builds them after CDC has stopped.
 
-##### Reasons to defer creating TTL indexes until after the migration is complete:
+Creating them earlier would let MongoDB's TTL job delete documents on the target while the stream is still running:
 
-* **Premature Data Deletion**: TTL indexes run on a background thread in MongoDB and automatically delete documents when their timestamp expires. If you create the TTL index on the target database *before* or *during* the migration, the target database will start actively deleting data on its own. Because a migration can take hours or days, documents that are valid on the source might be copied over, expire, and get deleted on the target before the migration even finishes. 
-* **CDC Conflicts**: During the CDC phase, docStreamer listens for changes on the source DocumentDB and replicates them to the target MongoDB. If the target MongoDB's TTL job deletes a document, and then the source DocumentDB also deletes or updates that same document, docStreamer will try to replicate that change. This can lead to "document not found" errors or synchronization mismatches because the target database altered the data independently of the migration tool.
-* **Resource Overhead**: Creating indexes and running the TTL background jobs consumes CPU and disk I/O. During a heavy Full Load phase, you want all of the target resources dedicated to absorbing the incoming data as fast as possible.
+* **Premature Data Deletion**: The TTL monitor deletes documents once their timestamp expires. A migration can take hours or days, so a document that is still valid on the source can be copied and then deleted on the target before cutover.
+* **CDC Conflicts**: If the target deletes a document and the source later updates or deletes that same document, docStreamer tries to replicate a change for a document the target already removed. That produces "document not found" errors and leaves the clusters out of sync.
+* **Resource Overhead**: The TTL background job uses CPU and disk I/O that the full load needs for incoming writes.
 
-**Best Practice**
-
-By default, docStreamer safely defers TTL index creation. The safest and recommended way to handle TTL indexes is to simply wait until you are ready to cut over. 
-
-When you run the `docStreamer finalize` command, docStreamer safely stops the CDC stream and **automatically builds your TTL indexes** (along with any other deferred indexes). Because the data stream is stopped, this ensures your target has an exact, 1:1 match of the source data before it begins autonomously managing document expiration. 
-
-*(Alternatively, you can choose to manually create TTL indexes on the destination cluster after the migration is fully complete.)*
+`finalize` stops the CDC stream, drains in-flight operations, and then builds the TTL indexes. The target matches the source before it starts expiring documents on its own.
 
 
 # Disclaimer

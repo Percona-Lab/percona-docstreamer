@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/Percona-Lab/percona-docstreamer/internal/config"
@@ -133,80 +134,207 @@ func CreateCollectionAndPreloadIndexes(ctx context.Context, targetDB *mongo.Data
 	return targetColl, nil
 }
 
+// listedIndex is one index currently present on the target.
+// ExpireAfterSeconds is kept as a raw BSON value because servers disagree
+// on whether that number is an int32 or an int64.
+type listedIndex struct {
+	Name               string        `bson:"name"`
+	Key                bson.D        `bson:"key"`
+	ExpireAfterSeconds bson.RawValue `bson:"expireAfterSeconds"`
+}
+
+func (li listedIndex) ttlSeconds() (int64, bool) {
+	raw := li.ExpireAfterSeconds
+	if raw.Type == 0 || len(raw.Value) == 0 {
+		return 0, false
+	}
+	switch raw.Type {
+	case bson.TypeInt32:
+		return int64(raw.Int32()), true
+	case bson.TypeInt64:
+		return raw.Int64(), true
+	case bson.TypeDouble:
+		return int64(raw.Double()), true
+	default:
+		return 0, false
+	}
+}
+
+type plannedTTLRepair struct {
+	existing listedIndex
+	desired  discover.IndexInfo
+}
+
 func FinalizeIndexes(ctx context.Context, targetColl *mongo.Collection, indexes []discover.IndexInfo, ns string, includeTTL bool) error {
 	cursor, err := targetColl.Indexes().List(ctx)
 	if err != nil {
 		return nil
 	}
 
-	// We decode to []bson.D to preserve the exact order of the index keys
-	var existingIndexes []bson.D
-	if err := cursor.All(ctx, &existingIndexes); err != nil {
+	var existing []listedIndex
+	if err := cursor.All(ctx, &existing); err != nil {
 		return err
 	}
 
-	// Store existing index keys by their binary representation
-	existingKeys := make(map[string]bool)
-	for _, idxDoc := range existingIndexes {
-		for _, elem := range idxDoc {
-			if elem.Key == "key" {
-				if keyD, ok := elem.Value.(bson.D); ok {
-					keyBytes, _ := bson.Marshal(keyD)
-					existingKeys[string(keyBytes)] = true
-				}
-			}
-		}
+	missing, repairs, skippedTTL := planIndexUpdates(existing, indexes, includeTTL)
+	for _, name := range skippedTTL {
+		logging.PrintInfo(fmt.Sprintf("[%s] Skipping TTL index '%s' (use 'finalize' to create safely).", ns, name), 0)
 	}
 
-	var missing []mongo.IndexModel
-	for _, idx := range indexes {
-		// 1. Explicitly skip the _id index (MongoDB handles this natively)
-		isId := false
-		if len(idx.Key) == 1 && idx.Key[0].Key == "_id" {
-			isId = true
-		}
-		if isId {
-			continue
-		}
-
-		// Check if this index has an expiration set (is a TTL index)
-		isTTL := idx.ExpireAfterSeconds != nil
-
-		if isTTL && !includeTTL {
-			logging.PrintInfo(fmt.Sprintf("[%s] Skipping TTL index '%s' (use 'finalize' to create safely).", ns, idx.Name), 0)
-			continue
-		}
-
-		// 2. Check if the index key already exists on the target
-		keyBytes, _ := bson.Marshal(idx.Key)
-		if !existingKeys[string(keyBytes)] {
-
-			// Build the index options safely
-			idxOpts := options.Index().SetName(idx.Name)
-			if idx.Unique {
-				idxOpts.SetUnique(true)
-			}
-			if isTTL {
-				idxOpts.SetExpireAfterSeconds(*idx.ExpireAfterSeconds)
-			}
-
-			missing = append(missing, mongo.IndexModel{
-				Keys:    idx.Key,
-				Options: idxOpts,
-			})
+	// Convert shells before creating anything else. A non-TTL index with the
+	// same name otherwise makes createIndexes fail with "index already exists",
+	// and a key-only comparison would treat that shell as already complete.
+	for _, repair := range repairs {
+		if err := promoteTTLIndex(ctx, targetColl, repair.existing, repair.desired, ns); err != nil {
+			logging.PrintError(fmt.Sprintf("[%s] Failed to create TTL index '%s': %v", ns, repair.desired.Name, err), 0)
+			return err
 		}
 	}
 
 	if len(missing) > 0 {
 		logging.PrintInfo(fmt.Sprintf("[%s] Finalizing %d missing indexes...", ns, len(missing)), 0)
-		_, err := targetColl.Indexes().CreateMany(ctx, missing)
-		if err != nil {
+		if _, err := targetColl.Indexes().CreateMany(ctx, missing); err != nil {
 			logging.PrintError(fmt.Sprintf("[%s] Failed to create final indexes: %v", ns, err), 0)
 			return err
 		}
 		logging.PrintSuccess(fmt.Sprintf("[%s] Indexes finalized.", ns), 0)
-	} else {
+	} else if len(repairs) == 0 {
 		logging.PrintSuccess(fmt.Sprintf("[%s] All required indexes already exist.", ns), 0)
 	}
 	return nil
+}
+
+func planIndexUpdates(existing []listedIndex, indexes []discover.IndexInfo, includeTTL bool) (missing []mongo.IndexModel, repairs []plannedTTLRepair, skippedTTL []string) {
+	byName := make(map[string]listedIndex, len(existing))
+	byKey := make(map[string]listedIndex, len(existing))
+	for _, idx := range existing {
+		if idx.Name != "" {
+			byName[idx.Name] = idx
+		}
+		if len(idx.Key) > 0 {
+			byKey[indexKeyID(idx.Key)] = idx
+		}
+	}
+
+	for _, idx := range indexes {
+		if len(idx.Key) == 1 && idx.Key[0].Key == "_id" {
+			continue
+		}
+
+		isTTL := idx.ExpireAfterSeconds != nil
+		if isTTL && !includeTTL {
+			skippedTTL = append(skippedTTL, idx.Name)
+			continue
+		}
+
+		match, ok := byName[idx.Name]
+		if !ok {
+			match, ok = byKey[indexKeyID(idx.Key)]
+		}
+		if !ok {
+			missing = append(missing, indexModel(idx, isTTL))
+			continue
+		}
+		if !isTTL {
+			continue
+		}
+
+		want := int64(*idx.ExpireAfterSeconds)
+		if got, has := match.ttlSeconds(); has && got == want {
+			continue
+		}
+		repairs = append(repairs, plannedTTLRepair{existing: match, desired: idx})
+	}
+	return missing, repairs, skippedTTL
+}
+
+func indexModel(idx discover.IndexInfo, withTTL bool) mongo.IndexModel {
+	opts := options.Index().SetName(idx.Name)
+	if idx.Unique {
+		opts.SetUnique(true)
+	}
+	if withTTL && idx.ExpireAfterSeconds != nil {
+		opts.SetExpireAfterSeconds(*idx.ExpireAfterSeconds)
+	}
+	return mongo.IndexModel{Keys: idx.Key, Options: opts}
+}
+
+// promoteTTLIndex turns an existing non-TTL shell into the source TTL index.
+// collMod is preferred so the index is not rebuilt. Dropping is limited to an
+// index that already uses the TTL index's name, so a shard-key index that
+// happens to share the key is not removed.
+func promoteTTLIndex(ctx context.Context, coll *mongo.Collection, existing listedIndex, idx discover.IndexInfo, ns string) error {
+	seconds := *idx.ExpireAfterSeconds
+	sameKey := indexKeyID(existing.Key) == indexKeyID(idx.Key)
+
+	if sameKey {
+		cmd := bson.D{
+			{Key: "collMod", Value: coll.Name()},
+			{Key: "index", Value: bson.D{
+				{Key: "name", Value: existing.Name},
+				{Key: "expireAfterSeconds", Value: seconds},
+			}},
+		}
+		if err := coll.Database().RunCommand(ctx, cmd).Err(); err == nil {
+			logging.PrintSuccess(fmt.Sprintf("[%s] Applied TTL to existing index '%s' (expireAfterSeconds=%d).", ns, existing.Name, seconds), 0)
+			if existing.Name != idx.Name {
+				logging.PrintWarning(fmt.Sprintf("[%s] TTL index '%s' is covered by existing index '%s' on the same key.", ns, idx.Name, existing.Name), 0)
+			}
+			return nil
+		} else if existing.Name != idx.Name {
+			return fmt.Errorf("index %q already exists on the same key as TTL index %q and could not be converted: %w", existing.Name, idx.Name, err)
+		} else {
+			logging.PrintWarning(fmt.Sprintf("[%s] Could not convert index '%s' to TTL in place (%v). Recreating it.", ns, existing.Name, err), 0)
+		}
+	}
+
+	if existing.Name != idx.Name {
+		return fmt.Errorf("index %q conflicts with TTL index %q", existing.Name, idx.Name)
+	}
+	if err := coll.Indexes().DropOne(ctx, existing.Name); err != nil {
+		return fmt.Errorf("drop existing index %q: %w", existing.Name, err)
+	}
+	if _, err := coll.Indexes().CreateOne(ctx, indexModel(idx, true)); err != nil {
+		return fmt.Errorf("create TTL index %q: %w", idx.Name, err)
+	}
+	logging.PrintSuccess(fmt.Sprintf("[%s] Recreated TTL index '%s' (expireAfterSeconds=%d).", ns, idx.Name, seconds), 0)
+	return nil
+}
+
+// indexKeyID identifies an index key without depending on BSON numeric width.
+// DocumentDB and MongoDB may return the same direction as int32 or int64.
+func indexKeyID(key bson.D) string {
+	var b strings.Builder
+	for i, elem := range key {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(elem.Key)
+		b.WriteByte(':')
+		b.WriteString(normalizeKeyValue(elem.Value))
+	}
+	return b.String()
+}
+
+func normalizeKeyValue(v any) string {
+	switch n := v.(type) {
+	case int32:
+		return strconv.FormatInt(int64(n), 10)
+	case int64:
+		return strconv.FormatInt(n, 10)
+	case int:
+		return strconv.Itoa(n)
+	case float32:
+		return strconv.FormatInt(int64(n), 10)
+	case float64:
+		return strconv.FormatInt(int64(n), 10)
+	case string:
+		return n
+	default:
+		rawType, raw, err := bson.MarshalValue(n)
+		if err != nil {
+			return fmt.Sprint(n)
+		}
+		return fmt.Sprintf("%d:%x", rawType, raw)
+	}
 }
