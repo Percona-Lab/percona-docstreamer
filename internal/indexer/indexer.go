@@ -140,6 +140,7 @@ func CreateCollectionAndPreloadIndexes(ctx context.Context, targetDB *mongo.Data
 type listedIndex struct {
 	Name               string        `bson:"name"`
 	Key                bson.D        `bson:"key"`
+	Sparse             bool          `bson:"sparse,omitempty"`
 	ExpireAfterSeconds bson.RawValue `bson:"expireAfterSeconds"`
 }
 
@@ -165,10 +166,18 @@ type plannedTTLRepair struct {
 	desired  discover.IndexInfo
 }
 
+// plannedRebuild is an index that already exists but is missing options that
+// cannot be added in place, such as sparse.
+type plannedRebuild struct {
+	existing listedIndex
+	desired  discover.IndexInfo
+	withTTL  bool
+}
+
 func FinalizeIndexes(ctx context.Context, targetColl *mongo.Collection, indexes []discover.IndexInfo, ns string, includeTTL bool) error {
 	cursor, err := targetColl.Indexes().List(ctx)
 	if err != nil {
-		return nil
+		return fmt.Errorf("list indexes: %w", err)
 	}
 
 	var existing []listedIndex
@@ -176,12 +185,22 @@ func FinalizeIndexes(ctx context.Context, targetColl *mongo.Collection, indexes 
 		return err
 	}
 
-	missing, repairs, skippedTTL := planIndexUpdates(existing, indexes, includeTTL)
+	missing, repairs, rebuilds, skippedTTL := planIndexUpdates(existing, indexes, includeTTL)
 	for _, name := range skippedTTL {
 		logging.PrintInfo(fmt.Sprintf("[%s] Skipping TTL index '%s' (use 'finalize' to create safely).", ns, name), 0)
 	}
 
-	// Convert shells before creating anything else. A non-TTL index with the
+	// Rebuild indexes whose options cannot be changed in place before creating
+	// anything else. A non-sparse index with the same name otherwise blocks the
+	// real sparse index with "index already exists".
+	for _, rebuild := range rebuilds {
+		if err := rebuildIndex(ctx, targetColl, rebuild, ns); err != nil {
+			logging.PrintError(fmt.Sprintf("[%s] Failed to recreate index '%s': %v", ns, rebuild.desired.Name, err), 0)
+			return err
+		}
+	}
+
+	// Convert TTL shells before creating anything else. A non-TTL index with the
 	// same name otherwise makes createIndexes fail with "index already exists",
 	// and a key-only comparison would treat that shell as already complete.
 	for _, repair := range repairs {
@@ -198,13 +217,13 @@ func FinalizeIndexes(ctx context.Context, targetColl *mongo.Collection, indexes 
 			return err
 		}
 		logging.PrintSuccess(fmt.Sprintf("[%s] Indexes finalized.", ns), 0)
-	} else if len(repairs) == 0 {
+	} else if len(repairs) == 0 && len(rebuilds) == 0 {
 		logging.PrintSuccess(fmt.Sprintf("[%s] All required indexes already exist.", ns), 0)
 	}
 	return nil
 }
 
-func planIndexUpdates(existing []listedIndex, indexes []discover.IndexInfo, includeTTL bool) (missing []mongo.IndexModel, repairs []plannedTTLRepair, skippedTTL []string) {
+func planIndexUpdates(existing []listedIndex, indexes []discover.IndexInfo, includeTTL bool) (missing []mongo.IndexModel, repairs []plannedTTLRepair, rebuilds []plannedRebuild, skippedTTL []string) {
 	byName := make(map[string]listedIndex, len(existing))
 	byKey := make(map[string]listedIndex, len(existing))
 	for _, idx := range existing {
@@ -235,17 +254,31 @@ func planIndexUpdates(existing []listedIndex, indexes []discover.IndexInfo, incl
 			missing = append(missing, indexModel(idx, isTTL))
 			continue
 		}
+
+		sparseMismatch := idx.Sparse && !match.Sparse
 		if !isTTL {
+			if sparseMismatch {
+				rebuilds = append(rebuilds, plannedRebuild{existing: match, desired: idx})
+			}
 			continue
 		}
 
 		want := int64(*idx.ExpireAfterSeconds)
+		ttlOK := false
 		if got, has := match.ttlSeconds(); has && got == want {
+			ttlOK = true
+		}
+		// collMod can add expireAfterSeconds, but it cannot make an index sparse.
+		if sparseMismatch {
+			rebuilds = append(rebuilds, plannedRebuild{existing: match, desired: idx, withTTL: true})
+			continue
+		}
+		if ttlOK {
 			continue
 		}
 		repairs = append(repairs, plannedTTLRepair{existing: match, desired: idx})
 	}
-	return missing, repairs, skippedTTL
+	return missing, repairs, rebuilds, skippedTTL
 }
 
 func indexModel(idx discover.IndexInfo, withTTL bool) mongo.IndexModel {
@@ -253,10 +286,32 @@ func indexModel(idx discover.IndexInfo, withTTL bool) mongo.IndexModel {
 	if idx.Unique {
 		opts.SetUnique(true)
 	}
+	if idx.Sparse {
+		opts.SetSparse(true)
+	}
 	if withTTL && idx.ExpireAfterSeconds != nil {
 		opts.SetExpireAfterSeconds(*idx.ExpireAfterSeconds)
 	}
 	return mongo.IndexModel{Keys: idx.Key, Options: opts}
+}
+
+// rebuildIndex drops an index and creates it again with the source options.
+// Used when an option such as sparse cannot be added to the existing index.
+// The drop is limited to an index that already uses the desired name, so a
+// shard-key index that happens to share the key is not removed.
+func rebuildIndex(ctx context.Context, coll *mongo.Collection, rebuild plannedRebuild, ns string) error {
+	idx := rebuild.desired
+	if rebuild.existing.Name != idx.Name {
+		return fmt.Errorf("index %q already exists on the same key as %q without sparse", rebuild.existing.Name, idx.Name)
+	}
+	if err := coll.Indexes().DropOne(ctx, idx.Name); err != nil {
+		return fmt.Errorf("drop index %q: %w", idx.Name, err)
+	}
+	if _, err := coll.Indexes().CreateOne(ctx, indexModel(idx, rebuild.withTTL)); err != nil {
+		return fmt.Errorf("create index %q: %w", idx.Name, err)
+	}
+	logging.PrintSuccess(fmt.Sprintf("[%s] Recreated index '%s' with sparse=%v.", ns, idx.Name, idx.Sparse), 0)
+	return nil
 }
 
 // promoteTTLIndex turns an existing non-TTL shell into the source TTL index.

@@ -17,6 +17,7 @@ type IndexInfo struct {
 	Name               string
 	Key                bson.D
 	Unique             bool
+	Sparse             bool
 	ExpireAfterSeconds *int32 `bson:"expireAfterSeconds,omitempty"`
 }
 
@@ -36,6 +37,7 @@ type indexDecoded struct {
 	Name                    string      `bson:"name"`
 	Key                     bson.D      `bson:"key"`
 	Unique                  bool        `bson:"unique,omitempty"`
+	Sparse                  bool        `bson:"sparse,omitempty"`
 	ExpireAfterSeconds      *int32      `bson:"expireAfterSeconds,omitempty"`
 	PartialFilterExpression interface{} `bson:"partialFilterExpression,omitempty"`
 }
@@ -317,6 +319,7 @@ func getCollectionInfo(ctx context.Context, db *mongo.Database, collName string)
 			Name:               indexDoc.Name,
 			Key:                indexDoc.Key,
 			Unique:             indexDoc.Unique,
+			Sparse:             indexDoc.Sparse,
 			ExpireAfterSeconds: indexDoc.ExpireAfterSeconds,
 		})
 	}

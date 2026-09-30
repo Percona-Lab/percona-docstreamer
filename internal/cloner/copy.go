@@ -175,9 +175,13 @@ func convertIndexes(indexes []discover.IndexInfo) []mongo.IndexModel {
 		if idx.ExpireAfterSeconds != nil {
 			continue
 		}
+		opts := options.Index().SetName(idx.Name).SetUnique(idx.Unique)
+		if idx.Sparse {
+			opts.SetSparse(true)
+		}
 		models = append(models, mongo.IndexModel{
 			Keys:    idx.Key,
-			Options: options.Index().SetName(idx.Name).SetUnique(idx.Unique),
+			Options: opts,
 		})
 	}
 	return models

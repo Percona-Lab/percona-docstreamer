@@ -19,12 +19,14 @@ func TestConvertIndexesOmitsTTL(t *testing.T) {
 			ExpireAfterSeconds: &ttl,
 		},
 		{Name: "userId_1", Key: bson.D{{Key: "userId", Value: int32(1)}}, Unique: true},
+		{Name: "email_1", Key: bson.D{{Key: "email", Value: int32(1)}}, Unique: true, Sparse: true},
 	}
 
 	models := convertIndexes(indexes)
-	if len(models) != 2 {
-		t.Fatalf("preload index count = %d, want 2 (TTL omitted)", len(models))
+	if len(models) != 3 {
+		t.Fatalf("preload index count = %d, want 3 (TTL omitted)", len(models))
 	}
+	var sawSparse bool
 	for _, model := range models {
 		opts := indexOptions(t, model)
 		if opts.Name != nil && *opts.Name == "expireAt_1" {
@@ -33,6 +35,18 @@ func TestConvertIndexesOmitsTTL(t *testing.T) {
 		if opts.ExpireAfterSeconds != nil {
 			t.Fatalf("preload index %v has expireAfterSeconds", opts.Name)
 		}
+		if opts.Name != nil && *opts.Name == "email_1" {
+			sawSparse = true
+			if opts.Sparse == nil || !*opts.Sparse {
+				t.Fatal("sparse index was preloaded without sparse")
+			}
+			if opts.Unique == nil || !*opts.Unique {
+				t.Fatal("sparse unique index lost unique")
+			}
+		}
+	}
+	if !sawSparse {
+		t.Fatal("sparse index was omitted from preload")
 	}
 }
 

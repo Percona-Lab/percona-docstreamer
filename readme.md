@@ -666,6 +666,16 @@ MongoDB applies a TTL index with a background job that deletes documents once th
 
 `finalize` stops CDC and waits until in-flight operations drain. Only then does it build each TTL index with its `expireAfterSeconds` value. Expiration on the target starts after the copy matches the source. If an older run left a normal index with the same name and no `expireAfterSeconds`, finalize converts that index into the real TTL index.
 
+#### If finalize fails
+
+A failed finalize does not mark the migration finalized. Copied data stays on the target, and CDC stays stopped. The log names the collection and the reason. Fix that, then run finalize again.
+
+1. Correct the target problem in the error.
+   - If docStreamer could not list or create indexes, check that it can reach the target and that the migration user can run `listIndexes` and `createIndexes` on that collection.
+   - If an index already exists, or an index on the same key is not sparse, drop that index on the target. Leave the collection and its documents in place.
+2. Run `./docStreamer finalize` again. It retries the remaining indexes, including TTL indexes, and marks the migration finalized only after they are created.
+3. Leave CDC stopped until that command succeeds. `./docStreamer start` resumes streaming and does not finish finalization.
+
 ### Status
 
 ```bash

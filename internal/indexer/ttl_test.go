@@ -17,9 +17,9 @@ func TestPlanIndexUpdatesDefersTTLUntilFinalize(t *testing.T) {
 		{Name: "expireAt_1", Key: bson.D{{Key: "expireAt", Value: int32(1)}}, ExpireAfterSeconds: &ttl},
 	}
 
-	missing, repairs, skipped := planIndexUpdates(nil, desired, false)
-	if len(repairs) != 0 {
-		t.Fatalf("index pass repaired TTL indexes: %+v", repairs)
+	missing, repairs, rebuilds, skipped := planIndexUpdates(nil, desired, false)
+	if len(repairs) != 0 || len(rebuilds) != 0 {
+		t.Fatalf("index pass repaired TTL indexes: repairs=%+v rebuilds=%+v", repairs, rebuilds)
 	}
 	if len(skipped) != 1 || skipped[0] != "expireAt_1" {
 		t.Fatalf("skipped TTL = %v", skipped)
@@ -31,9 +31,9 @@ func TestPlanIndexUpdatesDefersTTLUntilFinalize(t *testing.T) {
 		t.Fatalf("non-TTL index was given expireAfterSeconds")
 	}
 
-	missing, repairs, skipped = planIndexUpdates(nil, desired, true)
-	if len(skipped) != 0 || len(repairs) != 0 {
-		t.Fatalf("finalize unexpectedly skipped %v or repaired %+v", skipped, repairs)
+	missing, repairs, rebuilds, skipped = planIndexUpdates(nil, desired, true)
+	if len(skipped) != 0 || len(repairs) != 0 || len(rebuilds) != 0 {
+		t.Fatalf("finalize unexpectedly skipped %v, repaired %+v, or rebuilt %+v", skipped, repairs, rebuilds)
 	}
 	if names := modelNames(t, missing); len(names) != 2 {
 		t.Fatalf("finalize missing indexes = %v", names)
@@ -63,14 +63,14 @@ func TestPlanIndexUpdatesRepairsTTLShell(t *testing.T) {
 		{Name: "expireAt_1", Key: bson.D{{Key: "expireAt", Value: int64(1)}}},
 	}
 
-	missing, repairs, skipped := planIndexUpdates(shell, desired, false)
-	if len(missing) != 0 || len(repairs) != 0 || len(skipped) != 1 {
-		t.Fatalf("index pass missing=%d repairs=%d skipped=%v", len(missing), len(repairs), skipped)
+	missing, repairs, rebuilds, skipped := planIndexUpdates(shell, desired, false)
+	if len(missing) != 0 || len(repairs) != 0 || len(rebuilds) != 0 || len(skipped) != 1 {
+		t.Fatalf("index pass missing=%d repairs=%d rebuilds=%d skipped=%v", len(missing), len(repairs), len(rebuilds), skipped)
 	}
 
-	missing, repairs, skipped = planIndexUpdates(shell, desired, true)
-	if len(missing) != 0 || len(skipped) != 0 {
-		t.Fatalf("finalize tried to create indexes that already exist: missing=%d skipped=%v", len(missing), skipped)
+	missing, repairs, rebuilds, skipped = planIndexUpdates(shell, desired, true)
+	if len(missing) != 0 || len(rebuilds) != 0 || len(skipped) != 0 {
+		t.Fatalf("finalize tried to create indexes that already exist: missing=%d rebuilds=%d skipped=%v", len(missing), len(rebuilds), skipped)
 	}
 	if len(repairs) != 1 || repairs[0].desired.Name != "expireAt_1" || repairs[0].existing.Name != "expireAt_1" {
 		t.Fatalf("finalize did not plan a TTL shell repair: %+v", repairs)
@@ -92,9 +92,42 @@ func TestPlanIndexUpdatesLeavesMatchingTTL(t *testing.T) {
 		ExpireAfterSeconds: bson.RawValue{Type: rawType, Value: raw},
 	}}
 
-	missing, repairs, skipped := planIndexUpdates(existing, desired, true)
-	if len(missing) != 0 || len(repairs) != 0 || len(skipped) != 0 {
-		t.Fatalf("matching TTL was not treated as complete: missing=%d repairs=%d skipped=%v", len(missing), len(repairs), skipped)
+	missing, repairs, rebuilds, skipped := planIndexUpdates(existing, desired, true)
+	if len(missing) != 0 || len(repairs) != 0 || len(rebuilds) != 0 || len(skipped) != 0 {
+		t.Fatalf("matching TTL was not treated as complete: missing=%d repairs=%d rebuilds=%d skipped=%v", len(missing), len(repairs), len(rebuilds), skipped)
+	}
+}
+
+func TestPlanIndexUpdatesCopiesSparse(t *testing.T) {
+	desired := []discover.IndexInfo{{
+		Name:   "email_1",
+		Key:    bson.D{{Key: "email", Value: int32(1)}},
+		Unique: true,
+		Sparse: true,
+	}}
+
+	missing, repairs, rebuilds, skipped := planIndexUpdates(nil, desired, false)
+	if len(repairs) != 0 || len(rebuilds) != 0 || len(skipped) != 0 || len(missing) != 1 {
+		t.Fatalf("missing=%d repairs=%d rebuilds=%d skipped=%v", len(missing), len(repairs), len(rebuilds), skipped)
+	}
+	opts := appliedOptions(t, missing[0])
+	if opts.Sparse == nil || !*opts.Sparse {
+		t.Fatal("sparse index was planned without sparse")
+	}
+	if opts.Unique == nil || !*opts.Unique {
+		t.Fatal("sparse unique index lost unique")
+	}
+
+	existing := []listedIndex{{
+		Name: "email_1",
+		Key:  bson.D{{Key: "email", Value: int32(1)}},
+	}}
+	missing, repairs, rebuilds, skipped = planIndexUpdates(existing, desired, false)
+	if len(missing) != 0 || len(repairs) != 0 || len(skipped) != 0 || len(rebuilds) != 1 {
+		t.Fatalf("non-sparse shell was not scheduled for rebuild: missing=%d repairs=%d rebuilds=%d skipped=%v", len(missing), len(repairs), len(rebuilds), skipped)
+	}
+	if !rebuilds[0].desired.Sparse || rebuilds[0].existing.Name != "email_1" {
+		t.Fatalf("rebuild = %+v", rebuilds[0])
 	}
 }
 

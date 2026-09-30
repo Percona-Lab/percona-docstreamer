@@ -559,7 +559,8 @@ func createAllDeferredIndexes(ctx context.Context, docdbURI, mongoURI string, st
 
 		if err := indexer.FinalizeIndexes(ctx, targetColl, collInfo.Indexes, collInfo.Namespace, includeTTL); err != nil {
 			logging.PrintError(fmt.Sprintf("[%s] Failed to finalize indexes: %v", collInfo.Namespace, err), 0)
-			return err
+			statusMgr.SetIndexingProgress(false, collInfo.Namespace, i, totalColls, false)
+			return fmt.Errorf("%s: %w", collInfo.Namespace, err)
 		}
 	}
 
@@ -871,7 +872,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		}
 		logging.PrintPhase("FINALIZE", "Creating deferred indexes...")
 		if err := createAllDeferredIndexes(ctx, docdbURI, mongoURI, statusManager, true); err != nil {
-			logging.PrintError(fmt.Sprintf("Index creation failed: %v", err), 0)
+			reportFinalizeFailure(statusManager, err)
 			os.Exit(1)
 		}
 		statusManager.SetMigrationFinalized()
@@ -1144,7 +1145,7 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 		statusManager.SetState("finalizing", "Creating deferred indexes")
 		statusManager.Persist(context.Background())
 		if err := createAllDeferredIndexes(context.Background(), docdbURI, mongoURI, statusManager, true); err != nil {
-			logging.PrintError(fmt.Sprintf("Index creation failed: %v", err), 0)
+			reportFinalizeFailure(statusManager, err)
 		} else {
 			statusManager.SetMigrationFinalized()
 			statusManager.SetState("completed", "Migration Finalized")
@@ -1154,6 +1155,21 @@ func runMigrationProcess(cmd *cobra.Command, args []string) {
 	}
 
 	logging.PrintInfo("Migration process stopped. Exiting.", 0)
+}
+
+func reportFinalizeFailure(statusMgr *status.Manager, err error) {
+	logging.PrintError(fmt.Sprintf("Finalize failed: %v", err), 0)
+	logging.PrintError("The migration was not marked finalized. Copied data is still on the target, and CDC is stopped.", 0)
+	logging.PrintInfo("Finish the migration with these steps:", 0)
+	logging.PrintInfo("1. Correct the target problem named in the error above.", 0)
+	logging.PrintInfo("   If docStreamer could not list or create indexes, check that it can reach the target and that the migration user can run listIndexes and createIndexes on that collection.", 0)
+	logging.PrintInfo("   If an index already exists, or an index on the same key is not sparse, drop that index on the target. Leave the collection and its documents in place.", 0)
+	logging.PrintInfo("2. Run ./docStreamer finalize again. It retries the remaining indexes, including TTL indexes, and marks the migration finalized only after they are created.", 0)
+	logging.PrintInfo("3. Leave CDC stopped until that command succeeds. ./docStreamer start resumes streaming and does not finish finalization.", 0)
+	if statusMgr != nil {
+		statusMgr.SetError("Finalize failed. Fix the target index error, then run docStreamer finalize again.")
+		statusMgr.Persist(context.Background())
+	}
 }
 
 func extractDBNames(collections []discover.CollectionInfo) []string {
